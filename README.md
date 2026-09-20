@@ -1,93 +1,117 @@
-# template-gitlab-8c0dabb4
+# ПочтаТех · PI-Planner — слой данных
 
-Template for task: GitLab репозиторий
+Квартальное планирование производства, прогноз рисков и «Звёздная карта»
+компетенций. Этот репозиторий — **слой данных**: ETL из выданного Excel в
+PostgreSQL и контракт, по которому бэкенд забирает результаты планировщика.
 
-## Getting started
+Исходники: `Демо_онбординг.pdf` (правила), `Хакатон_датасетс…xlsx` (данные).
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+## Быстрый старт
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+```bash
+pip install openpyxl
+python3 etl/load.py                # -> build/seed.sql
 
-## Add your files
+psql "$DSN" -v ON_ERROR_STOP=1 -f db/01_schema.sql
+psql "$DSN" -v ON_ERROR_STOP=1 -f db/02_contract.sql
+psql "$DSN" -v ON_ERROR_STOP=1 -f build/seed.sql
+psql "$DSN" -v ON_ERROR_STOP=1 -f db/03_substitutions.sql
+psql "$DSN" -v ON_ERROR_STOP=1 -f db/04_views.sql
+psql "$DSN" -v ON_ERROR_STOP=1 -f db/05_invariants.sql
+```
 
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/ee/gitlab-basics/add-file.html#add-a-file-using-the-command-line) or push an existing Git repository with the following command:
+Можно залить одним шагом (нужен `psycopg2-binary`):
+
+```bash
+python3 etl/load.py --dsn "$DSN"
+```
+
+Перезалив идемпотентен: `seed.sql` начинается с `TRUNCATE … RESTART IDENTITY`,
+гонять можно сколько угодно. Когда организаторы пришлют версию датасета —
+просто положить новый файл и перезапустить ETL.
+
+## Что где
 
 ```
-cd existing_repo
-git remote add origin https://git.codenrock.com/codenrock/khakaton-postcode-challenge-ot-pochtatekha/template-gitlab-8c0dabb4.git
-git branch -M main
-git push -uf origin main
+db/01_schema.sql     ядро: справочники, команды-ядра, инженеры-спутники, бэклог
+db/02_contract.sql   выход планировщика — КОНТРАКТ С БЭКЕНДОМ, менять с оглядкой
+db/03_substitutions.sql  правила взаимозаменяемости ролей — НАШИ РЕШЕНИЯ, правятся руками
+db/04_views.sql      витрины (вьюхи): ёмкость, дефицит, замещение, bus factor, звёздная карта
+db/05_invariants.sql приёмка плана: v_plan_violations, 14 проверок
+etl/config.py        все ручки: даты квартала, алиасы ролей, источник оценок
+etl/load.py          загрузчик; блоки ищет по маркерам, а не по номерам строк
+build/seed.sql       СГЕНЕРИРОВАНО, руками не править
+docs/DECISIONS.md    почему сделано именно так + как поменять (ADR-000…008)
+docs/PLANNER_SPEC.md СПЕКА ДЛЯ БЭКЕНДА: правила планирования и ловушки в данных
+docs/SCHEMA.md       что читать бэкенду, примеры запросов
+docs/CHECKPOINT_QUESTIONS.md  что спросить у авторов задачи, по убыванию цены ошибки
 ```
 
-## Integrate with your tools
+## Модель в двух словах
 
-- [ ] [Set up project integrations](https://git.codenrock.com/codenrock/khakaton-postcode-challenge-ot-pochtatekha/template-gitlab-8c0dabb4/-/settings/integrations)
+**Команда — ядро, инженер — спутник.** Ядро владеет ёмкостью в Story Points,
+спутник владеет часами, грейдом и стеком. Привязка — `engineer_orbits` со
+ставкой: 30 инженеров, 34 орбиты, четверо висят на двух ядрах по 0.5.
 
-## Collaborate with your team
+Два саттелита, не путать: **структурный** `engineer_orbits` (кто вокруг кого,
+статично) и **временно́й** `task_state` (что с задачей было на каждый пересчёт,
+insert-only).
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/ee/user/project/merge_requests/merge_when_pipeline_succeeds.html)
+## Что показывают данные
 
-## Test and Deploy
+| | |
+|---|---|
+| Ёмкость в SP | дефицита почти нет, перегружена только `Team-Platform` (104%) |
+| Часы по ролям | **2371 ЧЧ** дефицита по **47** связкам «команда × роль» |
+| Природа дефицита | **все 47** — «роли вообще нет в команде», не «мало часов» |
+| Bus Factor = 1 | 8 ролей, спрос 1429 ЧЧ |
+| Ролей нет в штате | 6, спрос 665 ЧЧ (в т.ч. `Руководитель проекта` — 449 ЧЧ) |
+| Зависимости | живых рёбер 10 из 19, глубина ≤ 2 — **не** узкое место |
+| Ролей нет в штате | 6, спрос 665 ЧЧ — но 533 ЧЧ закрываются замещением |
+| **Нужен наём** | **132 ЧЧ, 4 роли, все 1С** — упираются в `SRV-4043` и `SRV-4091` |
 
-Use the built-in continuous integration in GitLab.
+Отсюда вывод для алгоритма: при жёсткой привязке задач к командам план
+нерешаем в принципе. Узкое место — ресурсы, а не граф; вкладываться надо в
+приоритизацию под ресурсным лимитом, а не в топологический solver.
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/index.html)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+Пять из восьми незаменимых инженеров вращаются вокруг `Team-Platform` — той
+самой единственной команды с перегрузом по SP. Это структурное бутылочное
+горлышко всей организации.
 
-***
+**Три уровня нехватки лечатся по-разному** — не смешивать:
 
-# Editing this README
+| Уровень | Механизм | Витрина |
+|---|---|---|
+| Человек есть, но в другой команде | заём между командами | `v_role_deficit` |
+| Роли нет, но есть кому замещать | `role_substitutions` | `v_role_deficit_effective` |
+| Закрыть некем нигде | **наём** — 132 ЧЧ, только 1С | `v_role_coverage_org` |
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+Правила замещения помечены `status='proposed'`: это наши гипотезы, не
+подтверждённые авторами задачи. Отключаются одной строкой —
+`UPDATE role_substitutions SET status='rejected';`
 
-## Suggestions for a good README
+## Передача бэкенду
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+Отдать три вещи: `build/seed.sql` (или доступ к поднятой БД),
+`docs/PLANNER_SPEC.md` (правила) и `docs/SCHEMA.md` (что читать и куда писать).
 
-## Name
-Choose a self-explaining name for your project.
+Приёмка результата — одним запросом, пустой ответ означает корректный план:
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+```sql
+SELECT * FROM v_plan_violations WHERE run_id = :run_id;
+```
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+14 проверок: ёмкость в SP, перегрузка инженеров по сумме орбит, допустимость
+роли, орбиты и займы, зазор зависимостей, окна назначений, недоданные часы,
+пропущенные задачи, базовая линия. Отдельным `warning` помечается каждое
+использованное замещение — правило ещё не подтверждено авторами задачи.
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+## Проверка после заливки
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+```sql
+SELECT * FROM v_dq_summary;                                  -- 38 находок, 0 блокирующих
+SELECT * FROM v_role_deficit WHERE gap_hh > 0 ORDER BY gap_hh DESC;
+SELECT * FROM v_bus_factor WHERE demand_hh > 0 ORDER BY bus_factor, demand_hh DESC;
+SELECT * FROM v_role_coverage_org WHERE verdict LIKE 'НАЙМ%';   -- 132 ЧЧ, 4 роли 1С
+SELECT row_counts FROM load_batches ORDER BY batch_id DESC LIMIT 1;
+```
