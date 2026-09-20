@@ -1,0 +1,19 @@
+[project]
+name = "pi-planner"
+version = "0.1.0"
+description = "Планировщик квартала и звёздная карта команд: API и UI поверх слоя данных ПочтаТеха"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "openpyxl>=3.1.5",
+    "psycopg[binary]>=3.3.6",
+]
+
+[tool.uv]
+required-version = ">=0.12"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
