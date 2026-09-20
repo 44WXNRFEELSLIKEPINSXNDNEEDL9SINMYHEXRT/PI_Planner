@@ -14,6 +14,12 @@ web/dist/**        -diff linguist-generated=true
 # (Перезапуск ETL может отличаться на байты, см. docs/RUNBOOK.md, раздел 7.)
 
 
+# --- Windows-скрипты ---
+# cmd.exe надёжнее с CRLF: с LF-переводами строк у меток (goto) и блоков
+# в скобках бывают отказы. Файлы .bat/.cmd поэтому принудительно CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
 # --- Кириллица в именах файлов датасета ---
 *.xlsx diff
 *.pdf  diff
