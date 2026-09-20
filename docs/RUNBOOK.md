@@ -1,0 +1,217 @@
+# RUNBOOK — как поднять и проверить сервис
+
+Документ для того, кто поднимает проект «с нуля» на чистой машине Windows,
+и для devops, который будет забирать релиз. Всё, что здесь написано, проверено
+на живой машине; результаты приёмок — в разделе «Приёмка M0».
+
+## 0. Что где лежит
+
+| Что | Где |
+|---|---|
+| Схема, контракт, вьюхи ДС | `db/01_schema.sql` … `db/05_invariants.sql` |
+| Сид (данные) | `build/seed.sql` |
+| ETL ДС (пересборка сида) | `etl/load.py`, `etl/config.py` |
+| Наш код | `app/*.py`, `tests/*.py` |
+| Фронт | `web/` (собранный — `web/dist/`, коммитим) |
+| Типы фронта из схемы БД | `tools/gen_types.py` → `web/src/types/db.ts` |
+| Приёмка БД | `tools/acceptance.sql` |
+| Точка входа для демо | `run.bat` |
+
+## 1. Быстрый старт
+
+```bat
+run.bat
+```
+
+Скрипт делает по порядку: `uv sync --frozen` → проверка PostgreSQL на
+`127.0.0.1:5432` (при необходимости поднимает `pg_ctl`) → сборка `web/dist`,
+если её нет → старт сервера → открытие браузера на `http://127.0.0.1:8000`.
+Повторный запуск безопасен.
+
+## 2. Установка инструментов
+
+### 2.1. uv (обязательно)
+
+```powershell
+powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+Ставится в `C:\Users\<user>\.local\bin` (проверено: 0.12.17, `uv.exe`, `uvx.exe`, `uvw.exe`).
+Альтернатива через пакетный менеджер: `winget install --id astral-sh.uv --exact`.
+Если uv не в PATH, `run.bat` сам найдёт его по этому пути.
+
+### 2.2. Python
+
+Отдельно ставить не нужно: `uv python install` подтянет 3.14 по `.python-version`.
+Ручной вариант — `uv python install 3.14`.
+
+### 2.3. Node (нужен только для сборки фронта)
+
+```powershell
+winget install --id OpenJS.NodeJS.LTS --exact
+```
+
+Вариант без прав администратора (использован на рабочей машине): распаковать
+`node-v24.19.0-win-x64.zip` в `tools\node\` — каталог в `.gitignore`, `run.bat`
+подхватывает `tools\node\npm.cmd` автоматически.
+**На демо-машине Node не нужен:** `web/dist` собран и закоммичен.
+
+### 2.4. PostgreSQL 17
+
+Основной путь на Windows без прав администратора — portable-сборка:
+
+```powershell
+$root = "$env:USERPROFILE\pg17"
+curl.exe -L -o "$env:TEMP\pg.zip" https://get.enterprisedb.com/postgresql/postgresql-17.11-4-windows-x64-binaries.zip
+Expand-Archive "$env:TEMP\pg.zip" -DestinationPath $root      # получится $root\pgsql\bin
+& "$root\pgsql\bin\initdb.exe" -D "$root\data" -U postgres -A scram-sha-256 `
+    -E UTF8 --locale=C --pwfile=<файл с одной строкой: postgres>
+& "$root\pgsql\bin\pg_ctl.exe" -D "$root\data" -l "$root\pg.log" start
+& "$root\pgsql\bin\createdb.exe" -h 127.0.0.1 -U postgres pi_planner
+```
+
+> **Ловушка, из-за которой ломается кириллица.** В сиде есть русский текст
+> (`'НАЙМ: закрыть некем'`). На русской Windows `initdb` по умолчанию выбирает
+> локаль `Russian_Russia.1251` и кодировку WIN1251 — вставка UTF-8 упадёт или
+> запишет мусор. Поэтому `-E UTF8 --locale=C` **обязательны**.
+> Проверка: `SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname='pi_planner';` → `UTF8`.
+
+Вариант с инсталлятором (нужны права администратора, будет один запрос UAC):
+
+```powershell
+.\postgresql-17.11-4-windows-x64.exe --mode unattended --superpassword postgres `
+    --serverport 5432 --prefix "C:\pgsql" --enable-components server,commandlinetools
+```
+
+Фолбэк, если локальный сервер не поднимается: `docker run -d --name pi-planner-pg
+-e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=pi_planner -p 5432:5432 postgres:17`.
+
+## 3. Залив SQL — порядок обязателен
+
+```powershell
+$psql = "$env:USERPROFILE\pg17\pgsql\bin\psql.exe"
+$env:PGPASSWORD = "postgres"
+foreach ($f in @("db\01_schema.sql","db\02_contract.sql","build\seed.sql",
+                 "db\03_substitutions.sql","db\04_views.sql","db\05_invariants.sql")) {
+    & $psql -h 127.0.0.1 -U postgres -d pi_planner -v ON_ERROR_STOP=1 -f $f
+}
+```
+
+`-v ON_ERROR_STOP=1` не косметика: без него `psql` продолжит работу после ошибки,
+и вы получите полупустую базу, не заметив этого. `seed.sql` идёт **после** схемы
+и **до** вьюх — вьюхи зависят от заполненных таблиц.
+
+> **Не пересевайте базу после первого планирования.** `build/seed.sql` начинается
+> с `TRUNCATE … RESTART IDENTITY`, то есть стирает историю прогонов планировщика
+> (`plan_runs` и всё, что на неё ссылается). На демо-машине пересев = потеря
+> результатов, которые показываются на защите.
+
+## 4. Ветки и релизы
+
+Модель — git-flow-lite. `main` не трогаем: туда мержит devops.
+
+| Ветка | Роль |
+|---|---|
+| `main` | приёмка/сдача, обновляется только devops'ом слиянием `develop → main` |
+| `develop` | всегда зелёная и запускаемая одной командой; сюда только `--no-ff` слияния |
+| `feature/backend` | наш бэкенд (планировщик, репланировщик, метрики, API) |
+| `feature/frontend` | наши экраны (ветвится от `feature/backend`) |
+| `feature/data` | **заморожена** — слой ДС, мы в неё не коммитим |
+
+```powershell
+# создать ветки (одноразово, уже сделано)
+git switch -c develop feature/data;      git push -u origin develop
+git switch -c feature/backend develop;   git push -u origin feature/backend
+```
+
+Промоушен по вехам: merge `--no-ff` в `develop` + аннотированный тег.
+
+| Тег | Когда | Гейт |
+|---|---|---|
+| `v0.1-m0-db` | БД поднята, приёмки M0 зелёные | 6 проверок из раздела 7 |
+| `v0.2-m2-planner` | планировщик пишет контракт | `v_plan_violations` пуст, кроме `SUBSTITUTION_USED` |
+| `v0.3-m4-ui` | экраны работают | `run.bat` открывает UI и отдаёт данные |
+| `v1.0-demo` | сдача | прогон демо-сценария без правок «на ходу» |
+
+```powershell
+git switch develop
+git merge --no-ff feature/backend -m "merge(backend): M0 into develop"
+git tag -a v0.1-m0-db -m "M0: PostgreSQL 17 + сид ДС, шесть приёмок, run.bat, скелет Vite"
+git push origin develop --follow-tags
+```
+
+## 5. Передача релиза devops
+
+1. Убедиться, что `develop` зелёный: `run.bat` поднимается с нуля на чистой машине.
+2. Отправить merge request `develop → main` (GitLab-ссылка печатается самим git
+   при пуше новой ветки).
+3. В описании MR — таблица приёмок и команда запуска.
+4. **Риск:** если слияние в `main` не сделать, `main` останется пустой заглушкой
+   («Initial commit»), и проверяющая сторона не увидит решения. Отправляем MR
+   сразу после `v0.1-m0-db` и напоминаем за сутки до дедлайна.
+5. Попросить включить защиту `main`/`develop` (merge request + запрет force-push),
+   если платформа это позволяет.
+
+## 6. Что легко сломать (проверено на живых данных ДС)
+
+| Симптом | Причина | Что делать |
+|---|---|---|
+| `column "is_loan" can only be updated to DEFAULT` | `plan_assignments.is_loan` — генерируемая колонка | никогда не включать её в `INSERT`/`UPDATE` |
+| `operator does not exist: text = integer` | параметры уходят как `text` | приводить в SQL явно: `WHERE task_id = %s::int` |
+| Русский текст превратился в мусор | база создана в WIN1251 | пересоздать с `-E UTF8 --locale=C` (раздел 2.4) |
+| `psql` «прошёл», но база пустая | нет `ON_ERROR_STOP=1` | всегда `-v ON_ERROR_STOP=1` |
+| История прогонов исчезла | повторный залив `seed.sql` (`TRUNCATE … RESTART IDENTITY`) | не пересевать после первого планирования |
+| `v_dq_summary` не 38 находок | залит не тот порядок файлов | перезалить по разделу 3 |
+
+## 7. Приёмка M0
+
+Прогон `tools/acceptance.sql` (`psql -v ON_ERROR_STOP=1`, `exit=0`) на базе
+`pi_planner` после заливки шести SQL-файлов в порядке из раздела 3.
+Эталон — цифры из выданного датасета; «факт» — то, что вернула живая база.
+
+| № | Проверка | Эталон ДС | Факт | Итог |
+|---|---|---|---|---|
+| 0 | кодировка базы | UTF8 | UTF8 | ✅ |
+| 1 | `load_batches.row_counts` | 21 роль, 45 задач, 258 строк сметы, 19 зависимостей, 30 инженеров, 12 снимков истории, 38 находок DQ | ровно эти значения (плюс 6 команд, 117 навыков, 183 связи, 34 орбиты, 15 инициатив, 6 спринтов, 24 факта) | ✅ |
+| 1а | живые `COUNT(*)` по 8 таблицам | совпадают с `row_counts` | 38 / 34 / 30 / 21 / 19 / 258 / 45 / 12 | ✅ |
+| 1б | объекты в `public` | 29 таблиц + 15 вьюх | 29 + 15 | ✅ |
+| 2 | `v_dq_summary` | 38 находок, 0 блокирующих | 38 = 0 error + 35 warning + 3 info | ✅ |
+| 3 | `v_role_deficit`, `gap_hh > 0` | ~2371 ЧЧ на 47 связках | 47 связок, 2371.00 ЧЧ | ✅ |
+| 3а | природа дефицита | все «роли нет в команде» | 47/47, 2371.00 ЧЧ | ✅ |
+| 4 | `v_role_coverage_org`, вердикт «НАЙМ…» | 4 роли 1С, 132 ЧЧ | Разработчик 1С 107 + Специалист поддержки 1С 12 + Аналитик 1С 10 + Архитектор 1С 3 = 132.00 ЧЧ | ✅ |
+| 4а | замещение вне штата | закрывается замещением | 6 ролей, спрос 665.00 ЧЧ | ✅ |
+| 5 | `v_bus_factor`, BF = 1 и спрос > 0 | 8 ролей, 1429 ЧЧ | 8 ролей, 1429.00 ЧЧ | ✅ |
+| 5а | кириллица | читаемый русский текст | «НАЙМ: закрыть некем» | ✅ |
+| 6 | `load_batches.source_sha256` | sha256 исходного xlsx | `a618cb80…f22e`, ETL 1.0.0, старт PI 2026-06-01 | ✅ |
+| 6а | `v_plan_violations` | 0 до первого прогона планировщика | 0 | ✅ |
+| 7 | `v_team_capacity_sp`, SP/спринт | velocity × 0.8 | Team-K 12.80 … Team-Platform 7.20 | ✅ |
+
+### Версии, на которых получен результат
+
+| Компонент | Версия |
+|---|---|
+| PostgreSQL | 17.11 (portable, `initdb -E UTF8 --locale=C`) |
+| uv | 0.12.17 |
+| Python | 3.14.2 |
+| psycopg | 3.3.6 |
+| openpyxl (только ETL ДС) | 3.1.5 |
+| Node / npm | 24.19.0 / 11.17.0 (нужны только для сборки `web/dist`) |
+| Vite / React / TypeScript | 8.3.0 / 19.3.0 / 7.0.2 |
+
+### Находка: ETL ДС недетерминирован (M0 не блокирует)
+
+`etl/load.py:468`:
+
+```python
+title = max(set(v["titles"]), key=v["titles"].count) if v["titles"] else None
+```
+
+На ничьей `max` берёт первый элемент **множества**, а порядок обхода `set` зависит от
+`PYTHONHASHSEED`. С `PYTHONHASHSEED=0` ETL воспроизводим байт-в-байт (два прогона дают
+один sha256), но от закоммиченного `build/seed.sql` он отличается ровно семью названиями
+инициатив: `PRODF-7121/7122/7125/7129/7131/7133/7134`. Поля `prodf_id`, `br_id`,
+`priority_rung` не меняются — на планирование это не влияет.
+
+Решение M0: источник истины — закоммиченный `build/seed.sql`, база залита из него.
+**После первого прогона планировщика базу не пересевать** (см. предупреждение в разделе 3).
+

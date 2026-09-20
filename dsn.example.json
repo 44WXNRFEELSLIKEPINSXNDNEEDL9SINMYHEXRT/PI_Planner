@@ -1,0 +1,7 @@
+{
+  "_comment": "Скопируйте в dsn.json (он в .gitignore) и правьте под свою машину.",
+  "_priority": "PI_PLANNER_DSN (env) -> dsn.json -> значение по умолчанию в app/db.py",
+  "dsn": "host=127.0.0.1 port=5432 dbname=pi_planner user=postgres password=postgres",
+  "read_only": true,
+  "statement_timeout_ms": 15000
+}

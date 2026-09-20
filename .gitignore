@@ -7,3 +7,28 @@ __pycache__/
 # бэкенду нужна рабочая БД без запуска нашего пайплайна
 build/*
 !build/seed.sql
+
+# --- Python / uv ---
+# uv.lock коммитим: это источник истины для версий зависимостей.
+# requirements.txt генерируется из uv.lock (uv export) и тоже коммитится.
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# --- Node / Vite ---
+# package-lock.json и web/dist коммитим намеренно:
+# демо-машина собирает фронт без доступа к npm, а run.bat отдаёт готовый dist.
+node_modules/
+npm-debug.log*
+.vite/
+
+# --- Локальные секреты и рабочие каталоги ---
+dsn.json
+tmp/
+
+# --- Portable-инструменты (локальная установка без прав администратора) ---
+tools/node/
+tools/pgsql/
+*.log
