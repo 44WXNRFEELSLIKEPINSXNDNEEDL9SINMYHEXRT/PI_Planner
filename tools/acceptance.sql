@@ -49,7 +49,7 @@ SELECT verdict, COUNT(*) AS pairs, ROUND(SUM(gap_hh), 2) AS gap_hh
 FROM v_role_deficit WHERE gap_hh > 0
 GROUP BY verdict ORDER BY gap_hh DESC;
 
-\echo '=== 4. Наём по компании: ожидаем 4 роли 1С и 132 ЧЧ ==='
+\echo '=== 4. Наём по компании: ожидаем 6 ролей и 665 ЧЧ (замещения отклонены, ADR-010) ==='
 SELECT role_name,
        ROUND(demand_hh, 2) AS demand_hh,
        ROUND(supply_hh, 2) AS supply_hh,
@@ -63,10 +63,15 @@ SELECT COUNT(*)              AS hiring_roles,
        ROUND(SUM(gap_hh), 2) AS hiring_hh
 FROM v_role_coverage_org WHERE verdict LIKE 'НАЙМ%';
 
-\echo '--- 4а. Замещение: 6 ролей вне штата, спрос 665 ЧЧ, 533 ЧЧ закрывает замещение ---'
+\echo '--- 4а. Роли вне штата: те же 6 ролей и 665 ЧЧ, закрывать нечем ---'
 SELECT COUNT(*) FILTER (WHERE bus_factor = 0)                          AS roles_not_in_staff,
        ROUND(SUM(demand_hh) FILTER (WHERE bus_factor = 0), 2)          AS demand_no_staff_hh
 FROM v_bus_factor WHERE demand_hh > 0;
+
+\echo '--- 4б. Строгий режим: замещений нет, покрытие только нативными ролями ---'
+SELECT (SELECT COUNT(*) FROM role_substitutions WHERE status <> 'rejected')  AS active_substitutions,
+       (SELECT COUNT(*) FROM v_engineer_role_coverage)                       AS coverage_rows,
+       (SELECT COUNT(*) FROM v_engineer_role_coverage WHERE NOT is_native)   AS substitution_rows;
 
 \echo '=== 5. Bus Factor: ожидаем 8 ролей с BF=1 и спрос 1429 ЧЧ ==='
 SELECT COUNT(*) FILTER (WHERE bus_factor = 1)                          AS bf1_roles,
@@ -82,8 +87,9 @@ SELECT verdict FROM v_role_coverage_org WHERE verdict LIKE 'НАЙМ%' LIMIT 1;
 SELECT source_file, source_sha256, etl_version, pi_start, loaded_at
 FROM load_batches ORDER BY batch_id DESC LIMIT 1;
 
-\echo '=== 6а. Приёмка плана: до первого прогона планировщика нарушений нет ==='
-SELECT COUNT(*) AS violations FROM v_plan_violations;
+\echo '=== 6а. Приёмка плана: нарушений нет ни в одном прогоне ==='
+SELECT (SELECT COUNT(*) FROM v_plan_violations) AS violations,
+       (SELECT COUNT(*) FROM plan_runs)        AS runs;
 
 \echo '=== 7. Ёмкость в SP: перегружена только Team-Platform (104%) ==='
 SELECT team_id,
