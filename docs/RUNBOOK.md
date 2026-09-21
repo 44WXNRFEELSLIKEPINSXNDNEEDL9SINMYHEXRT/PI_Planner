@@ -12,7 +12,7 @@
 | Сид (данные) | `build/seed.sql` |
 | ETL ДС (пересборка сида) | `etl/load.py`, `etl/config.py` |
 | Наш код | `app/*.py`, `tests/*.py` |
-| Демо-сервер (`/api/health` + статика `web/dist`) | `app/server.py`, только stdlib |
+| Демо-сервер (`/api/health`, `/api/livez`, `/api/version`, `/metrics` + статика `web/dist`) | `app/server.py`, `app/metrics.py` — только stdlib |
 | Фронт | `web/` (собранный — `web/dist/`, коммитим) |
 | Типы фронта из схемы БД | `tools/gen_types.py` → `web/src/types/db.ts` |
 | Приёмка БД | `tools/acceptance.sql` |
@@ -138,7 +138,8 @@ git switch -c feature/backend develop;   git push -u origin feature/backend
 | `v0.1-m0-db` | БД поднята, приёмки M0 зелёные | 6 проверок из раздела 7 |
 | `v0.2-m2-planner` | планировщик пишет контракт | нет ошибок в `v_plan_violations` (warning допустим; замещения отклонены, ADR-010) |
 | `v0.2.1-m2-planner` | разбор ревью M2 | те же 0 ошибок + негативный тест срабатывает (раздел 9) |
-| `v0.2.2-data-calendar` | точный календарь PI + детерминированный ETL | приёмка M0 (раздел 7) зелёная, два прогона дают побайтово одинаковый `build/seed.sql`, `41 passed` |
+| `v0.2.2-data-calendar` | точный календарь PI + детерминированный ETL | приёмка M0 (раздел 7) зелёная, два прогона дают побайтово одинаковый `build/seed.sql`, `57 passed` |
+| `v0.2.3-backend-metrics` | контракт метрик для devops | `/metrics` отдаёт `pi_planner_db_up 1` и `fund_factor="6.5714"`, `/metrics` закрыт снаружи (Caddy `respond 404`) |
 | `v0.3-m4-ui` | экраны работают | `run.bat` открывает UI и отдаёт данные |
 | `v1.0-demo` | сдача | прогон демо-сценария без правок «на ходу» |
 
@@ -261,10 +262,12 @@ Compare-Object (Get-Content seed_a.sql) (Get-Content seed_b.sql)   # ожида�
 ## 8. Приёмка сервера (стаб к вехе M4)
 
 Сервер — `app/server.py`, только стандартная библиотека (`http.server`,
-`ThreadingHTTPServer`). Отдельная зависимость не добавлялась, `uv.lock` не менялся.
-Маршруты: `GET /api/health` (JSON) и вся прочая статика из `web/dist` с SPA-fallback
-на `index.html`. Записи в БД нет: единственный запрос — `app.db.health()`, и он идёт
-в read-only сессии, поэтому демо физически не может испортить данные.
+`ThreadingHTTPServer`); реестр метрик — `app/metrics.py`. Отдельная зависимость не
+добавлялась, `uv.lock` не менялся: текстовый формат Prometheus собирается руками.
+Маршруты: `GET /api/health`, `GET /api/livez`, `GET /api/version`, `GET /metrics`
+и вся прочая статика из `web/dist` с SPA-fallback на `index.html`. Записи в БД
+нет: `app.db.health()` и сбор бизнес-метрик идут в read-only сессии, поэтому демо
+физически не может испортить данные.
 
 Прогон: `run.bat`, затем в другом окне проверки ниже.
 
@@ -274,7 +277,7 @@ Compare-Object (Get-Content seed_a.sql) (Get-Content seed_b.sql)   # ожида�
 | 2 | `server_version` / `dbname` | 17.11 / `pi_planner` | 17.11 / `pi_planner` |
 | 3 | `tables` / `views` | 29 / 17 (как в приёмке M0, п. 1б) | 29 / 17 |
 | 4 | поле `dsn` в ответе | без `password=` | `host=127.0.0.1 port=5432 dbname=pi_planner user=postgres` |
-| 5 | `curl http://127.0.0.1:8000/api/nope` | 404 JSON | 404, `{"error": "not_found", "known": ["/api/health"]}` |
+| 5 | `curl http://127.0.0.1:8000/api/nope` | 404 JSON со списком известных эндпоинтов | 404, `known` = `/api/health`, `/api/livez`, `/api/version`, `/metrics` |
 | 6 | `curl http://127.0.0.1:8000/` | 200 `text/html; charset=utf-8` | 200, `index.html`, 463 байта |
 | 7 | `curl http://127.0.0.1:8000/plan/3` | SPA-fallback на `index.html` | 200, тот же HTML |
 | 8 | `curl http://127.0.0.1:8000/assets/index-*.js` | 200 `text/javascript; charset=utf-8` | 200, 222 189 байт |
@@ -282,19 +285,136 @@ Compare-Object (Get-Content seed_a.sql) (Get-Content seed_b.sql)   # ожида�
 | 10 | `web/dist` удалён, `GET /` | 503 JSON «frontend_not_built» | 503 (тест) |
 | 11 | PostgreSQL остановлен, `GET /api/health` | 503 JSON, сервер не падает | 503 `database_unavailable` (тест) |
 | 12 | кириллица в ошибке 404 | читаемая | «нет такого эндпоинта: /api/nope» |
+| 13 | `curl http://127.0.0.1:8000/api/livez` | 200 без обращения к базе | 200, 77 байт, `{"status": "alive", ...}` |
+| 14 | `curl http://127.0.0.1:8000/api/version` | 200, версии приложения и ETL | 200, 210 байт, `0.3.0` / ETL `1.1.0` / `PI-2026-Q3` |
+| 15 | `curl http://127.0.0.1:8000/metrics` | 200 `text/plain; version=0.0.4` | 200, 3828 байт, 122 мс (сбор из базы) |
+| 16 | `pi_planner_db_up` в выводе | `1` при живой базе, `0` при мёртвой (и всё равно 200) | `1` |
+| 17 | `pi_planner_calendar_info` | `fund_factor="6.5714"`, значение `525.71` | ровно эти значения (ADR-017) |
+| 18 | лог строкой JSON: `--log-format json` | одна строка — один объект | `{"ts": ..., "event": "http_request", "status": 200, ...}` |
+| 19 | остановка сигналом (`CTRL_BREAK_EVENT` в тесте — аналог `SIGTERM`) | штатная остановка, код возврата 0 | `server_stopped reason=SIGBREAK`, `uptime_seconds=0.77`, exit `0` |
 
 UI проверяется глазами: после `run.bat` вкладка открывается сама, карточка
 «Сервер» должна показать 17.11 / `pi_planner` / 29 / 17 и не показывать блок
 «API недоступен».
 
-Тесты: `uv run pytest -q` → `41 passed` (8 сервер + 29 планировщик + 4 календарь
-ETL). Файл
+Тесты: `uv run pytest -q` → `57 passed` (16 сервер + 8 метрики + 29 планировщик +
+4 календарь ETL). Файл
 `tests/test_server.py` поднимает сервер на свободном порту (`--port 0`) в потоке и
-дёргает его по HTTP; живая база не нужна — `app.db.health` подменяется через
+дёргает его по HTTP; живая база не нужна — `app.db.health` и сборщик
+бизнес-метрик подменяются через
 `monkeypatch`. Проверки статики помечены `skip`, если `web/dist` не собран.
 `tests/test_planner.py` работает с чистой `build_plan()` и базы не касается вовсе.
 `tests/test_etl_calendar.py` проверяет сетку спринтов и её guard: квартал закрыт
 ровно, последний спринт короткий, а ошибка конфига падает, а не режется молча.
+`tests/test_metrics.py` проверяет формат Prometheus, кэш снимка, отказ базы и
+кардинальность метки `route`.
+
+### Контракт для мониторинга (devops)
+
+Бэкенд заморожен: ниже — то, чем devops может пользоваться, не заглядывая в код.
+Переименование метрики, лейбла или эндпоинта — breaking change и объявляется
+отдельно, а не делается «попутным рефакторингом».
+
+**Эндпоинты и их роли**
+
+| Метод и путь | Ответ | Ходит в базу | Для чего |
+|---|---|---|---|
+| `GET /api/livez` | 200 JSON `{status, version, uptime_seconds, pid}` | нет | liveness-проба: по ней рестарт уместен только если процесс не отвечает |
+| `GET /api/health` | 200 JSON / 503 `database_unavailable` | да | readiness-проба: трафик и алерт «база недоступна» |
+| `GET /api/version` | 200 JSON | нет | версии приложения, ETL и PI — привязать инцидент к релизу |
+| `GET /metrics` | 200 `text/plain; version=0.0.4` | да, с кэшем | scrape Prometheus |
+
+`/metrics` отвечает 200 и при мёртвой базе: вместо бизнес-серий приходят
+`pi_planner_db_up 0` и `pi_planner_db_metrics_error{error_class="..."}`. Если
+закрывать эндпоинт при недоступной базе, мониторинг потеряет вместе с метриками
+и причину их отсутствия.
+
+**Метрики** (все с префиксом `pi_planner_`, формат собирается самим сервером —
+`prometheus_client` в зависимости не тянули)
+
+| Метрика | Тип | Лейблы | Смысл |
+|---|---|---|---|
+| `pi_planner_up` | gauge | — | 1, пока процесс отвечает |
+| `pi_planner_build_info` | gauge | `version`, `etl_version`, `pi_id`, `python` | что именно запущено, всегда 1 |
+| `pi_planner_uptime_seconds` | gauge | — | секунды с запуска |
+| `pi_planner_http_requests_total` | counter | `method`, `route`, `status` | запросы |
+| `pi_planner_http_request_duration_seconds` | summary | `method`, `route` | `_sum` и `_count`; квантилей нет — их считает Prometheus |
+| `pi_planner_http_requests_in_flight` | gauge | — | обработка «прямо сейчас» |
+| `pi_planner_db_up` | gauge | — | 1/0 — прошёл ли последний сбор из базы |
+| `pi_planner_db_metrics_timestamp_seconds` | gauge | — | когда снят снимок: алерт на устаревание |
+| `pi_planner_db_metrics_scrape_seconds` | gauge | — | сколько занял сбор |
+| `pi_planner_db_metrics_error` | gauge | `error_class` | 1 при ошибке сбора (имя класса, без текста — кардинальность) |
+| `pi_planner_plan_runs_total` | gauge | — | прогонов планировщика в базе |
+| `pi_planner_plan_last_run_info` | gauge | `run_id`, `as_of_sprint`, `status` | последний прогон, всегда 1 |
+| `pi_planner_plan_last_run_timestamp_seconds` | gauge | `run_id` | когда прогон создан |
+| `pi_planner_plan_violations` | gauge | `run_id`, `severity` | нарушения контракта: `error` обязан быть 0 |
+| `pi_planner_plan_tasks_in_quarter` | gauge | `run_id` | задач с решением `in_quarter` |
+| `pi_planner_plan_assigned_hours` | gauge | `run_id` | часы исполнителей в прогоне |
+| `pi_planner_calendar_info` | gauge | `pi_id`, `pi_start`, `pi_end`, `sprint_count`, `fund_factor` | границы PI; значение — фонд ставки за квартал (525.71) |
+
+Лейбл `route` — фиксированный набор (`/api/health`, `/api/livez`, `/api/version`,
+`/metrics`, `/api/*`, `/static`), а не URL: `/assets/index-*.js` не создаёт новую
+серию, иначе кардинальность росла бы с каждой сборкой фронта. Код ответа `0` в
+`status` означает «ответ не отправлен» — клиент оборвал соединение или хендлер
+упал; это не ошибка запроса.
+
+**Алерты, которые имеют смысл** (пороги — предложение, не догма)
+
+| Условие | Что значит |
+|---|---|
+| `pi_planner_up == 0` дольше 1 минуты | процесс не отвечает — рестарт |
+| `pi_planner_db_up == 0` дольше 2 минут | база недоступна: смотреть `/api/health` и `pi_planner_db_metrics_error` |
+| `pi_planner_plan_violations{severity="error"} > 0` | контракт плана сломан, приёмка не пройдена |
+| `time() - pi_planner_db_metrics_timestamp_seconds > 120` | снимок устарел: сбор падает или залип |
+| `rate(pi_planner_http_requests_total{status=~"5.."}[5m]) > 0` | ошибки сервера |
+
+**Scrape**
+
+```yaml
+scrape_configs:
+  - job_name: pi-planner
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["pi-planner:8000"]
+```
+
+`/metrics` — внутренний эндпоинт: наружу его закрывает Caddy, чтобы метрики
+(а с ними имена вьюх и структура БД) не уехали в публичный интернет.
+
+```caddy
+example.com {
+    # Публично: UI, health и версия. Метрики — только внутри сети.
+    handle /metrics {
+        respond 404
+    }
+    reverse_proxy pi-planner:8000
+}
+```
+
+**Логи.** По умолчанию — текст для консоли демо (`[server] http_request ...`);
+для лог-сборщика включается `--log-format json` или `PI_PLANNER_LOG_FORMAT=json`,
+и тогда каждая строка — один объект:
+
+```json
+{"ts": "2026-09-21T18:13:10.123+03:00", "level": "info", "event": "http_request",
+ "service": "pi-planner", "version": "0.3.0", "method": "GET", "path": "/api/health",
+ "route": "/api/health", "status": 200, "duration_ms": 1.27, "bytes": 145,
+ "client": "127.0.0.1"}
+```
+
+Обязательные поля: `ts` (ISO-8601 с местным смещением), `level`, `event`,
+`service`, `version`. События: `server_started`, `server_stopped`,
+`http_request`, `http_note` (сообщения самой библиотеки), `frontend_missing`.
+
+**Остановка.** `SIGTERM` / `SIGINT` (на Windows ещё `SIGBREAK`) гасят сервер
+штатно: приём новых соединений закрывается, в лог уходит `server_stopped` с
+причиной и `uptime_seconds`. Убивать процесс по таймауту не нужно —
+`docker stop` проходит за миллисекунды.
+
+**Стоимость scrape.** Бизнес-метрики берутся из базы с кэшем
+`PI_PLANNER_METRICS_TTL` (по умолчанию 15 секунд): сбор из базы — около 120 мс,
+остальные scrape берут снимок из памяти. Вьюха `v_plan_violations` тяжёлая, и без
+кэша каждый scrape считал бы все 29 проверок заново.
 
 ### Следующий шаг
 

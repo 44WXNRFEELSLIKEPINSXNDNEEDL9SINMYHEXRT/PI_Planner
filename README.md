@@ -45,7 +45,7 @@ app/planner.py       планировщик: чтение витрин → чи�
 tools/run_planner.py прогон планировщика: uv run python tools/run_planner.py --as-of-sprint 0
 tools/acceptance.sql приёмка M0: календарь, фонд, витрины, счётчики
 tools/negative_test.sql негативный тест инвариантов: битый прогон + ROLLBACK
-docs/DECISIONS.md    почему сделано именно так + как поменять (ADR-000…017)
+docs/DECISIONS.md    почему сделано именно так + как поменять (ADR-000…018)
 docs/PLANNER_SPEC.md СПЕКА ДЛЯ БЭКЕНДА: правила планирования и ловушки в данных
 docs/SCHEMA.md       что читать бэкенду, примеры запросов
 docs/ANSWERS_ORGANIZERS.md  ответы организаторов и что после них поменялось
@@ -131,6 +131,30 @@ SELECT * FROM v_plan_violations WHERE run_id = :run_id AND severity = 'error';
 Прогон планировщика — `uv run python tools/run_planner.py` (базовый план Недели 0,
 он же фиксирует `plan_baseline`; `--dry-run` считает без записи). Результат
 приёмки M2 — `docs/RUNBOOK.md`, раздел 9.
+
+## Метрики и мониторинг
+
+Сервер отдаёт четыре эндпоинта, и у каждого своя роль — путать их нельзя:
+
+| Путь | База | Зачем |
+|---|---|---|
+| `/api/livez` | не трогает | liveness: 200, пока процесс жив |
+| `/api/health` | читает | readiness: 503, если база недоступна |
+| `/api/version` | не трогает | версии приложения, ETL и PI |
+| `/metrics` | читает, с кэшем 15 с | Prometheus: 17 метрик `pi_planner_*` |
+
+Метрики собираются своим кодом (`app/metrics.py`, формат Prometheus 0.0.4, без
+`prometheus_client`): HTTP-счётчики, живость базы, последний прогон планировщика
+(`pi_planner_plan_violations{severity="error"}` обязан быть 0) и
+`pi_planner_calendar_info{fund_factor="6.5714"}` — календарь виден на дашборде, а
+не только в логах. `/metrics` отвечает 200 и при мёртвой базе: вместо бизнес-серий
+приходят `pi_planner_db_up 0` и `pi_planner_db_metrics_error{error_class}`.
+
+Имена метрик заморожены для devops (ADR-018). Полный список с лейблами,
+scrape-конфиг, разумные алерты и Caddy-правило (`respond 404`, чтобы метрики не
+уехали в публичный интернет) — `docs/RUNBOOK.md`, раздел «Контракт для
+мониторинга». Логи: текст для демо или `--log-format json` — одна строка, один
+объект.
 
 ## Проверка после заливки
 
