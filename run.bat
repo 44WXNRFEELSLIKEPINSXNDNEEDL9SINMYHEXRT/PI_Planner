@@ -65,32 +65,36 @@ if not defined NPM if exist "%~dp0tools\node\npm.cmd" (
   set "PATH=%~dp0tools\node;%PATH%"
 )
 
-rem Сборка нужна, если dist отсутствует или если web\src новее собранной
-rem страницы: правки фронта без пересборки уезжают «невидимыми», а демо-стенд
-rem собирать не умеет (там нет Node) — поэтому dist лежит в коммите.
+rem Собранный фронт лежит в коммите: на стенде без Node и без интернета он должен
+rem просто работать, поэтому пересборка здесь никогда не обязательна — кроме
+rem случая, когда web\dist нет вообще. Устаревание определяем по git, а не по
+rem времени файлов: checkout и merge переписывают mtime, и свежий dist выглядел бы
+rem «устаревшим», а это на стенде без сети обернулось бы падением на npm ci.
 set "NEED_BUILD="
-if not exist "web\dist\index.html" set "NEED_BUILD=нет сборки"
-if not defined NEED_BUILD if exist "web\src" (
-  for /f "delims=" %%S in ('powershell -NoProfile -Command "$s=(Get-ChildItem web\src -Recurse -File | Sort-Object LastWriteTime -Descending | Select-Object -First 1).LastWriteTime; if ($s -gt (Get-Item web\dist\index.html).LastWriteTime) { 'stale' }"') do set "NEED_BUILD=%%S"
+if not exist "web\dist\index.html" set "NEED_BUILD=web\dist отсутствует"
+if not defined NEED_BUILD for /f "delims=" %%C in ('git status --porcelain -- web/src 2^>nul') do set "NEED_BUILD=в web\src есть незакоммиченные правки"
+if not defined NEED_BUILD (
+  set "SRC_COMMIT="
+  set "DIST_COMMIT="
+  for /f "delims=" %%C in ('git rev-list -1 HEAD -- web/src 2^>nul') do set "SRC_COMMIT=%%C"
+  for /f "delims=" %%C in ('git rev-list -1 HEAD -- web/dist 2^>nul') do set "DIST_COMMIT=%%C"
+  call :src_vs_dist
 )
 
 if defined NEED_BUILD (
-  if defined NPM (
-    echo [run] web\dist устарел ^(%NEED_BUILD%^), собираю фронт...
+  if defined NPM if exist "web\node_modules" (
+    echo [run] %NEED_BUILD% — пересобираю web\dist...
     pushd web
-    if not exist "node_modules" (
-      call "%NPM%" ci || (echo [run] ОШИБКА: npm ci упал & popd & pause & exit /b 1)
-    )
     call "%NPM%" run build || (echo [run] ОШИБКА: сборка фронта упала & popd & pause & exit /b 1)
     popd
   ) else (
-    echo [run] ОШИБКА: %NEED_BUILD%, а npm не найден. Установите Node LTS: winget install OpenJS.NodeJS.LTS
-    echo [run] Либо соберите вручную: cd web ^&^& ..\tools\node\npm.cmd run build
-    pause & exit /b 1
+    echo [run] ВНИМАНИЕ: %NEED_BUILD%, но собрать нечем ^(нет npm или web\node_modules^).
+    echo [run] Работаю на том, что лежит в web\dist. Собрать вручную: cd web ^&^& npm ci ^&^& npm run build
   )
 )
 if not exist "web\dist\index.html" (
-  echo [run] ОШИБКА: web\dist\index.html так и не появился.
+  echo [run] ОШИБКА: web\dist\index.html нет, и собрать не удалось.
+  echo [run] Установите Node LTS: winget install OpenJS.NodeJS.LTS, затем cd web ^&^& npm ci ^&^& npm run build
   pause & exit /b 1
 )
 
@@ -107,3 +111,12 @@ rem вкладку открывает отдельный процесс чере
 start "" /b powershell -NoProfile -WindowStyle Hidden -Command "Start-Sleep -Seconds 3; Start-Process '%APP_URL%'"
 call "%UV%" run --frozen --no-sync python -m app.server --port %APP_PORT%
 endlocal
+exit /b 0
+
+rem ---------- вспомогательное: web\src ушёл вперёд web\dist? ----------
+rem Без call «%SRC_COMMIT%» раскрылось бы на этапе разбора блока и осталось пустым.
+:src_vs_dist
+if not defined SRC_COMMIT exit /b 0
+if not defined DIST_COMMIT exit /b 0
+if not "%SRC_COMMIT%"=="%DIST_COMMIT%" set "NEED_BUILD=web\src менялся после web\dist"
+exit /b 0
