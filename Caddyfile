@@ -1,0 +1,26 @@
+{
+	admin off
+}
+
+{$CADDY_DOMAIN} {
+	encode zstd gzip
+
+	log {
+		output stdout
+		format json
+	}
+
+	header {
+		-Server
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+	}
+
+	request_body {
+		max_size 10MB
+	}
+
+	reverse_proxy app:8000
+}
