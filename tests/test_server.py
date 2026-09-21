@@ -73,6 +73,10 @@ def test_database_down_gives_503_and_hides_password(base_url: str, monkeypatch) 
         raise RuntimeError("connection refused")
 
     monkeypatch.setattr(server.db, "health", boom)
+    # База может жить не на 127.0.0.1:5432: подсказка обязана называть реальный адрес.
+    monkeypatch.setattr(
+        server.db, "dsn", lambda: "host=10.20.30.40 port=5999 dbname=pi_planner user=postgres"
+    )
 
     status, _, body = get(f"{base_url}/api/health")
     payload = json.loads(body.decode("utf-8"))
@@ -81,6 +85,30 @@ def test_database_down_gives_503_and_hides_password(base_url: str, monkeypatch) 
     assert payload["error"] == "database_unavailable"
     assert "connection refused" in payload["message"]
     assert "password" not in json.dumps(payload)
+    assert payload["dsn"] == "host=10.20.30.40 port=5999 dbname=pi_planner user=postgres"
+    assert "5999" in payload["hint"]
+    assert "5432" not in payload["hint"]  # регрессия: адрес не захардкожен
+
+
+def test_broken_dsn_config_still_gives_json_503(base_url: str, monkeypatch) -> None:
+    """Сломанный dsn.json не должен превращать 503 в оборванное соединение."""
+
+    def boom() -> dict:
+        raise RuntimeError("connection refused")
+
+    def broken_dsn() -> str:
+        raise RuntimeError("dsn.json не парсится: Expecting value")
+
+    monkeypatch.setattr(server.db, "health", boom)
+    monkeypatch.setattr(server.db, "dsn", broken_dsn)
+
+    status, _, body = get(f"{base_url}/api/health")
+    payload = json.loads(body.decode("utf-8"))
+
+    assert status == 503
+    assert payload["error"] == "database_unavailable"
+    assert payload["dsn"] is None
+    assert "dsn.json" in payload["hint"]
 
 
 def test_index_served_for_root(base_url: str) -> None:

@@ -47,6 +47,35 @@ MIME_OVERRIDES = {
 KNOWN_API = ("/api/health",)
 
 
+def unavailable_payload(exc: Exception) -> dict[str, Any]:
+    """Тело 503: причина, DSN без пароля и подсказка с РЕАЛЬНЫМ адресом базы.
+
+    Адрес берём из `app.db.dsn()`, а не из константы: база может быть поднята
+    на другом порту или хосте (`dsn.json`, `PI_PLANNER_DSN`), и подсказка про
+    `127.0.0.1:5432` в этом случае уводит в сторону.
+
+    `db.dsn()` вызываем терпимо: если `dsn.json` не парсится, падает и он —
+    без этой защиты фронт вместо внятного 503 получил бы оборванное соединение.
+    """
+    try:
+        dsn = db.dsn()
+    except Exception:  # noqa: BLE001 — диагностика не должна падать сильнее причины
+        return {
+            "error": "database_unavailable",
+            "message": str(exc).strip(),
+            "dsn": None,
+            "hint": "строку подключения собрать не удалось — проверьте dsn.json "
+            "(образец: dsn.example.json)",
+        }
+    return {
+        "error": "database_unavailable",
+        "message": str(exc).strip(),
+        "dsn": dsn,
+        "hint": f"PostgreSQL по адресу «{dsn}» не отвечает — запустите run.bat; "
+        f"адрес и порт берутся из dsn.json или PI_PLANNER_DSN",
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     """GET/HEAD: `/api/*` — JSON, остальное — собранный фронт."""
 
@@ -71,15 +100,7 @@ class Handler(BaseHTTPRequestHandler):
                 payload = db.health()
             except Exception as exc:  # noqa: BLE001 — фронту нужен внятный ответ,
                 # а не оборванное соединение: демо-машина может стартовать раньше PostgreSQL
-                self._send_json(
-                    HTTPStatus.SERVICE_UNAVAILABLE,
-                    {
-                        "error": "database_unavailable",
-                        "message": str(exc).strip(),
-                        "dsn": db.dsn(),
-                        "hint": "PostgreSQL на 127.0.0.1:5432 не отвечает — запустите run.bat",
-                    },
-                )
+                self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, unavailable_payload(exc))
                 return
             self._send_json(HTTPStatus.OK, payload)
             return
