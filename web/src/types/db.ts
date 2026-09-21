@@ -345,7 +345,7 @@ export interface v_plan_assignment_detail {
   grade: string | null;
 }
 
-/** вьюха public.v_plan_violations — 5 кол. · Приёмка плана. Пустой результат = план корректен. severity=warning не блокирует, но требует отображения в UI. Правила — docs/PLANNER_SPEC.md. */
+/** вьюха public.v_plan_violations — 5 кол. · Приёмка плана: нет строк с severity = error. Строки severity = warning план не отменяют, но требуют отображения в UI. Правила — docs/PLANNER_SPEC.md, раздел 7; разбор ревью M2 — docs/REVIEW_RESPONSE.md. */
 export interface v_plan_violations {
   run_id: number | null;
   check_code: string | null;
