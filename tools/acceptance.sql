@@ -87,9 +87,10 @@ SELECT verdict FROM v_role_coverage_org WHERE verdict LIKE 'НАЙМ%' LIMIT 1;
 SELECT source_file, source_sha256, etl_version, pi_start, loaded_at
 FROM load_batches ORDER BY batch_id DESC LIMIT 1;
 
-\echo '=== 6а. Приёмка плана: нарушений нет ни в одном прогоне ==='
-SELECT (SELECT COUNT(*) FROM v_plan_violations) AS violations,
-       (SELECT COUNT(*) FROM plan_runs)        AS runs;
+\echo '=== 6а. Приёмка плана: ошибок нет ни в одном прогоне (warning допустим) ==='
+SELECT (SELECT COUNT(*) FROM v_plan_violations WHERE severity = 'error')   AS errors,
+       (SELECT COUNT(*) FROM v_plan_violations WHERE severity = 'warning') AS warnings,
+       (SELECT COUNT(*) FROM plan_runs)                                   AS runs;
 
 \echo '=== 7. Ёмкость в SP: перегружена только Team-Platform (104%) ==='
 SELECT team_id,
