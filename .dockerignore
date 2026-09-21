@@ -11,3 +11,13 @@ dsn.json
 .env
 .env.*
 *.log
+
+# В образ приложения не входят исходные данные, документация и тесты. Это
+# уменьшает build context и исключает случайную публикацию материалов хакатона.
+docs/
+tests/
+build/
+*.pdf
+*.xlsx
+run.bat
+requirements.txt

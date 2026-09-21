@@ -30,6 +30,7 @@ dsn.json
 .env.*
 !.env.example
 tmp/
+backups/
 
 # --- Portable-инструменты (локальная установка без прав администратора) ---
 tools/node/
