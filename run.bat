@@ -81,11 +81,14 @@ if not exist "web\dist\index.html" (
 
 rem ---------- 5. Сервер ----------
 if not exist "app\server.py" (
-  echo [run] app\server.py ещё не реализован ^(веха M4^). Окружение и БД готовы.
-  exit /b 0
+  echo [run] ОШИБКА: нет app\server.py — обновите рабочую копию ^(git pull^).
+  pause & exit /b 1
 )
 
 echo [run] стартую сервер на %APP_URL%
-start "" "%APP_URL%"
+rem Сервер поднимается в этом же окне и открыть вкладку сам не может: если
+rem открыть её сразу, браузер попадёт на ещё не слушающий порт. Поэтому
+rem вкладку открывает отдельный процесс через паузу, а мы сразу стартуем.
+start "" /b powershell -NoProfile -WindowStyle Hidden -Command "Start-Sleep -Seconds 3; Start-Process '%APP_URL%'"
 call "%UV%" run --frozen --no-sync python -m app.server --port %APP_PORT%
 endlocal

@@ -41,7 +41,8 @@ export default function App() {
             API недоступен: {probe.message}
             <br />
             <span className="muted">
-              Ожидаемо до вехи M4 — сервер появится в <code>app/server.py</code>.
+              Сервер не отвечает на <code>:8000</code> — запустите <code>run.bat</code> из корня
+              репозитория.
             </span>
           </p>
         )}
