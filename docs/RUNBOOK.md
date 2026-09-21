@@ -63,6 +63,24 @@ winget install --id OpenJS.NodeJS.LTS --exact
 подхватывает `tools\node\npm.cmd` автоматически.
 **На демо-машине Node не нужен:** `web/dist` собран и закоммичен.
 
+Для фронт-команды: если `node`/`npm` не в PATH, а портативная распаковка лежит в
+`tools\node`, соберите фронт так (иначе `npm ci` уйдёт в сеть и упрётся в прокси):
+
+```powershell
+cd web
+$env:PATH = "$PWD\..\tools\node;$env:PATH"   # npm.cmd зовёт `node` по имени — нужен PATH
+..\tools\node\npm.cmd ci                     # один раз, подтянуть node_modules по package-lock.json
+..\tools\node\npm.cmd run build               # пересобрать dist
+```
+
+Без добавления `tools\node` в PATH сборка падает на `tsc --noEmit` с
+«`'node' is not recognized`» — это самая частая ошибка при портативном Node.
+`run.bat` делает это сам.
+
+`run.bat` пересобирает `web/dist` сам, если исходники `web/src` новее сборки
+(сравнение времени `index.html` и самого свежего файла в `web/src`): держите
+`dist` в коммите — демо-машина собирать не умеет.
+
 ### 2.4. PostgreSQL 17
 
 Основной путь на Windows без прав администратора — portable-сборка:
@@ -131,6 +149,14 @@ git switch -c develop feature/data;      git push -u origin develop
 git switch -c feature/backend develop;   git push -u origin feature/backend
 ```
 
+Ветку фронта создаём от готового бэкенда, а не от `develop`: фронту нужны
+`/api/views` и замороженные метрики, а не «последнее состояние репозитория».
+
+```powershell
+git switch -c feature/frontend v0.2.4-backend-views   # бэкенд, на который можно опираться
+git push -u origin feature/frontend
+```
+
 Промоушен по вехам: merge `--no-ff` в `develop` + аннотированный тег.
 
 | Тег | Когда | Гейт |
@@ -140,6 +166,7 @@ git switch -c feature/backend develop;   git push -u origin feature/backend
 | `v0.2.1-m2-planner` | разбор ревью M2 | те же 0 ошибок + негативный тест срабатывает (раздел 9) |
 | `v0.2.2-data-calendar` | точный календарь PI + детерминированный ETL | приёмка M0 (раздел 7) зелёная, два прогона дают побайтово одинаковый `build/seed.sql`, `57 passed` |
 | `v0.2.3-backend-metrics` | контракт метрик для devops | `/metrics` отдаёт `pi_planner_db_up 1` и `fund_factor="6.5714"`, `/metrics` закрыт снаружи (Caddy `respond 404`) |
+| `v0.2.4-backend-views` | витрины для фронта (`/api/views`, ADR-019) | 25 витрин отвечают на живых данных, инъекция в имя витрины и в `order` не доходит до SQL, `89 passed` |
 | `v0.3-m4-ui` | экраны работают | `run.bat` открывает UI и отдаёт данные |
 | `v1.0-demo` | сдача | прогон демо-сценария без правок «на ходу» |
 
@@ -264,10 +291,11 @@ Compare-Object (Get-Content seed_a.sql) (Get-Content seed_b.sql)   # ожида�
 Сервер — `app/server.py`, только стандартная библиотека (`http.server`,
 `ThreadingHTTPServer`); реестр метрик — `app/metrics.py`. Отдельная зависимость не
 добавлялась, `uv.lock` не менялся: текстовый формат Prometheus собирается руками.
-Маршруты: `GET /api/health`, `GET /api/livez`, `GET /api/version`, `GET /metrics`
-и вся прочая статика из `web/dist` с SPA-fallback на `index.html`. Записи в БД
-нет: `app.db.health()` и сбор бизнес-метрик идут в read-only сессии, поэтому демо
-физически не может испортить данные.
+Маршруты: `GET /api/health`, `GET /api/livez`, `GET /api/version`,
+`GET /api/views` + `GET /api/views/{view}` (витрины для фронта, ADR-019),
+`GET /metrics` и вся прочая статика из `web/dist` с SPA-fallback на `index.html`.
+Записи в БД нет: `app.db.health()`, сбор бизнес-метрик и `app.views.fetch()` идут
+в read-only сессии, поэтому демо физически не может испортить данные.
 
 Прогон: `run.bat`, затем в другом окне проверки ниже.
 
@@ -277,7 +305,7 @@ Compare-Object (Get-Content seed_a.sql) (Get-Content seed_b.sql)   # ожида�
 | 2 | `server_version` / `dbname` | 17.11 / `pi_planner` | 17.11 / `pi_planner` |
 | 3 | `tables` / `views` | 29 / 17 (как в приёмке M0, п. 1б) | 29 / 17 |
 | 4 | поле `dsn` в ответе | без `password=` | `host=127.0.0.1 port=5432 dbname=pi_planner user=postgres` |
-| 5 | `curl http://127.0.0.1:8000/api/nope` | 404 JSON со списком известных эндпоинтов | 404, `known` = `/api/health`, `/api/livez`, `/api/version`, `/metrics` |
+| 5 | `curl http://127.0.0.1:8000/api/nope` | 404 JSON со списком известных эндпоинтов | 404, `known` = `/api/health`, `/api/livez`, `/api/version`, `/api/views`, `/metrics` |
 | 6 | `curl http://127.0.0.1:8000/` | 200 `text/html; charset=utf-8` | 200, `index.html`, 463 байта |
 | 7 | `curl http://127.0.0.1:8000/plan/3` | SPA-fallback на `index.html` | 200, тот же HTML |
 | 8 | `curl http://127.0.0.1:8000/assets/index-*.js` | 200 `text/javascript; charset=utf-8` | 200, 222 189 байт |
@@ -286,28 +314,41 @@ Compare-Object (Get-Content seed_a.sql) (Get-Content seed_b.sql)   # ожида�
 | 11 | PostgreSQL остановлен, `GET /api/health` | 503 JSON, сервер не падает | 503 `database_unavailable` (тест) |
 | 12 | кириллица в ошибке 404 | читаемая | «нет такого эндпоинта: /api/nope» |
 | 13 | `curl http://127.0.0.1:8000/api/livez` | 200 без обращения к базе | 200, 77 байт, `{"status": "alive", ...}` |
-| 14 | `curl http://127.0.0.1:8000/api/version` | 200, версии приложения и ETL | 200, 210 байт, `0.3.0` / ETL `1.1.0` / `PI-2026-Q3` |
-| 15 | `curl http://127.0.0.1:8000/metrics` | 200 `text/plain; version=0.0.4` | 200, 3828 байт, 122 мс (сбор из базы) |
+| 14 | `curl http://127.0.0.1:8000/api/version` | 200, версии приложения и ETL | 200, 210 байт, `0.4.0` / ETL `1.1.0` / `PI-2026-Q3` |
+| 15 | `curl http://127.0.0.1:8000/metrics` | 200 `text/plain; version=0.0.4` | 200, 4270 байт, 139 мс (сбор из базы) |
 | 16 | `pi_planner_db_up` в выводе | `1` при живой базе, `0` при мёртвой (и всё равно 200) | `1` |
 | 17 | `pi_planner_calendar_info` | `fund_factor="6.5714"`, значение `525.71` | ровно эти значения (ADR-017) |
 | 18 | лог строкой JSON: `--log-format json` | одна строка — один объект | `{"ts": ..., "event": "http_request", "status": 200, ...}` |
 | 19 | остановка сигналом (`CTRL_BREAK_EVENT` в тесте — аналог `SIGTERM`) | штатная остановка, код возврата 0 | `server_stopped reason=SIGBREAK`, `uptime_seconds=0.77`, exit `0` |
+| 20 | `GET /api/views` | 200, справочник витрин: имена, экран, колонки сортировки | 200, 25 витрин, 10 999 байт, 31 мс |
+| 21 | `GET /api/views/v_task_board?limit=1` | 200, строка витрины как есть + конверт (`as_of`, `count`, `columns`) | 200, 1503 байта, `count=45`, `returned=1`, `truncated=true`, `has_more=true` |
+| 22 | `GET /api/views/kpi_snapshots`, `/plan_task_schedule`, `/alerts`, `/v_plan_violations`, `/v_orbit_map?order=-orbit_count`, `/v_pi_fund_factor`, `/plan_runs` | 200 у всех, `run_id` подставлен там, где витрина фильтруется прогоном | 200 у всех семи; у первых четырёх `run_id=2`, `run_default=true`, у `v_orbit_map`, `v_pi_fund_factor` и `plan_runs` — `run_id=null` |
+| 23 | `GET /api/views/nope` | 404 `not_found` + `known` со всеми именами витрин | 404, 614 байт, `known` = 25 имён, `hint` со ссылкой на `/api/views` |
+| 24 | `GET /api/views/v_task_board?order=1;--` | 400 `bad_request`, `param=order`, `known` с колонками витрины, **в SQL ничего не уходит** | 400, 503 байта, 22 колонки в `known` |
+| 25 | `GET /api/views/v_task_board?limit=5001` и `?run_id=1` | 400 с объяснением (потолок `limit`; справочная витрина не фильтруется по прогону) | 400, 137 байт, «должен быть в диапазоне 1..5000» |
+| 26 | база остановлена, `GET /api/views/v_task_board` | 503 `database_unavailable` с `hint` (как `/api/health`) | 503 (тест) |
+| 27 | все витрины в метриках | одна серия `route="/api/views/{view}"`, а не серия на витрину | в живом прогоне: `/api/views` 1 × 200; `/api/views/{view}` 3 × 200, 2 × 400, 1 × 404 |
 
 UI проверяется глазами: после `run.bat` вкладка открывается сама, карточка
 «Сервер» должна показать 17.11 / `pi_planner` / 29 / 17 и не показывать блок
 «API недоступен».
 
-Тесты: `uv run pytest -q` → `57 passed` (16 сервер + 8 метрики + 29 планировщик +
-4 календарь ETL). Файл
+Тесты: `uv run pytest -q` → `89 passed` (26 сервер + 20 витрины + 10 метрики +
+29 планировщик + 4 календарь ETL). Файл
 `tests/test_server.py` поднимает сервер на свободном порту (`--port 0`) в потоке и
 дёргает его по HTTP; живая база не нужна — `app.db.health` и сборщик
 бизнес-метрик подменяются через
 `monkeypatch`. Проверки статики помечены `skip`, если `web/dist` не собран.
+`tests/test_views.py` тоже без базы: `tests/conftest.py` подменяет
+`app.views.query_dicts` фейком `FakeViewsDB`, который записывает пришедший SQL в
+`calls` — так проверяется, что инъекция в имя витрины или в `order` **не доходит
+до базы** (`fake_db.calls == []`), а не только что ответ 400.
 `tests/test_planner.py` работает с чистой `build_plan()` и базы не касается вовсе.
 `tests/test_etl_calendar.py` проверяет сетку спринтов и её guard: квартал закрыт
 ровно, последний спринт короткий, а ошибка конфига падает, а не режется молча.
-`tests/test_metrics.py` проверяет формат Prometheus, кэш снимка, отказ базы и
-кардинальность метки `route`.
+`tests/test_metrics.py` проверяет формат Prometheus, кэш снимка, отказ базы,
+замороженный набор лейблов `route` (сверяется с `server.KNOWN_API`) и что все
+витрины дают одну серию `/api/views/{view}`.
 
 ### Контракт для мониторинга (devops)
 
@@ -322,7 +363,14 @@ UI проверяется глазами: после `run.bat` вкладка о
 | `GET /api/livez` | 200 JSON `{status, version, uptime_seconds, pid}` | нет | liveness-проба: по ней рестарт уместен только если процесс не отвечает |
 | `GET /api/health` | 200 JSON / 503 `database_unavailable` | да | readiness-проба: трафик и алерт «база недоступна» |
 | `GET /api/version` | 200 JSON | нет | версии приложения, ETL и PI — привязать инцидент к релизу |
+| `GET /api/views` | 200 JSON | нет | справочник витрин для фронта (что вообще есть и по каким колонкам сортировать) |
+| `GET /api/views/{view}` | 200 JSON / 400 / 404 / 503 | да | витрины для фронта: `?run_id=&limit=&offset=&order=` |
 | `GET /metrics` | 200 `text/plain; version=0.0.4` | да, с кэшем | scrape Prometheus |
+
+`/api/views/*` — read-only витрины (ADR-019); 503 при мёртвой базе, 404 на
+неизвестное имя витрины с полным списком в теле, 400 на плохой параметр. В
+метриках они **не** заводят отдельную серию на витрину: лейбл один —
+`route="/api/views/{view}"`.
 
 `/metrics` отвечает 200 и при мёртвой базе: вместо бизнес-серий приходят
 `pi_planner_db_up 0` и `pi_planner_db_metrics_error{error_class="..."}`. Если
@@ -353,7 +401,8 @@ UI проверяется глазами: после `run.bat` вкладка о
 | `pi_planner_calendar_info` | gauge | `pi_id`, `pi_start`, `pi_end`, `sprint_count`, `fund_factor` | границы PI; значение — фонд ставки за квартал (525.71) |
 
 Лейбл `route` — фиксированный набор (`/api/health`, `/api/livez`, `/api/version`,
-`/metrics`, `/api/*`, `/static`), а не URL: `/assets/index-*.js` не создаёт новую
+`/api/views`, `/api/views/{view}`, `/metrics`, `/api/*`, `/static`), а не URL:
+`/assets/index-*.js` не создаёт новую
 серию, иначе кардинальность росла бы с каждой сборкой фронта. Код ответа `0` в
 `status` означает «ответ не отправлен» — клиент оборвал соединение или хендлер
 упал; это не ошибка запроса.
@@ -420,6 +469,10 @@ example.com {
 
 M4 (UI) — экраны поверх контракта: гант по `plan_task_schedule`, лента алертов,
 KPI-плашки по `target_min` / `target_max`, звёздная карта из `v_orbit_map`.
+Точка входа для фронта — `docs/UI_SPEC.md`: что за какой экран отвечает, какие
+витрины нужны, типы JSON и чего фронт не считает сам. Витрины уже отдаются
+эндпоинтом `/api/views/*` (ADR-019), отдельного «API под экран» не будет без
+явного запроса.
 
 ## 9. Приёмка M2 (планировщик)
 

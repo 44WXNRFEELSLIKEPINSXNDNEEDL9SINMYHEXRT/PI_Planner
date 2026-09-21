@@ -14,7 +14,7 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 
-from app import server
+from app import server, views
 
 HEALTH = {
     "dsn": "host=127.0.0.1 port=5432 dbname=pi_planner user=postgres",
@@ -329,3 +329,143 @@ def test_missing_asset_is_404_not_index(base_url: str) -> None:
 
     assert status == 404
     assert json.loads(body.decode("utf-8"))["error"] == "not_found"
+
+
+# ------------------------------------------------------- витрины для фронта (ADR-019)
+# Обращения к базе подменены фикстурой `fake_db` (tests/conftest.py): здесь
+# проверяется HTTP-поведение — коды, конверт и то, что попытка инъекции не доходит
+# до SQL. Те же витрины на живых данных — приёмка в docs/RUNBOOK.md.
+
+
+def test_views_catalog_over_http(base_url: str, fake_db) -> None:
+    """`GET /api/views` — справочник витрин: фронт читает контракт, а не угадывает."""
+    status, headers, body = get(f"{base_url}/api/views")
+    payload = json.loads(body.decode("utf-8"))
+
+    assert status == 200
+    assert headers["Content-Type"].startswith("application/json")
+    assert payload["count"] == len(views.SOURCES)
+    assert payload["limit_max"] == views.LIMIT_MAX
+    assert {item["name"] for item in payload["items"]} == set(views.BY_NAME)
+
+
+def test_three_screens_get_rows_with_the_envelope(base_url: str, fake_db) -> None:
+    """Строка витрины как есть плюс конверт: что показано, на каком прогоне, сколько всего."""
+    fake_db.rows = [{"task_id": "ONK-2475", "status": "ToDo", "remaining_hh": 10}]
+    fake_db.columns = ["task_id", "status", "remaining_hh"]
+
+    for name in ("v_task_board", "plan_task_schedule", "v_orbit_map"):
+        status, _, body = get(f"{base_url}/api/views/{name}")
+        payload = json.loads(body.decode("utf-8"))
+
+        assert status == 200, name
+        assert payload["view"] == name
+        assert payload["count"] == 1 and payload["returned"] == 1
+        assert payload["columns"] == fake_db.columns
+        assert payload["items"][0]["task_id"] == "ONK-2475"
+        assert payload["as_of"] and payload["screen"] and payload["note"]
+        assert payload["truncated"] is False and payload["has_more"] is False
+
+
+def test_view_run_defaults_to_the_last_ok_run(base_url: str, fake_db) -> None:
+    """`run_id` по умолчанию — последний удачный прогон, как в KPI и приёмке."""
+    status, _, body = get(f"{base_url}/api/views/alerts")
+    payload = json.loads(body.decode("utf-8"))
+
+    assert status == 200
+    assert payload["run_id"] == 2
+    assert payload["run_default"] is True
+    assert "status = 'ok'" in fake_db.sql[0]
+    assert "WHERE run_id = %s::int" in fake_db.select()[0]
+
+
+def test_view_accepts_run_limit_offset_and_order(base_url: str, fake_db) -> None:
+    """Параметры запроса доходят до SQL как параметры, а не склейкой строк."""
+    status, _, body = get(
+        f"{base_url}/api/views/alerts?run_id=7&limit=5&offset=2&order=-sprint_no"
+    )
+    payload = json.loads(body.decode("utf-8"))
+
+    assert status == 200
+    assert payload["run_id"] == 7 and payload["run_default"] is False
+    assert payload["limit"] == 5 and payload["offset"] == 2
+    assert payload["order"] == ["-sprint_no"]
+    assert fake_db.select()[1] == [7, 5, 2]
+
+
+def test_unknown_view_is_404_with_the_whitelist(base_url: str, fake_db) -> None:
+    """Имя витрины — не текст SQL: подстановка не доходит до базы."""
+    status, _, body = get(f"{base_url}/api/views/v_task_board%3BDROP%20TABLE%20tasks")
+    payload = json.loads(body.decode("utf-8"))
+
+    assert status == 404
+    assert payload["error"] == "not_found"
+    assert payload["known"] == [source.name for source in views.SOURCES]
+    assert "GET /api/views" in payload["hint"]
+    assert fake_db.calls == []
+
+
+def test_view_order_injection_is_400(base_url: str, fake_db) -> None:
+    """`order` — только из белого списка колонок этой витрины."""
+    status, _, body = get(f"{base_url}/api/views/v_task_board?order=task_id%3B--")
+    payload = json.loads(body.decode("utf-8"))
+
+    assert status == 400
+    assert payload["error"] == "bad_request"
+    assert payload["param"] == "order"
+    assert payload["known"] == list(views.BY_NAME["v_task_board"].orderable)
+    assert fake_db.calls == []
+
+
+def test_view_limit_above_the_cap_is_400(base_url: str, fake_db) -> None:
+    """Потолок `limit` — не пожелание: 5001 отвергается явно, а не молча режется."""
+    status, _, body = get(f"{base_url}/api/views/v_task_board?limit=5001")
+    payload = json.loads(body.decode("utf-8"))
+
+    assert status == 400
+    assert payload["param"] == "limit"
+    assert str(views.LIMIT_MAX) in payload["message"]
+    assert fake_db.calls == []
+
+
+def test_view_with_a_dead_database_is_503(base_url: str, fake_db) -> None:
+    """База упала — витрина отвечает 503 с подсказкой, как `/api/health`."""
+    fake_db.error = RuntimeError("connection refused")
+
+    status, _, body = get(f"{base_url}/api/views/v_task_board")
+    payload = json.loads(body.decode("utf-8"))
+
+    assert status == 503
+    assert payload["error"] == "database_unavailable"
+    assert "connection refused" in payload["message"]
+    assert "run.bat" in payload["hint"]
+    assert "password" not in json.dumps(payload)
+
+
+def test_empty_view_is_200_with_zero_count(base_url: str, fake_db) -> None:
+    """Пустая витрина — не 404: UI покажет «в этом прогоне переносов нет»."""
+    fake_db.rows = []
+
+    status, _, body = get(f"{base_url}/api/views/v_plan_violations?run_id=999")
+    payload = json.loads(body.decode("utf-8"))
+
+    assert status == 200
+    assert payload["count"] == 0 and payload["items"] == []
+    assert payload["columns"] == fake_db.columns
+
+
+def test_all_views_share_one_route_label(base_url: str, fake_db) -> None:
+    """Много витрин — одна серия в метриках: иначе дашборд растёт с каждым экраном."""
+    fake_db.rows = []
+    for name in ("v_task_board", "v_orbit_map", "plan_runs"):
+        get(f"{base_url}/api/views/{name}")
+
+    parsed = samples(get(f"{base_url}/metrics")[2])
+
+    assert (
+        parsed[
+            'pi_planner_http_requests_total{method="GET",route="/api/views/{view}",status="200"}'
+        ]
+        == 3.0
+    )
+    assert not [key for key in parsed if "v_task_board" in key or "v_orbit_map" in key]

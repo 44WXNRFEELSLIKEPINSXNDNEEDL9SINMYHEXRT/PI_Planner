@@ -104,6 +104,64 @@ SELECT * FROM v_plan_violations WHERE run_id = :run_id AND severity = 'error';
 (прогноз выходит за даты исходного плана) и `WINDOW_HAS_GAP` (в окне задачи есть
 спринт без назначений).
 
+## 2б. API для фронта — один маршрут на все витрины
+
+Фронт получает данные из этой схемы только через `app/views.py` (ADR-019):
+
+```
+GET /api/views                                            # справочник витрин
+GET /api/views/{view}?run_id=&limit=&offset=&order=       # строка витрины как есть
+```
+
+Один маршрут, а не маршрут на витрину: набор лейблов `route` в метриках заморожен
+(ADR-018), и отдельный путь на каждый экран раздул бы его до числа экранов. В
+метриках все витрины — одна серия `/api/views/{view}`.
+
+**Что отдаётся наружу** — 25 источников в белом списке (см. `GET /api/views`):
+
+| Группа | Источники |
+|---|---|
+| Справочный слой (§1) | `v_task_board`, `tasks`, `v_task_remaining_hh`, `v_orbit_map`, `v_satellite_capacity`, `v_engineer_role_coverage`, `v_team_capacity_sp`, `teams`, `v_role_deficit`, `v_role_deficit_effective`, `v_role_coverage_org`, `v_bus_factor`, `v_sprint_fund_factor`, `v_pi_fund_factor`, `sprints`, `initiatives`, `ref_result_options`, `v_dq_summary` |
+| Контракт прогона (§2) | `plan_runs`, `plan_task_schedule`, `v_plan_assignment_detail`, `plan_baseline`, `alerts`, `kpi_snapshots`, `v_plan_violations` |
+
+`run_id` фильтрует только источники контракта: у них он и есть ось (§2), а
+`plan_runs` намеренно **не** фильтруется — она нужна, чтобы прогон выбрать.
+Без `run_id` подставляется последний удачный (`MAX(run_id) WHERE status = 'ok'`),
+и в ответе это видно как `run_default: true`.
+
+**Чего наружу нет:** внутренняя кухня ETL (§3) и промежуточные вьюхи
+(`v_role_supply_hh`, `v_backlog_demand`) — у экранов есть готовые витрины с
+вердиктом. Писать через `/api/*` нельзя: сессии read-only.
+
+**Конверт ответа** (подробно — `docs/UI_SPEC.md`):
+
+```json
+{
+  "view": "kpi_snapshots", "kind": "table", "screen": "KPI", "note": "…",
+  "run_id": 2, "run_column": "run_id", "run_default": true,
+  "as_of": "2026-09-21T19:46:00+03:00",
+  "order": ["sprint_no", "kpi_code"], "limit": 500, "offset": 0,
+  "count": 9, "returned": 9, "truncated": false, "has_more": false,
+  "columns": ["run_id", "sprint_no", "kpi_code", "value", "target_min", "target_max", "details"],
+  "items": [{"run_id": 2, "sprint_no": 1, "kpi_code": "say_do_ratio", "value": "0.00",
+             "target_min": "90.00", "target_max": "105.00", "details": {"…": "…"}}]
+}
+```
+
+Четыре правила, которые держат фронт и документы согласованными:
+
+* `as_of` в шапке экрана обязателен: данные читаются из базы на момент запроса;
+* `count` считается отдельным `COUNT(*)` только при обрезании — «45 из 300» иначе
+  было бы неправдой, а на короткой странице лишний запрос не нужен;
+* `numeric` уезжает **строкой** (`"140.00"`): это не строка ради строки, а
+  сохранение точности, фронт конвертирует сам;
+* `ORDER BY` собирается только из `orderable` витрины (имя колонки параметром не
+  подставить), поэтому `?order=1;--` — это 400 с подсказкой, а не 500.
+
+**Коды ответов:** 200 (в том числе пустая витрина с `count: 0`), 400
+`bad_request` (параметр), 404 `not_found` (витрина, в теле — `known`),
+503 `database_unavailable` (база — как у `/api/health`).
+
 ## 3. Внутренняя кухня ETL — бэкенду не нужно
 
 `load_batches`, `dq_issues`, `role_aliases`, `task_sequence`,

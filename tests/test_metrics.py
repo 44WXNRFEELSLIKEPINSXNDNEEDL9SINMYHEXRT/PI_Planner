@@ -9,9 +9,11 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 
-from app import metrics
+from app import metrics, server
 
-KNOWN = ("/api/health", "/api/livez", "/api/version", "/metrics")
+# Набор известных маршрутов берём у сервера: лейблы метрик и маршруты не должны
+# разъезжаться (ADR-018). Сам набор заморожен — тест ниже.
+KNOWN = server.KNOWN_API
 
 SNAPSHOT = {
     "db_up": 1,
@@ -92,6 +94,21 @@ def test_render_reports_the_last_run_and_the_calendar() -> None:
     )
 
 
+def test_known_api_routes_are_frozen() -> None:
+    """Набор известных маршрутов — часть контракта (ADR-018): меняется вместе с ADR.
+
+    `/api/views` добавлен к замороженному набору вместе с витринами для фронта:
+    это расширение набора, а не переименование меток.
+    """
+    assert server.KNOWN_API == (
+        "/api/health",
+        "/api/livez",
+        "/api/version",
+        "/api/views",
+        "/metrics",
+    )
+
+
 def test_route_label_is_bounded() -> None:
     """Лейбл маршрута — фиксированный набор: произвольный путь раздул бы кардинальность."""
     reg = registry()
@@ -101,6 +118,17 @@ def test_route_label_is_bounded() -> None:
     assert reg.route_label("/api/nope") == "/api/*"
     assert reg.route_label("/assets/index-a1b2c3.js") == "/static"
     assert reg.route_label("/") == "/static"
+
+
+def test_views_share_a_single_route_label() -> None:
+    """Все витрины — один лейбл: число витрин растёт вместе с UI, кардинальность нет."""
+    reg = registry()
+
+    assert reg.route_label("/api/views") == "/api/views"
+    assert reg.route_label("/api/views/v_task_board") == "/api/views/{view}"
+    assert reg.route_label("/api/views/v_orbit_map") == "/api/views/{view}"
+    # Даже мусор в пути остаётся одной меткой: до SQL он не доходит (app/views.py).
+    assert reg.route_label("/api/views/nope;DROP TABLE tasks") == "/api/views/{view}"
 
 
 def test_counters_are_labelled_by_route_and_status() -> None:

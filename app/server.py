@@ -1,4 +1,4 @@
-"""HTTP-сервер демо: `/api/health`, `/api/livez`, `/api/version`, `/metrics`, статика.
+"""HTTP-сервер демо: `/api/*`, `/metrics`, статика из `web/dist`.
 
 Запускается ровно так, как его зовёт `run.bat`:
 
@@ -18,13 +18,19 @@ devops, описан в docs/RUNBOOK.md («Контракт для монито�
 * `/api/health` — готовность: 200 только если база отвечает, иначе 503 с
   причиной и подсказкой;
 * `/api/version` — версии приложения и ETL, работает без базы;
+* `/api/views` — справочник витрин, `/api/views/{view}` — строки витрины как
+  есть (белый список и конверт — `app/views.py`, ADR-019): маршрут один, имя
+  витрины — параметр пути, иначе фиксированный набор лейблов `route` раздулся бы
+  до числа экранов;
 * `/metrics` — всегда 200, даже при мёртвой базе (`pi_planner_db_up 0`): иначе
   мониторинг теряет вместе с метриками и причину их отсутствия.
 
 Отношение к базе — **read-only**: единственные запросы к PostgreSQL это
-`app.db.health()` и `app.db.query_one()` для бизнес-метрик, оба идут в
-read-only сессии. Ни один маршрут этого сервера не пишет в контракт планировщика.
+`app.db.health()`, `app.db.query_one()` для бизнес-метрик и `app.views.fetch()`
+для витрин, все три идут в read-only сессии. Ни один маршрут этого сервера не
+пишет в контракт планировщика.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -40,10 +46,10 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from app import __version__ as APP_VERSION
-from app import db
+from app import db, views
 from app.metrics import NO_RESPONSE_STATUS, PROMETHEUS_CONTENT_TYPE, Metrics
 
 try:  # версия ETL и PI живут в одном месте — etl/config.py, а не здесь
@@ -77,7 +83,9 @@ MIME_OVERRIDES = {
 
 # Публичный контракт для фронта и devops. `/metrics` тоже здесь: он известен
 # серверу, но наружу его закрывает Caddy (`respond 404`) — см. RUNBOOK.
-KNOWN_API = ("/api/health", "/api/livez", "/api/version", "/metrics")
+# `/api/views` — справочник витрин; сами витрины живут под ним же, но лейблом
+# `route` становится `/api/views/{view}` (см. app/metrics.py).
+KNOWN_API = ("/api/health", "/api/livez", "/api/version", "/api/views", "/metrics")
 
 # Реестр метрик один на процесс: Handler создаётся на каждый запрос.
 METRICS = Metrics(
@@ -244,6 +252,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, version_payload())
             return
 
+        if path == "/api/views":
+            # Справочник витрин: фронт получает контракт (имена, колонки сортировки,
+            # экран) не из переписки, а из живого сервера.
+            self._send_json(HTTPStatus.OK, views.catalog())
+            return
+
+        if path.startswith("/api/views/"):
+            self._views(path)
+            return
+
         if path == "/metrics":
             # Всегда 200, даже если база мертва: иначе мониторинг теряет вместе
             # с метриками и причину их отсутствия (`pi_planner_db_up 0`).
@@ -260,8 +278,46 @@ class Handler(BaseHTTPRequestHandler):
                 "error": "not_found",
                 "message": f"нет такого эндпоинта: {path}",
                 "known": list(KNOWN_API),
+                "hint": "витрины: GET /api/views (справочник), GET /api/views/{view} (строки)",
             },
         )
+
+    def _views(self, path: str) -> None:
+        """`GET /api/views/{view}` — строки витрины как есть плюс конверт (ADR-019).
+
+        Три разных «плохо» различаются кодами, и фронт должен уметь их различать:
+        404 — витрины нет в белом списке, 400 — параметр не прошёл проверку
+        (включая попытку подсунуть SQL в `order`), 503 — база не отвечает.
+        Пустая витрина — не ошибка: 200 и `count: 0`.
+        """
+        name = unquote(path[len("/api/views/") :])
+        query = parse_qs(urlparse(self.path).query)
+        try:
+            payload = views.fetch(
+                name,
+                run_id=views.parse_run_id(self._query_param(query, "run_id")),
+                limit=views.parse_limit(self._query_param(query, "limit")),
+                offset=views.parse_offset(self._query_param(query, "offset")),
+                order=self._query_param(query, "order"),
+            )
+        except views.UnknownView as exc:
+            self._send_json(HTTPStatus.NOT_FOUND, exc.payload())
+            return
+        except views.BadRequest as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, exc.payload())
+            return
+        except Exception as exc:  # noqa: BLE001 — как у /api/health: фронту нужен
+            # внятный 503, а не оборванное соединение; демо-машина может стартовать
+            # раньше PostgreSQL, а браузер кэширует «сервер недоступен» надолго
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, unavailable_payload(exc))
+            return
+        self._send_json(HTTPStatus.OK, payload)
+
+    @staticmethod
+    def _query_param(query: dict[str, list[str]], key: str) -> str | None:
+        """Первый параметр запроса или None: пустая строка значит «не задан»."""
+        values = query.get(key) or []
+        return values[0] if values and values[0] != "" else None
 
     # ---------------------------------------------------------------- статика
     def _static(self, path: str) -> None:
@@ -399,6 +455,7 @@ def main(argv: list[str] | None = None) -> int:
         log_format=LOG_FORMAT,
         liveness=f"{url}/api/livez",
         readiness=f"{url}/api/health",
+        views=f"{url}/api/views",
         metrics=f"{url}/metrics",
     )
     try:

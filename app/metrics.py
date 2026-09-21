@@ -37,6 +37,8 @@ PROMETHEUS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 # Метки маршрута — фиксированный набор (см. модуль).
 STATIC_ROUTE = "/static"
 UNKNOWN_ROUTE = "/api/*"
+VIEWS_PREFIX = "/api/views"  # справочник витрин: GET /api/views
+VIEWS_ROUTE = "/api/views/{view}"  # одна метка на все витрины: их число растёт вместе с UI
 NO_RESPONSE_STATUS = "0"  # ответ не отправлен: клиент оборвал соединение
 
 # Бизнес-метрики читаются одним запросом, чтобы снимок был согласованным:
@@ -146,6 +148,10 @@ class Metrics:
         """Метка маршрута — только из фиксированного набора (кардинальность!)."""
         if path in self.known_api:
             return path
+        if path.startswith(f"{VIEWS_PREFIX}/"):
+            # Имя витрины — часть пути, но метка у всех витрин одна: иначе каждый
+            # новый экран добавлял бы серию на дашборд devops.
+            return VIEWS_ROUTE
         if path.startswith("/api/"):
             return UNKNOWN_ROUTE
         return STATIC_ROUTE
