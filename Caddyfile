@@ -18,9 +18,17 @@
 		Permissions-Policy "camera=(), microphone=(), geolocation=()"
 	}
 
+	@assets path /assets/*
+	header @assets Cache-Control "public, max-age=31536000, immutable"
+
 	request_body {
 		max_size 10MB
 	}
 
-	reverse_proxy app:8000
+	reverse_proxy app:8000 {
+		transport http {
+			dial_timeout 3s
+			response_header_timeout 20s
+		}
+	}
 }

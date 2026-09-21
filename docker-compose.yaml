@@ -3,12 +3,16 @@ services:
   db:
     image: postgres:17-bookworm
     restart: unless-stopped
+    cpus: ${DB_CPU_LIMIT:-1.0}
+    mem_limit: ${DB_MEMORY_LIMIT:-1g}
+    pids_limit: ${DB_PIDS_LIMIT:-200}
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-pi_planner}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      # Эти SQL-файлы выполняются только при создании пустого postgres_data.
       - ./db/01_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
       - ./db/02_contract.sql:/docker-entrypoint-initdb.d/02_contract.sql:ro
       - ./build/seed.sql:/docker-entrypoint-initdb.d/03_seed.sql:ro
@@ -16,11 +20,17 @@ services:
       - ./db/04_views.sql:/docker-entrypoint-initdb.d/05_views.sql:ro
       - ./db/05_invariants.sql:/docker-entrypoint-initdb.d/06_invariants.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}" &&
+          psql -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}" -tAc
+          "SELECT to_regclass('public.load_batches') IS NOT NULL
+          AND to_regclass('public.v_plan_violations') IS NOT NULL" | grep -qx t
       interval: 5s
       timeout: 5s
-      retries: 10
-      start_period: 10s
+      retries: 20
+      start_period: 15s
     networks:
       - backend
 
@@ -29,11 +39,16 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    init: true
+    stop_grace_period: 10s
+    cpus: ${APP_CPU_LIMIT:-0.5}
+    mem_limit: ${APP_MEMORY_LIMIT:-256m}
+    pids_limit: ${APP_PIDS_LIMIT:-100}
     environment:
       APP_PORT: 8000
       PI_PLANNER_DSN: >-
         host=db port=5432 dbname=${POSTGRES_DB:-pi_planner}
-        user=${POSTGRES_USER:-postgres} password=${POSTGRES_PASSWORD:-postgres}
+        user=${POSTGRES_USER:-postgres} password=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     expose:
       - "8000"
     cap_drop:
@@ -53,11 +68,16 @@ services:
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
+    stop_grace_period: 10s
+    cpus: ${CADDY_CPU_LIMIT:-0.5}
+    mem_limit: ${CADDY_MEMORY_LIMIT:-128m}
+    pids_limit: ${CADDY_PIDS_LIMIT:-100}
     environment:
       CADDY_DOMAIN: ${CADDY_DOMAIN:-localhost}
     ports:
       - "${HTTP_PORT:-80}:80"
       - "${HTTPS_PORT:-443}:443"
+      - "${HTTPS_PORT:-443}:443/udp"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
@@ -69,7 +89,8 @@ services:
     security_opt:
       - no-new-privileges:true
     depends_on:
-      - app
+      app:
+        condition: service_healthy
     networks:
       - frontend
 
