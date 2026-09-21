@@ -216,7 +216,7 @@ CREATE TABLE pi_periods (
     pi_id              TEXT PRIMARY KEY,
     start_date         DATE     NOT NULL,
     end_date           DATE     NOT NULL,
-    sprint_count       SMALLINT NOT NULL DEFAULT 6,
+    sprint_count       SMALLINT NOT NULL DEFAULT 7,
     sprint_length_days SMALLINT NOT NULL DEFAULT 14,
     fte_hours_per_sprint SMALLINT NOT NULL DEFAULT 80,
     CHECK (end_date > start_date)
@@ -226,12 +226,25 @@ CREATE TABLE sprints (
     sprint_no  SMALLINT NOT NULL CHECK (sprint_no BETWEEN 1 AND 12),
     start_date DATE     NOT NULL,
     end_date   DATE     NOT NULL,
-    PRIMARY KEY (pi_id, sprint_no)
+    -- Генерируемая: длина спринта — единственный источник множителя фонда
+    -- (`v_pi_fund_factor`). Считать её руками в ETL нельзя — разъедется
+    -- с датами, и фонд 7-го спринта станет «обычным» молча.
+    length_days SMALLINT GENERATED ALWAYS AS ((end_date - start_date) + 1) STORED,
+    PRIMARY KEY (pi_id, sprint_no),
+    CHECK (end_date >= start_date)
 );
 COMMENT ON COLUMN pi_periods.fte_hours_per_sprint IS
  'Из онбординга: 1.0 ставки = 80 ЧЧ за 2-недельный спринт (уже с учётом Focus Factor). '
  'Лежит в данных, а не в коде вьюх, — чтобы менялось одной строкой.';
-COMMENT ON TABLE sprints IS 'Генерится ETL из PI_START (ADR-007). Датасет границы квартала явно не задаёт.';
+COMMENT ON TABLE pi_periods IS
+ 'Границы PI (ADR-007). С 1.1.0 — КАЛЕНДАРНЫЙ квартал: 01.07..30.09.2026 (92 дня). '
+ 'Фонд ставки за весь PI = fte_hours_per_sprint × v_pi_fund_factor.factor = 525.71 ЧЧ.';
+COMMENT ON TABLE sprints IS
+ 'Генерится ETL из PI_START по PI_END (ADR-007, ADR-017). Датасет границы квартала явно не задаёт. '
+ 'Последний спринт обрезается по PI_END и потому короче: 23.09..30.09.2026 = 8 дней.';
+COMMENT ON COLUMN sprints.length_days IS
+ 'Длина спринта в днях (включительно). Генерируемая колонка: ETL её не пишет. '
+ 'Множитель фонда = length_days / pi_periods.sprint_length_days.';
 
 -- =====================================================================
 --  5. ПРЕДРАСЧЁТ ГРАФА ЗАВИСИМОСТЕЙ

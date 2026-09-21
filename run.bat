@@ -58,11 +58,25 @@ if defined PGBIN (
 rem ---------- 4. Собранный фронт ----------
 set "NPM="
 where npm >nul 2>nul && set "NPM=npm"
-if not defined NPM if exist "tools\node\npm.cmd" set "NPM=tools\node\npm.cmd"
+if not defined NPM if exist "%~dp0tools\node\npm.cmd" (
+  set "NPM=%~dp0tools\node\npm.cmd"
+  rem npm.cmd зовёт `node` по имени, поэтому каталог портативного Node нужен в
+  rem PATH, иначе `tsc --noEmit` падает с «'node' is not recognized».
+  set "PATH=%~dp0tools\node;%PATH%"
+)
 
-if not exist "web\dist\index.html" (
+rem Сборка нужна, если dist отсутствует или если web\src новее собранной
+rem страницы: правки фронта без пересборки уезжают «невидимыми», а демо-стенд
+rem собирать не умеет (там нет Node) — поэтому dist лежит в коммите.
+set "NEED_BUILD="
+if not exist "web\dist\index.html" set "NEED_BUILD=нет сборки"
+if not defined NEED_BUILD if exist "web\src" (
+  for /f "delims=" %%S in ('powershell -NoProfile -Command "$s=(Get-ChildItem web\src -Recurse -File | Sort-Object LastWriteTime -Descending | Select-Object -First 1).LastWriteTime; if ($s -gt (Get-Item web\dist\index.html).LastWriteTime) { 'stale' }"') do set "NEED_BUILD=%%S"
+)
+
+if defined NEED_BUILD (
   if defined NPM (
-    echo [run] web\dist отсутствует, собираю фронт...
+    echo [run] web\dist устарел ^(%NEED_BUILD%^), собираю фронт...
     pushd web
     if not exist "node_modules" (
       call "%NPM%" ci || (echo [run] ОШИБКА: npm ci упал & popd & pause & exit /b 1)
@@ -70,7 +84,8 @@ if not exist "web\dist\index.html" (
     call "%NPM%" run build || (echo [run] ОШИБКА: сборка фронта упала & popd & pause & exit /b 1)
     popd
   ) else (
-    echo [run] ОШИБКА: нет web\dist и не найден npm. Установите Node LTS: winget install OpenJS.NodeJS.LTS
+    echo [run] ОШИБКА: %NEED_BUILD%, а npm не найден. Установите Node LTS: winget install OpenJS.NodeJS.LTS
+    echo [run] Либо соберите вручную: cd web ^&^& ..\tools\node\npm.cmd run build
     pause & exit /b 1
   )
 )

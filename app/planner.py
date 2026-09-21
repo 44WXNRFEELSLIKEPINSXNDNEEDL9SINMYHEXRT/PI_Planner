@@ -115,17 +115,23 @@ KPI_TARGETS: dict[str, tuple[Decimal | None, Decimal | None]] = {
 #  Запросы на чтение. Все — к витринам: планировщик не знает ядро изнутри.
 # ---------------------------------------------------------------------------
 PI_SQL = """
-SELECT pi_id, sprint_count, fte_hours_per_sprint
-FROM pi_periods
-ORDER BY pi_id
+SELECT p.pi_id, p.start_date, p.end_date, p.sprint_count, p.fte_hours_per_sprint,
+       COALESCE(f.days_total, p.sprint_count * p.sprint_length_days) AS pi_days,
+       COALESCE(f.factor, p.sprint_count)                            AS fund_factor
+FROM pi_periods p
+LEFT JOIN v_pi_fund_factor f ON f.pi_id = p.pi_id
+ORDER BY p.pi_id
 LIMIT 1
 """
 
+# factor спринта — из вьюхи, а не «из головы»: короткий 7-й спринт даёт
+# 0.5714 фонда, и планировщик обязан считать так же, как инварианты.
 SPRINTS_SQL = """
-SELECT sprint_no, start_date, end_date
-FROM sprints
-WHERE pi_id = %s
-ORDER BY sprint_no
+SELECT s.sprint_no, s.start_date, s.end_date, s.length_days, f.factor
+FROM sprints s
+JOIN v_sprint_fund_factor f ON f.pi_id = s.pi_id AND f.sprint_no = s.sprint_no
+WHERE s.pi_id = %s
+ORDER BY s.sprint_no
 """
 
 # Порядок обхода — правило из спеки: инициатива по скорингу, задача по топологии.
@@ -275,6 +281,13 @@ class Inputs:
     pi_id: str
     sprint_count: int
     fte_hours_per_sprint: int
+    # Календарь: PI — это КАЛЕНДАРНЫЙ квартал, а не «N × 14 дней» (ADR-017).
+    # `fund_factor` — сколько полных спринтов в квартале (92/14 = 6.5714),
+    # `sprint_factors` — множитель фонда по каждому спринту (7-й = 0.5714).
+    # Фонд ставки за PI = fte_hours_per_sprint × fund_factor = 525.71 ЧЧ.
+    fund_factor: Decimal
+    pi_days: int
+    sprint_factors: dict[int, Decimal]
     team_sp_per_sprint: dict[str, Decimal]
     tasks: tuple[TaskInput, ...]
     engineers: tuple[EngineerInput, ...]
@@ -287,12 +300,34 @@ class Inputs:
     estimate_conflict_warnings: int
     active_substitutions: int
 
+    @property
+    def fund_hours_per_fte(self) -> Decimal:
+        """Фонд одной ставки за весь PI в ЧЧ: 80 × 6.5714 = 525.71."""
+        return (self.fund_factor * Decimal(self.fte_hours_per_sprint)).quantize(
+            Decimal("0.01")
+        )
+
+    def short_sprints_note(self) -> str:
+        """Короткие спринты человеческим языком — для логов прогона и UI."""
+        short = {no: f for no, f in sorted(self.sprint_factors.items()) if f < 1}
+        if not short:
+            return "нет"
+        return ", ".join(f"спринт {no} — ×{factor}" for no, factor in short.items())
+
 
 def load_inputs() -> Inputs:
     """Читает всё, что нужно для плана. Только SELECT: сессия read-only."""
     pi = db.query_one(PI_SQL)
     if not pi:
         raise RuntimeError("pi_periods пуст: сначала залейте схему, seed и витрины (docs/RUNBOOK.md)")
+
+    # Календарь читаем один раз: из него и границы спринтов, и множители фонда.
+    sprint_rows = db.query_dicts(SPRINTS_SQL, (pi["pi_id"],))
+    if len(sprint_rows) != int(pi["sprint_count"]):
+        raise RuntimeError(
+            f"календарь PI разъехался: sprints содержит {len(sprint_rows)} строк, "
+            f"а pi_periods.sprint_count = {pi['sprint_count']} (docs/RUNBOOK.md, раздел 7)"
+        )
 
     roles_by_task: dict[str, dict[int, Decimal]] = defaultdict(dict)
     names_by_task: dict[str, dict[int, str]] = defaultdict(dict)
@@ -347,6 +382,11 @@ def load_inputs() -> Inputs:
         pi_id=pi["pi_id"],
         sprint_count=int(pi["sprint_count"]),
         fte_hours_per_sprint=int(pi["fte_hours_per_sprint"]),
+        fund_factor=Decimal(pi["fund_factor"]),
+        pi_days=int(pi["pi_days"]),
+        sprint_factors={
+            int(row["sprint_no"]): Decimal(row["factor"]) for row in sprint_rows
+        },
         team_sp_per_sprint={
             row["team_id"]: Decimal(row["available_sp_per_sprint"])
             for row in db.query_dicts(TEAM_CAPACITY_SQL)
@@ -368,8 +408,7 @@ def load_inputs() -> Inputs:
             for row in db.query_dicts(LIVE_DEPS_SQL)
         ),
         sprints={
-            row["sprint_no"]: (row["start_date"], row["end_date"])
-            for row in db.query_dicts(SPRINTS_SQL, (pi["pi_id"],))
+            row["sprint_no"]: (row["start_date"], row["end_date"]) for row in sprint_rows
         },
         all_tasks=tuple(
             (
@@ -498,6 +537,10 @@ class _Funds:
 
     def __init__(self, inputs: Inputs) -> None:
         self.fte = Decimal(inputs.fte_hours_per_sprint)
+        # Множитель фонда по спринтам. Короткий 7-й спринт даёт 0.5714 от
+        # обычного (ADR-017). Нет ключа — считаем спринт полным: безопасный
+        # дефолт для тестов и для календарей без коротких спринтов.
+        self.factors: dict[int, Decimal] = dict(inputs.sprint_factors)
         self.engineers: dict[str, EngineerInput] = {e.engineer_id: e for e in inputs.engineers}
         self._budget: dict[tuple[str, str], Decimal] = {
             (engineer.engineer_id, team_id): rate * self.fte
@@ -507,9 +550,16 @@ class _Funds:
         self._spent: dict[tuple[str, str, int], Decimal] = defaultdict(Decimal)
         self.used_sp: dict[tuple[str, int], Decimal] = defaultdict(Decimal)
 
+    def sprint_factor(self, sprint_no: int) -> Decimal:
+        """Доля фонда полного спринта, которую даёт спринт `sprint_no`."""
+        return self.factors.get(sprint_no, Decimal("1"))
+
     # ---- часы ------------------------------------------------------------
     def orbit_left(self, engineer_id: str, team_id: str, sprint_no: int) -> Decimal:
-        budget = self._budget.get((engineer_id, team_id), Decimal("0"))
+        budget = (
+            self._budget.get((engineer_id, team_id), Decimal("0"))
+            * self.sprint_factor(sprint_no)
+        )
         return budget - self._spent[(engineer_id, team_id, sprint_no)]
 
     def total_left(self, engineer_id: str, sprint_no: int) -> Decimal:
@@ -518,7 +568,9 @@ class _Funds:
             (self._spent[(engineer_id, team_id, sprint_no)] for team_id in engineer.orbits),
             Decimal("0"),
         )
-        return engineer.total_capacity_rate * self.fte - spent
+        return (
+            engineer.total_capacity_rate * self.fte * self.sprint_factor(sprint_no) - spent
+        )
 
     def spend(self, engineer_id: str, team_id: str, sprint_no: int, hours: Decimal) -> None:
         self._spent[(engineer_id, team_id, sprint_no)] += hours
@@ -788,7 +840,9 @@ def build_plan(
 
         Часы раскладываем первыми, SP проверяем по ФАКТИЧЕСКОМУ спринту старта:
         инвариант `SP_OVERFLOW` группирует SP по `start_sprint`, поэтому если
-        задача начала работать в спринте 3, ёмкость нужна именно там.
+        задача начала работать в спринте 3, ёмкость нужна именно там. Ёмкость
+        спринта = `available_sp_per_sprint` × factor спринта: в коротком 7-м
+        спринте SP меньше (ADR-017).
         """
         capacity = inputs.team_sp_per_sprint.get(task.team_id, Decimal("0"))
         for candidate in range(max(replan_floor, lower), inputs.sprint_count + 1):
@@ -798,7 +852,10 @@ def build_plan(
             if result is None:
                 continue
             rows, start_used, end_sprint = result
-            if funds.used_sp[(task.team_id, start_used)] + task.estimation_sp > capacity:
+            if (
+                funds.used_sp[(task.team_id, start_used)] + task.estimation_sp
+                > capacity * funds.sprint_factor(start_used)
+            ):
                 funds.free(rows)  # SP не влезли в спринт старта — откат и пробуем позже
                 continue
             funds.take_sp(task.team_id, start_used, task.estimation_sp)
@@ -966,9 +1023,29 @@ def _assemble(
         if 0 < len(set(ids) & in_quarter_ids) < len(ids)
     )
 
+    # Календарь уезжает в `plan_runs.params`: прогон без границ PI невозможно
+    # сопоставить с кварталом, а фонд 525.71 ЧЧ выглядит «взятым с потолка»,
+    # если рядом нет 92 дней и множителя 6.5714 (ADR-017).
+    pi_start = min((pair[0] for pair in inputs.sprints.values()), default=None)
+    pi_end = max((pair[1] for pair in inputs.sprints.values()), default=None)
+    short_sprints = {
+        str(no): str(factor)
+        for no, factor in sorted(inputs.sprint_factors.items())
+        if factor < 1
+    }
+
     params: dict[str, Any] = {
         "algorithm": ALGORITHM,
         "estimate_source": ESTIMATE_SOURCE,
+        "calendar": {
+            "pi_start": str(pi_start) if pi_start else None,
+            "pi_end": str(pi_end) if pi_end else None,
+            "sprint_count": inputs.sprint_count,
+            "pi_days": inputs.pi_days,
+            "fund_factor": str(inputs.fund_factor),
+            "fund_hh_per_fte": str(inputs.fund_hours_per_fte),
+            "short_sprints": short_sprints,
+        },
         "estimate_validated": True,
         "estimate_conflicts": inputs.estimate_conflicts,
         "estimate_conflicts_note": (
@@ -1045,7 +1122,11 @@ def _build_alerts(
 
     supply: dict[int, Decimal] = defaultdict(Decimal)
     for engineer in inputs.engineers:
-        supply[engineer.role_id] += engineer.total_capacity_rate * fte * inputs.sprint_count
+        # Фонд за квартал — через fund_factor (92/14 = 6.5714), а не sprint_count:
+        # иначе короткий 7-й спринт приписал бы роли лишние 8 дней работы.
+        supply[engineer.role_id] += (
+            engineer.total_capacity_rate * fte * inputs.fund_factor
+        )
 
     for role_id in sorted(demand):
         need = demand[role_id]

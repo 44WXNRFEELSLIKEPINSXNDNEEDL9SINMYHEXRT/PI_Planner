@@ -12,7 +12,7 @@
 | Сид (данные) | `build/seed.sql` |
 | ETL ДС (пересборка сида) | `etl/load.py`, `etl/config.py` |
 | Наш код | `app/*.py`, `tests/*.py` |
-| Демо-сервер (`/api/health` + статика `web/dist`) | `app/server.py`, только stdlib |
+| Демо-сервер (`/api/health`, `/api/livez`, `/api/version`, `/metrics` + статика `web/dist`) | `app/server.py`, `app/metrics.py` — только stdlib |
 | Фронт | `web/` (собранный — `web/dist/`, коммитим) |
 | Типы фронта из схемы БД | `tools/gen_types.py` → `web/src/types/db.ts` |
 | Приёмка БД | `tools/acceptance.sql` |
@@ -62,6 +62,24 @@ winget install --id OpenJS.NodeJS.LTS --exact
 `node-v24.19.0-win-x64.zip` в `tools\node\` — каталог в `.gitignore`, `run.bat`
 подхватывает `tools\node\npm.cmd` автоматически.
 **На демо-машине Node не нужен:** `web/dist` собран и закоммичен.
+
+Для фронт-команды: если `node`/`npm` не в PATH, а портативная распаковка лежит в
+`tools\node`, соберите фронт так (иначе `npm ci` уйдёт в сеть и упрётся в прокси):
+
+```powershell
+cd web
+$env:PATH = "$PWD\..\tools\node;$env:PATH"   # npm.cmd зовёт `node` по имени — нужен PATH
+..\tools\node\npm.cmd ci                     # один раз, подтянуть node_modules по package-lock.json
+..\tools\node\npm.cmd run build               # пересобрать dist
+```
+
+Без добавления `tools\node` в PATH сборка падает на `tsc --noEmit` с
+«`'node' is not recognized`» — это самая частая ошибка при портативном Node.
+`run.bat` делает это сам.
+
+`run.bat` пересобирает `web/dist` сам, если исходники `web/src` новее сборки
+(сравнение времени `index.html` и самого свежего файла в `web/src`): держите
+`dist` в коммите — демо-машина собирать не умеет.
 
 ### 2.4. PostgreSQL 17
 
@@ -131,6 +149,14 @@ git switch -c develop feature/data;      git push -u origin develop
 git switch -c feature/backend develop;   git push -u origin feature/backend
 ```
 
+Ветку фронта создаём от готового бэкенда, а не от `develop`: фронту нужны
+`/api/views` и замороженные метрики, а не «последнее состояние репозитория».
+
+```powershell
+git switch -c feature/frontend v0.2.4-backend-views   # бэкенд, на который можно опираться
+git push -u origin feature/frontend
+```
+
 Промоушен по вехам: merge `--no-ff` в `develop` + аннотированный тег.
 
 | Тег | Когда | Гейт |
@@ -138,6 +164,9 @@ git switch -c feature/backend develop;   git push -u origin feature/backend
 | `v0.1-m0-db` | БД поднята, приёмки M0 зелёные | 6 проверок из раздела 7 |
 | `v0.2-m2-planner` | планировщик пишет контракт | нет ошибок в `v_plan_violations` (warning допустим; замещения отклонены, ADR-010) |
 | `v0.2.1-m2-planner` | разбор ревью M2 | те же 0 ошибок + негативный тест срабатывает (раздел 9) |
+| `v0.2.2-data-calendar` | точный календарь PI + детерминированный ETL | приёмка M0 (раздел 7) зелёная, два прогона дают побайтово одинаковый `build/seed.sql`, `57 passed` |
+| `v0.2.3-backend-metrics` | контракт метрик для devops | `/metrics` отдаёт `pi_planner_db_up 1` и `fund_factor="6.5714"`, `/metrics` закрыт снаружи (Caddy `respond 404`) |
+| `v0.2.4-backend-views` | витрины для фронта (`/api/views`, ADR-019) | 25 витрин отвечают на живых данных, инъекция в имя витрины и в `order` не доходит до SQL, `89 passed` |
 | `v0.3-m4-ui` | экраны работают | `run.bat` открывает UI и отдаёт данные |
 | `v1.0-demo` | сдача | прогон демо-сценария без правок «на ходу» |
 
@@ -170,6 +199,9 @@ git push origin develop --follow-tags
 | `psql` «прошёл», но база пустая | нет `ON_ERROR_STOP=1` | всегда `-v ON_ERROR_STOP=1` |
 | История прогонов исчезла | повторный залив `seed.sql` (`TRUNCATE … RESTART IDENTITY`) | не пересевать после первого планирования |
 | `v_dq_summary` не 38 находок | залит не тот порядок файлов | перезалить по разделу 3 |
+| Фонд часов остался «80 × 6» после смены календаря | залит старый `db/04_views.sql` (без `v_pi_fund_factor`) или `sprints.length_days` нет | перезалить схему и витрины по разделу 3; проверить разделом 7, пункты 0а/0б/7б |
+| `planner: календарь PI разъехался` | `pi_periods.sprint_count` не совпадает с числом строк `sprints` | перезалить `build/seed.sql` (он генерит оба) и витрины |
+| `etl: календарь PI: спринты покрывают N дней из M` | в `etl/config.py` разошлись `PI_START` / `PI_END` / `SPRINT_COUNT` | править конфиг, а не guard: сетка обязана закрыть квартал ровно (ADR-007) |
 | `v_role_coverage_org` снова показывает 132 ЧЧ на 4 ролях | залит старый `db/03_substitutions.sql` со статусом `proposed` | перезалить файл: в нём все 6 строк `rejected` (ответ №2, ADR-010) |
 | UI показывает «API недоступен: 503: …» | PostgreSQL не отвечает или `dsn.json` смотрит в другую базу | `curl http://127.0.0.1:8000/api/health` — в теле причина, DSN без пароля и подсказка с **реальным** адресом из `dsn.json`/`PI_PLANNER_DSN`; поднять Postgres (раздел 2.4) |
 | `OSError: [WinError 10048]` при старте | порт 8000 занят прошлым запуском | закрыть прежнее окно `run.bat` (сервер останавливается по `Ctrl+C`) |
@@ -187,9 +219,11 @@ git push origin develop --follow-tags
 | № | Проверка | Эталон ДС | Факт | Итог |
 |---|---|---|---|---|
 | 0 | кодировка базы | UTF8 | UTF8 | ✅ |
-| 1 | `load_batches.row_counts` | 21 роль, 45 задач, 258 строк сметы, 19 зависимостей, 30 инженеров, 12 снимков истории, 38 находок DQ | ровно эти значения (плюс 6 команд, 117 навыков, 183 связи, 34 орбиты, 15 инициатив, 6 спринтов, 24 факта) | ✅ |
+| 0а | `pi_periods` + `v_pi_fund_factor` | календарный Q3: 01.07–30.09.2026, 92 дня, 7 спринтов, фонд ставки 525.71 ЧЧ | ровно эти значения, `fund_factor = 6.5714`, `fund_hh_per_fte = 525.71` | ✅ |
+| 0б | `v_sprint_fund_factor` | 6 полных спринтов (×1.0000) и короткий 7-й (×0.5714) | 1..6 по 14 дней / 1.0000; 7-й 23.09–30.09, 8 дней / 0.5714 | ✅ |
+| 1 | `load_batches.row_counts` | 21 роль, 45 задач, 258 строк сметы, 19 зависимостей, 30 инженеров, 12 снимков истории, 38 находок DQ | ровно эти значения (плюс 6 команд, 117 навыков, 183 связи, 34 орбиты, 15 инициатив, **7 спринтов**, 24 факта) | ✅ |
 | 1а | живые `COUNT(*)` по 8 таблицам | совпадают с `row_counts` | 38 / 34 / 30 / 21 / 19 / 258 / 45 / 12 | ✅ |
-| 1б | объекты в `public` | 29 таблиц + 15 вьюх | 29 + 15 | ✅ |
+| 1б | объекты в `public` | 29 таблиц + 17 вьюх | 29 + 17 (две новые — `v_pi_fund_factor`, `v_sprint_fund_factor`) | ✅ |
 | 2 | `v_dq_summary` | 38 находок, 0 блокирующих | 38 = 0 error + 35 warning + 3 info | ✅ |
 | 3 | `v_role_deficit`, `gap_hh > 0` | ~2371 ЧЧ на 47 связках | 47 связок, 2371.00 ЧЧ | ✅ |
 | 3а | природа дефицита | все «роли нет в команде» | 47/47, 2371.00 ЧЧ | ✅ |
@@ -198,9 +232,12 @@ git push origin develop --follow-tags
 | 4б | строгий режим замещений | 0 активных правил, 30 нативных пар | `role_substitutions`: 6 × `rejected`; `v_engineer_role_coverage`: 30 пар, все `is_native` | ✅ |
 | 5 | `v_bus_factor`, BF = 1 и спрос > 0 | 8 ролей, 1429 ЧЧ | 8 ролей, 1429.00 ЧЧ | ✅ |
 | 5а | кириллица | читаемый русский текст | «НАЙМ: закрыть некем» | ✅ |
-| 6 | `load_batches.source_sha256` | sha256 исходного xlsx | `a618cb80…f22e`, ETL 1.0.0, старт PI 2026-06-01 | ✅ |
-| 6а | `v_plan_violations` | 0 ошибок во всех прогонах планировщика | 0 `error`; 9 `warning` суммарно — по 3 `PLANNED_END_OVERSAIL` в каждом из прогонов 1, 2, 4 (приёмка M2, раздел 9) | ✅ |
+| 6 | `load_batches.source_sha256` | sha256 исходного xlsx | `a618cb80…f22e`, ETL **1.1.0**, старт PI **2026-07-01** | ✅ |
+| 6а | `v_plan_violations` | 0 ошибок во всех прогонах планировщика | 0 `error`; 12 `warning` — 5 `PLANNED_END_OVERSAIL` в прогоне 1 и 7 в прогоне 2 (раздел 9) | ✅ |
 | 7 | `v_team_capacity_sp`, SP/спринт | velocity × 0.8 | Team-K 12.80 … Team-Platform 7.20 | ✅ |
+| 7а | `v_team_capacity_sp`, SP за квартал | velocity × 0.8 × 6.5714 | Team-K 84.11 … Team-Platform 47.31 | ✅ |
+| 7б | фонд часов по спринтам (`v_satellite_capacity`) | 2400 ЧЧ в полном спринте, 1371.34 в коротком | 2400.00 × 6 и **1371.34** в 7-м (×0.5714) | ✅ |
+| 7в | `plan_assignments` по спринтам | часы только внутри спринтов 1..5 | прогон 1: 258.01 / 254.00 / 10.00; прогон 2: 158.01 / 339.00 / 25.00 | ✅ |
 
 ### Версии, на которых получен результат
 
@@ -214,19 +251,37 @@ git push origin develop --follow-tags
 | Node / npm | 24.19.0 / 11.17.0 (нужны только для сборки `web/dist`) |
 | Vite / React / TypeScript | 8.3.0 / 19.3.0 / 7.0.2 |
 
-### Находка: ETL ДС недетерминирован (M0 не блокирует)
+### Недетерминизм ETL ДС: найдено и исправлено в ETL 1.1.0
 
-`etl/load.py:468`:
+Было (`etl/load.py:468`):
 
 ```python
 title = max(set(v["titles"]), key=v["titles"].count) if v["titles"] else None
 ```
 
-На ничьей `max` берёт первый элемент **множества**, а порядок обхода `set` зависит от
-`PYTHONHASHSEED`. С `PYTHONHASHSEED=0` ETL воспроизводим байт-в-байт (два прогона дают
-один sha256), но от закоммиченного `build/seed.sql` он отличается ровно семью названиями
-инициатив: `PRODF-7121/7122/7125/7129/7131/7133/7134`. Поля `prodf_id`, `br_id`,
-`priority_rung` не меняются — на планирование это не влияет.
+На ничьей `max` брал первый элемент **множества**, а порядок обхода `set` зависит от
+`PYTHONHASHSEED`: два прогона ETL на одном и том же xlsx давали разные `build/seed.sql` —
+расходились 20 строк (заголовки инициатив `PRODF-7121/7122/7125/7129/7131/7133/7134`).
+Поля `prodf_id`, `br_id`, `priority_rung` не менялись, на планирование это не влияло, но
+закоммиченный сид перестал быть воспроизводимым артефактом: проверка 6 приёмки сверяет
+sha256 **исходника**, а не текста сида, и потому этого не видела.
+
+Стало — тай-брейк по отсортированному множеству:
+
+```python
+title = max(sorted(set(v["titles"])), key=v["titles"].count) if v["titles"] else None
+```
+
+Проверка воспроизводимости (повторять после любой правки ETL):
+
+```powershell
+python etl/load.py; Copy-Item build/seed.sql seed_a.sql
+python etl/load.py; Copy-Item build/seed.sql seed_b.sql
+Compare-Object (Get-Content seed_a.sql) (Get-Content seed_b.sql)   # ожидаем пусто
+```
+
+Факт: два прогона подряд дают побайтово одинаковый файл. Сид перегенерирован, так что
+расхождение с прежним коммитом осталось только в этих строках плюс календарь.
 
 Решение M0: источник истины — закоммиченный `build/seed.sql`, база залита из него.
 **После первого прогона планировщика базу не пересевать** (см. предупреждение в разделе 3).
@@ -234,9 +289,12 @@ title = max(set(v["titles"]), key=v["titles"].count) if v["titles"] else None
 ## 8. Приёмка сервера (стаб к вехе M4)
 
 Сервер — `app/server.py`, только стандартная библиотека (`http.server`,
-`ThreadingHTTPServer`). Отдельная зависимость не добавлялась, `uv.lock` не менялся.
-Маршруты: `GET /api/health` (JSON) и вся прочая статика из `web/dist` с SPA-fallback
-на `index.html`. Записи в БД нет: единственный запрос — `app.db.health()`, и он идёт
+`ThreadingHTTPServer`); реестр метрик — `app/metrics.py`. Отдельная зависимость не
+добавлялась, `uv.lock` не менялся: текстовый формат Prometheus собирается руками.
+Маршруты: `GET /api/health`, `GET /api/livez`, `GET /api/version`,
+`GET /api/views` + `GET /api/views/{view}` (витрины для фронта, ADR-019),
+`GET /metrics` и вся прочая статика из `web/dist` с SPA-fallback на `index.html`.
+Записи в БД нет: `app.db.health()`, сбор бизнес-метрик и `app.views.fetch()` идут
 в read-only сессии, поэтому демо физически не может испортить данные.
 
 Прогон: `run.bat`, затем в другом окне проверки ниже.
@@ -245,9 +303,9 @@ title = max(set(v["titles"]), key=v["titles"].count) if v["titles"] else None
 |---|---|---|---|
 | 1 | `curl http://127.0.0.1:8000/api/health` | 200, JSON, 5 полей | 200 `application/json; charset=utf-8`, 145 байт |
 | 2 | `server_version` / `dbname` | 17.11 / `pi_planner` | 17.11 / `pi_planner` |
-| 3 | `tables` / `views` | 29 / 15 (как в приёмке M0, п. 1б) | 29 / 15 |
+| 3 | `tables` / `views` | 29 / 17 (как в приёмке M0, п. 1б) | 29 / 17 |
 | 4 | поле `dsn` в ответе | без `password=` | `host=127.0.0.1 port=5432 dbname=pi_planner user=postgres` |
-| 5 | `curl http://127.0.0.1:8000/api/nope` | 404 JSON | 404, `{"error": "not_found", "known": ["/api/health"]}` |
+| 5 | `curl http://127.0.0.1:8000/api/nope` | 404 JSON со списком известных эндпоинтов | 404, `known` = `/api/health`, `/api/livez`, `/api/version`, `/api/views`, `/metrics` |
 | 6 | `curl http://127.0.0.1:8000/` | 200 `text/html; charset=utf-8` | 200, `index.html`, 463 байта |
 | 7 | `curl http://127.0.0.1:8000/plan/3` | SPA-fallback на `index.html` | 200, тот же HTML |
 | 8 | `curl http://127.0.0.1:8000/assets/index-*.js` | 200 `text/javascript; charset=utf-8` | 200, 222 189 байт |
@@ -255,21 +313,166 @@ title = max(set(v["titles"]), key=v["titles"].count) if v["titles"] else None
 | 10 | `web/dist` удалён, `GET /` | 503 JSON «frontend_not_built» | 503 (тест) |
 | 11 | PostgreSQL остановлен, `GET /api/health` | 503 JSON, сервер не падает | 503 `database_unavailable` (тест) |
 | 12 | кириллица в ошибке 404 | читаемая | «нет такого эндпоинта: /api/nope» |
+| 13 | `curl http://127.0.0.1:8000/api/livez` | 200 без обращения к базе | 200, 77 байт, `{"status": "alive", ...}` |
+| 14 | `curl http://127.0.0.1:8000/api/version` | 200, версии приложения и ETL | 200, 210 байт, `0.4.0` / ETL `1.1.0` / `PI-2026-Q3` |
+| 15 | `curl http://127.0.0.1:8000/metrics` | 200 `text/plain; version=0.0.4` | 200, 4270 байт, 139 мс (сбор из базы) |
+| 16 | `pi_planner_db_up` в выводе | `1` при живой базе, `0` при мёртвой (и всё равно 200) | `1` |
+| 17 | `pi_planner_calendar_info` | `fund_factor="6.5714"`, значение `525.71` | ровно эти значения (ADR-017) |
+| 18 | лог строкой JSON: `--log-format json` | одна строка — один объект | `{"ts": ..., "event": "http_request", "status": 200, ...}` |
+| 19 | остановка сигналом (`CTRL_BREAK_EVENT` в тесте — аналог `SIGTERM`) | штатная остановка, код возврата 0 | `server_stopped reason=SIGBREAK`, `uptime_seconds=0.77`, exit `0` |
+| 20 | `GET /api/views` | 200, справочник витрин: имена, экран, колонки сортировки | 200, 25 витрин, 10 999 байт, 31 мс |
+| 21 | `GET /api/views/v_task_board?limit=1` | 200, строка витрины как есть + конверт (`as_of`, `count`, `columns`) | 200, 1503 байта, `count=45`, `returned=1`, `truncated=true`, `has_more=true` |
+| 22 | `GET /api/views/kpi_snapshots`, `/plan_task_schedule`, `/alerts`, `/v_plan_violations`, `/v_orbit_map?order=-orbit_count`, `/v_pi_fund_factor`, `/plan_runs` | 200 у всех, `run_id` подставлен там, где витрина фильтруется прогоном | 200 у всех семи; у первых четырёх `run_id=2`, `run_default=true`, у `v_orbit_map`, `v_pi_fund_factor` и `plan_runs` — `run_id=null` |
+| 23 | `GET /api/views/nope` | 404 `not_found` + `known` со всеми именами витрин | 404, 614 байт, `known` = 25 имён, `hint` со ссылкой на `/api/views` |
+| 24 | `GET /api/views/v_task_board?order=1;--` | 400 `bad_request`, `param=order`, `known` с колонками витрины, **в SQL ничего не уходит** | 400, 503 байта, 22 колонки в `known` |
+| 25 | `GET /api/views/v_task_board?limit=5001` и `?run_id=1` | 400 с объяснением (потолок `limit`; справочная витрина не фильтруется по прогону) | 400, 137 байт, «должен быть в диапазоне 1..5000» |
+| 26 | база остановлена, `GET /api/views/v_task_board` | 503 `database_unavailable` с `hint` (как `/api/health`) | 503 (тест) |
+| 27 | все витрины в метриках | одна серия `route="/api/views/{view}"`, а не серия на витрину | в живом прогоне: `/api/views` 1 × 200; `/api/views/{view}` 3 × 200, 2 × 400, 1 × 404 |
 
 UI проверяется глазами: после `run.bat` вкладка открывается сама, карточка
-«Сервер» должна показать 17.11 / `pi_planner` / 29 / 15 и не показывать блок
+«Сервер» должна показать 17.11 / `pi_planner` / 29 / 17 и не показывать блок
 «API недоступен».
 
-Тесты: `uv run pytest -q` → `24 passed` (8 сервер + 16 планировщик). Файл
+Тесты: `uv run pytest -q` → `89 passed` (26 сервер + 20 витрины + 10 метрики +
+29 планировщик + 4 календарь ETL). Файл
 `tests/test_server.py` поднимает сервер на свободном порту (`--port 0`) в потоке и
-дёргает его по HTTP; живая база не нужна — `app.db.health` подменяется через
+дёргает его по HTTP; живая база не нужна — `app.db.health` и сборщик
+бизнес-метрик подменяются через
 `monkeypatch`. Проверки статики помечены `skip`, если `web/dist` не собран.
+`tests/test_views.py` тоже без базы: `tests/conftest.py` подменяет
+`app.views.query_dicts` фейком `FakeViewsDB`, который записывает пришедший SQL в
+`calls` — так проверяется, что инъекция в имя витрины или в `order` **не доходит
+до базы** (`fake_db.calls == []`), а не только что ответ 400.
 `tests/test_planner.py` работает с чистой `build_plan()` и базы не касается вовсе.
+`tests/test_etl_calendar.py` проверяет сетку спринтов и её guard: квартал закрыт
+ровно, последний спринт короткий, а ошибка конфига падает, а не режется молча.
+`tests/test_metrics.py` проверяет формат Prometheus, кэш снимка, отказ базы,
+замороженный набор лейблов `route` (сверяется с `server.KNOWN_API`) и что все
+витрины дают одну серию `/api/views/{view}`.
+
+### Контракт для мониторинга (devops)
+
+Бэкенд заморожен: ниже — то, чем devops может пользоваться, не заглядывая в код.
+Переименование метрики, лейбла или эндпоинта — breaking change и объявляется
+отдельно, а не делается «попутным рефакторингом».
+
+**Эндпоинты и их роли**
+
+| Метод и путь | Ответ | Ходит в базу | Для чего |
+|---|---|---|---|
+| `GET /api/livez` | 200 JSON `{status, version, uptime_seconds, pid}` | нет | liveness-проба: по ней рестарт уместен только если процесс не отвечает |
+| `GET /api/health` | 200 JSON / 503 `database_unavailable` | да | readiness-проба: трафик и алерт «база недоступна» |
+| `GET /api/version` | 200 JSON | нет | версии приложения, ETL и PI — привязать инцидент к релизу |
+| `GET /api/views` | 200 JSON | нет | справочник витрин для фронта (что вообще есть и по каким колонкам сортировать) |
+| `GET /api/views/{view}` | 200 JSON / 400 / 404 / 503 | да | витрины для фронта: `?run_id=&limit=&offset=&order=` |
+| `GET /metrics` | 200 `text/plain; version=0.0.4` | да, с кэшем | scrape Prometheus |
+
+`/api/views/*` — read-only витрины (ADR-019); 503 при мёртвой базе, 404 на
+неизвестное имя витрины с полным списком в теле, 400 на плохой параметр. В
+метриках они **не** заводят отдельную серию на витрину: лейбл один —
+`route="/api/views/{view}"`.
+
+`/metrics` отвечает 200 и при мёртвой базе: вместо бизнес-серий приходят
+`pi_planner_db_up 0` и `pi_planner_db_metrics_error{error_class="..."}`. Если
+закрывать эндпоинт при недоступной базе, мониторинг потеряет вместе с метриками
+и причину их отсутствия.
+
+**Метрики** (все с префиксом `pi_planner_`, формат собирается самим сервером —
+`prometheus_client` в зависимости не тянули)
+
+| Метрика | Тип | Лейблы | Смысл |
+|---|---|---|---|
+| `pi_planner_up` | gauge | — | 1, пока процесс отвечает |
+| `pi_planner_build_info` | gauge | `version`, `etl_version`, `pi_id`, `python` | что именно запущено, всегда 1 |
+| `pi_planner_uptime_seconds` | gauge | — | секунды с запуска |
+| `pi_planner_http_requests_total` | counter | `method`, `route`, `status` | запросы |
+| `pi_planner_http_request_duration_seconds` | summary | `method`, `route` | `_sum` и `_count`; квантилей нет — их считает Prometheus |
+| `pi_planner_http_requests_in_flight` | gauge | — | обработка «прямо сейчас» |
+| `pi_planner_db_up` | gauge | — | 1/0 — прошёл ли последний сбор из базы |
+| `pi_planner_db_metrics_timestamp_seconds` | gauge | — | когда снят снимок: алерт на устаревание |
+| `pi_planner_db_metrics_scrape_seconds` | gauge | — | сколько занял сбор |
+| `pi_planner_db_metrics_error` | gauge | `error_class` | 1 при ошибке сбора (имя класса, без текста — кардинальность) |
+| `pi_planner_plan_runs_total` | gauge | — | прогонов планировщика в базе |
+| `pi_planner_plan_last_run_info` | gauge | `run_id`, `as_of_sprint`, `status` | последний прогон, всегда 1 |
+| `pi_planner_plan_last_run_timestamp_seconds` | gauge | `run_id` | когда прогон создан |
+| `pi_planner_plan_violations` | gauge | `run_id`, `severity` | нарушения контракта: `error` обязан быть 0 |
+| `pi_planner_plan_tasks_in_quarter` | gauge | `run_id` | задач с решением `in_quarter` |
+| `pi_planner_plan_assigned_hours` | gauge | `run_id` | часы исполнителей в прогоне |
+| `pi_planner_calendar_info` | gauge | `pi_id`, `pi_start`, `pi_end`, `sprint_count`, `fund_factor` | границы PI; значение — фонд ставки за квартал (525.71) |
+
+Лейбл `route` — фиксированный набор (`/api/health`, `/api/livez`, `/api/version`,
+`/api/views`, `/api/views/{view}`, `/metrics`, `/api/*`, `/static`), а не URL:
+`/assets/index-*.js` не создаёт новую
+серию, иначе кардинальность росла бы с каждой сборкой фронта. Код ответа `0` в
+`status` означает «ответ не отправлен» — клиент оборвал соединение или хендлер
+упал; это не ошибка запроса.
+
+**Алерты, которые имеют смысл** (пороги — предложение, не догма)
+
+| Условие | Что значит |
+|---|---|
+| `pi_planner_up == 0` дольше 1 минуты | процесс не отвечает — рестарт |
+| `pi_planner_db_up == 0` дольше 2 минут | база недоступна: смотреть `/api/health` и `pi_planner_db_metrics_error` |
+| `pi_planner_plan_violations{severity="error"} > 0` | контракт плана сломан, приёмка не пройдена |
+| `time() - pi_planner_db_metrics_timestamp_seconds > 120` | снимок устарел: сбор падает или залип |
+| `rate(pi_planner_http_requests_total{status=~"5.."}[5m]) > 0` | ошибки сервера |
+
+**Scrape**
+
+```yaml
+scrape_configs:
+  - job_name: pi-planner
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["pi-planner:8000"]
+```
+
+`/metrics` — внутренний эндпоинт: наружу его закрывает Caddy, чтобы метрики
+(а с ними имена вьюх и структура БД) не уехали в публичный интернет.
+
+```caddy
+example.com {
+    # Публично: UI, health и версия. Метрики — только внутри сети.
+    handle /metrics {
+        respond 404
+    }
+    reverse_proxy pi-planner:8000
+}
+```
+
+**Логи.** По умолчанию — текст для консоли демо (`[server] http_request ...`);
+для лог-сборщика включается `--log-format json` или `PI_PLANNER_LOG_FORMAT=json`,
+и тогда каждая строка — один объект:
+
+```json
+{"ts": "2026-09-21T18:13:10.123+03:00", "level": "info", "event": "http_request",
+ "service": "pi-planner", "version": "0.3.0", "method": "GET", "path": "/api/health",
+ "route": "/api/health", "status": 200, "duration_ms": 1.27, "bytes": 145,
+ "client": "127.0.0.1"}
+```
+
+Обязательные поля: `ts` (ISO-8601 с местным смещением), `level`, `event`,
+`service`, `version`. События: `server_started`, `server_stopped`,
+`http_request`, `http_note` (сообщения самой библиотеки), `frontend_missing`.
+
+**Остановка.** `SIGTERM` / `SIGINT` (на Windows ещё `SIGBREAK`) гасят сервер
+штатно: приём новых соединений закрывается, в лог уходит `server_stopped` с
+причиной и `uptime_seconds`. Убивать процесс по таймауту не нужно —
+`docker stop` проходит за миллисекунды.
+
+**Стоимость scrape.** Бизнес-метрики берутся из базы с кэшем
+`PI_PLANNER_METRICS_TTL` (по умолчанию 15 секунд): сбор из базы — около 120 мс,
+остальные scrape берут снимок из памяти. Вьюха `v_plan_violations` тяжёлая, и без
+кэша каждый scrape считал бы все 29 проверок заново.
 
 ### Следующий шаг
 
 M4 (UI) — экраны поверх контракта: гант по `plan_task_schedule`, лента алертов,
 KPI-плашки по `target_min` / `target_max`, звёздная карта из `v_orbit_map`.
+Точка входа для фронта — `docs/UI_SPEC.md`: что за какой экран отвечает, какие
+витрины нужны, типы JSON и чего фронт не считает сам. Витрины уже отдаются
+эндпоинтом `/api/views/*` (ADR-019), отдельного «API под экран» не будет без
+явного запроса.
 
 ## 9. Приёмка M2 (планировщик)
 
@@ -286,21 +489,21 @@ uv run python tools/run_planner.py --dry-run --initiative-mode atomic
 строки `severity = 'warning'` план не отменяют, но показываются в UI:
 
 ```sql
-SELECT * FROM v_plan_violations WHERE run_id = 4;                          -- всё
-SELECT * FROM v_plan_violations WHERE run_id = 4 AND severity = 'error';   -- приёмка
+SELECT * FROM v_plan_violations WHERE run_id = 2;                          -- всё
+SELECT * FROM v_plan_violations WHERE run_id = 2 AND severity = 'error';   -- приёмка
 ```
 
-| № | Проверка | Ожидаемо | Факт (прогон 4) |
+| № | Проверка | Ожидаемо | Факт (прогоны 1 и 2) |
 |---|---|---|---|
-| 1 | `v_plan_violations`, `severity='error'` | пусто | **0 строк** по всем прогонам (1, 2, 4) |
-| 2 | `v_plan_violations`, `severity='warning'` | допустимо | 3 строки `PLANNED_END_OVERSAIL` (`MOB-7011`, `KP-0000`, `QA-9022`) — прогноз позже даты исходного плана, ADR-016 |
-| 3 | `plan_task_schedule` | строка на каждую живую задачу | 37 (7 `in_quarter`, 30 `deferred_next_pi` / `M2`, `M3` — 0) |
+| 1 | `v_plan_violations`, `severity='error'` | пусто | **0 строк** в обоих прогонах |
+| 2 | `v_plan_violations`, `severity='warning'` | допустимо | `PLANNED_END_OVERSAIL`: **5** строк в прогоне 1, **7** в прогоне 2 — прогноз позже даты исходного плана (ADR-016). После перехода на календарный квартал выросло: 20 задач стартуют 01.06, то есть до PI (ADR-007) |
+| 3 | `plan_task_schedule` | строка на каждую живую задачу | 37 = 7 `in_quarter` + 30 `deferred_next_pi` (причина `M2`; `M3` — 0) |
 | 4 | `plan_assignments` | часы внутри окон, фондов и бюджетов орбит | 18 строк, 522.01 ЧЧ, из них заём — 6 строк / 187.00 ЧЧ |
-| 5 | `plan_baseline` | только при `as_of_sprint = 0`, и не расходится с каноническим прогоном | 37 строк, 7 `committed`; совпадает с прогоном 1 |
-| 6 | `task_state` | слепок всех задач | 45 строк на `as_of_sprint = 0` |
-| 7 | `alerts` | red по инициативам, orange по ролям | 14 `red/deadline_miss` + 6 `orange/role_deficit`, жёлтых нет (первый прогон — сравнивать не с чем) |
-| 8 | `kpi_snapshots` | 1 + `sprint_count` + 1 | `pi_predictability` 6.67 (норма 80–100), `say_do_ratio` 100.00 в каждом спринте, `bus_factor` 0.00 (норма > 1) |
-| 9 | `plan_runs.params` | правила прогона записаны | `estimate_source = matrix_column_sum`, `estimate_validated = true`, `estimate_conflicts = 25`, `substitution_mode = rejected`, `objective`, `dependency_mode = start_start`, `initiative_mode = greedy`, `replan_floor = 1`, `initiatives_planned = 15`, `initiatives_complete = 1`, `initiatives_partial = [5 инициатив]` |
+| 5 | `plan_baseline` | только при `as_of_sprint = 0` | 37 строк, 7 `committed` — есть только у прогона 1 |
+| 6 | `task_state` | слепок всех задач | 45 строк на каждый прогон |
+| 7 | `alerts` | red по инициативам, orange по ролям | 14 `red/deadline_miss` + 6 `orange/role_deficit`; в прогоне 2 ещё 3 `yellow/cascade_shift` (в первом сравнивать не с чем) |
+| 8 | `kpi_snapshots` | 1 + `sprint_count` + 1 | `pi_predictability` 6.67 (норма 80–100), `bus_factor` 0.00 (норма > 1), `say_do_ratio` 7 строк: 100.00 в прогоне 1, 0.00–100.00 в прогоне 2 |
+| 9 | `plan_runs.params` | правила **и календарь** прогона записаны | `estimate_source = matrix_column_sum`, `estimate_validated = true`, `estimate_conflicts = 25`, `substitution_mode = rejected`, `objective`, `dependency_mode = start_start`, `initiative_mode = greedy`, `replan_floor = 1`, `initiatives_planned = 15`, `initiatives_complete = 1`, `initiatives_partial = [5 инициатив]`, `calendar = {2026-07-01..2026-09-30, 92 дня, 7 спринтов, fund_factor 6.5714, fund_hh_per_fte 525.71, short_sprints {"7": "0.5714"}}` |
 | 10 | `is_loan` | считает СУБД, не мы | 6 строк с `home_team_id <> serving_team_id`, в `INSERT` колонки нет |
 | 11 | Проверок в `db/05_invariants.sql` | 29 (A…AC) | см. таблицу кодов в `docs/PLANNER_SPEC.md`, раздел 7 |
 
@@ -317,37 +520,51 @@ SELECT * FROM v_plan_violations WHERE run_id = 4 AND severity = 'error';   -- п
 роли есть в штате (замер в `docs/ANSWERS_ORGANIZERS.md`). Планировщик проверяет
 ещё часы и SP-ёмкость, и четыре задачи упираются именно в них: `AI-302`
 (216 ЧЧ), `DB-202` (247 ЧЧ), `MOB-7012` (210 ЧЧ), `SRV-4042` (120 ЧЧ). Плюс
-`Team-Platform` — структурное горлышко: 43.2 SP за квартал против 45 SP спроса.
+`Team-Platform` — структурное горлышко: 47.31 SP за квартал против 45 SP спроса.
 Роли есть, а рук на всё не хватает — это честнее и совпадает с выводом M0 про
 ресурсы, а не граф.
 
-**Прогоны 1, 2 и 4.** Прогон 1 — первый: на нём нашлась неточность формулы
-`say_do_ratio` (считался кумулятивно, а спека требует «в спринте / на спринт»).
-Прогон 2 — приёмочный: тот же алгоритм и то же расписание, отличается только KPI.
-Прогон 4 — после разбора ревью M2: добавлены `params`, инициативные счётчики
-и три новых warning-а. Все строки остались в `plan_runs` — история пересчётов
-не перезаписывается, а обещание Недели 0 берётся из ПЕРВОГО базового прогона
-(`MIN(run_id) = 1`).
+**Календарь Q3 не изменил состав плана — и это ожидаемо.** Фонд вырос с 480 до
+525.71 ЧЧ (+9.5%) и ёмкость `Team-Platform` с 43.2 до 47.31 SP, но в квартал
+по-прежнему попадают те же 7 задач на те же 522.01 ЧЧ: узкое место — покрытие
+ролей (11 задач из 37), а не часы. Замер «до» снят из дампа того же дня, а не
+по памяти: `%USERPROFILE%\pg17\backups\pi_planner_before_calendar_1_1_0.dump`.
+Разбор — `docs/ANSWERS_ORGANIZERS.md`, «Ответ №5».
 
-Номера 1, 2, 4 без 3: значение последовательности израсходовала транзакция
-негативного теста (см. ниже). Пропуск в нумерации — норма,
-`run_id` не претендует на непрерывность.
+**Прогоны 1 и 2.** Прогон 1 — базовый план Недели 0 (`as_of_sprint = 0`): он
+фиксирует `plan_baseline`, то есть обещание Недели 0, и на него смотрит
+`BASELINE_STARTS_SQL` (`MIN(run_id)`). Прогон 2 — пересчёт на начало 3-го
+спринта (`as_of_sprint = 3`, ADR-014): состав квартала тот же (7 задач,
+522.01 ЧЧ, те же займы 187.00 ЧЧ), но окна сдвинуты — `replan_floor = 3`,
+никто не планируется в закрытые спринты 1–2 (это гарантирует проверка **Y**),
+а `SRV-4051` растянулась на 4..5. Добавились 3 `yellow/cascade_shift`:
+появилось с чем сравнивать.
 
-Расписание и назначения прогонов 2 и 4 совпадают побитово; это проверено
-запросом, а не глазами:
+Пропуски в нумерации (`run_id` 3) — следствие негативного теста: он берёт
+значение последовательности и откатывается. `run_id` не претендует на
+непрерывность, а обещание Недели 0 всё равно берётся из первого базового
+прогона, а не из «первого по счёту».
+
+Что пересчёт действительно не ломает — видно запросом, а не глазами:
 
 ```sql
+-- Ни одного назначения в закрытые спринты (проверка Y молчит):
+SELECT count(*) FROM plan_assignments a
+JOIN plan_runs r ON r.run_id = a.run_id
+WHERE r.as_of_sprint > 0 AND a.sprint_no < r.as_of_sprint;   -- 0
+
+-- Обещание Недели 0 одно и то же у базовой линии и у прогона 1:
 SELECT count(*) FROM (
-  SELECT task_id, sprint_no, engineer_id, role_id, hours, home_team_id, serving_team_id
-    FROM plan_assignments WHERE run_id = 2
+  SELECT task_id, planned_sp, committed FROM plan_baseline WHERE run_id = 1
   EXCEPT
-  SELECT task_id, sprint_no, engineer_id, role_id, hours, home_team_id, serving_team_id
-    FROM plan_assignments WHERE run_id = 4
+  SELECT s.task_id, COALESCE(t.estimation_sp, 0), (s.decision = 'in_quarter')
+    FROM plan_task_schedule s JOIN tasks t USING (task_id)
+   WHERE s.run_id = 1 AND t.status IN ('ToDo', 'InProgress')
 ) x;   -- 0
 ```
 
 **Варианты правил (ADR-013).** Обе новые ветки прогоняются по живому датасету
-и меняют результат измеримо:
+и меняют результат измеримо (замер 21.09.2026, `--dry-run`, календарь Q3):
 
 | Запуск | Задачи в квартале | Инициатив целиком | Назначений | Займов | `pi_predictability` |
 |---|---|---|---|---|---|
@@ -361,22 +578,29 @@ SELECT count(*) FROM (
 значение по умолчанию: он стоит 5 задач из 7 и не приносит ни одного пункта KPI.
 
 **Негативный тест.** Проверки, которые всегда молчат, ничего не доказывают.
-Синтетический «плохой» прогон собирается внутри транзакции и откатывается:
+Синтетический «плохой» прогон лежит в `tools/negative_test.sql`: собирается
+внутри транзакции и откатывается.
 
-```sql
-BEGIN;
--- ... вставка заведомо битого прогона (закрытый спринт, перенос без причины,
---     часы сверх фонда, нарушенная зависимость, пустой KPI, нет алертов) ...
-SELECT DISTINCT check_code FROM v_plan_violations WHERE run_id = :bad;   -- ждём P..AA
-ROLLBACK;
+```bash
+psql -h 127.0.0.1 -U postgres -d pi_planner -v ON_ERROR_STOP=1 -f tools/negative_test.sql
 ```
 
-Факт: сработали `DEPENDENCY_BLOCKER_DEFERRED`, `START_BEFORE_EARLIEST`,
-`WINDOW_OUTSIDE_PI`, `DEFERRED_WITHOUT_REASON`, `ORBIT_OVER_BUDGET`,
-`ASSIGNMENT_IN_CLOSED_SPRINT`, `STATE_SNAPSHOT_INCOMPLETE`, `ALERTS_MISSING`,
-`KPI_INCOMPLETE` — 72 строки нарушений, после `ROLLBACK` база не изменилась.
-Проверка новых кодов выполнена на транзакции, а не на живых прогонах: живые
-прогоны получают 0 ошибок, и «нулей» для доказательства мало.
+Что ломается намеренно: перенесённая блокирующая при блокируемой «в квартале»
+(P), окно 3..9 при 7 спринтах (R), старт раньше графа (Q), перенос без причины
+(S), 9999 ЧЧ одному исполнителю (B, X), назначения в закрытые спринты при
+`as_of_sprint = 3` (Y), одна строка `task_state` вместо 45 (Z), ни одного
+алерта при 30 переносах (AA), ни одной строки KPI (W), а также намеренное
+переполнение SP и недогруз («толпа» задач одной команды в 4-м спринте: A, H).
+
+Факт: **56 нарушений, из них 54 `error`, 14 различных кодов** —
+`ALERTS_MISSING`, `ASSIGNMENT_IN_CLOSED_SPRINT`, `ASSIGNMENT_OUTSIDE_WINDOW`,
+`DEFERRED_WITHOUT_REASON`, `DEPENDENCY_BLOCKER_DEFERRED`, `ENGINEER_OVERLOAD`,
+`KPI_INCOMPLETE`, `ORBIT_OVER_BUDGET`, `SP_OVERFLOW`, `START_BEFORE_EARLIEST`,
+`STATE_SNAPSHOT_INCOMPLETE`, `UNDER_ALLOCATED`, `WINDOW_OUTSIDE_PI` и warning
+`WINDOW_HAS_GAP`. После `ROLLBACK` битого прогона в `plan_runs` не остаётся
+(`SELECT count(*) FROM plan_runs WHERE algorithm = 'negative-test'` → 0).
+Проверять коды на транзакции приходится именно потому, что живые прогоны дают
+0 ошибок: «нулей» для доказательства мало.
 
 **Разбор ревью M2.** `docs/REVIEW_RESPONSE.md`: 10 пунктов ревью, у каждого —
 что сделано и какой ADR это закрепил; все 10 закрыты. Там же 5 вопросов, которые
@@ -386,5 +610,13 @@ ROLLBACK;
 
 **Заморозка.** После этих прогонов базу не пересевать: `build/seed.sql` сносит
 `plan_runs` вместе со всей историей. Откат — дамп `pg_dump -Fc` в
-`%USERPROFILE%\pg17\backups\` (вне репозитория), снят перед первым прогоном M2.
+`%USERPROFILE%\pg17\backups\` (вне репозитория). Дамп снят перед переходом на
+календарный квартал: `pi_planner_before_calendar_1_1_0.dump` — из него
+восстановлен замер «до» для таблицы в `docs/ANSWERS_ORGANIZERS.md`.
+
+Если пересев всё же понадобился (например, после правки `etl/config.py`),
+порядок такой: дамп → залив шести файлов по разделу 3 → приёмка M0 (раздел 7)
+→ прогоны заново (`tools/run_planner.py`, затем `--as-of-sprint 3`) → негативный
+тест. Обновить ожидаемые числа в разделах 7 и 9 этого файла, если календарь
+или фонд поехали.
 

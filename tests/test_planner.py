@@ -81,11 +81,35 @@ def inputs(
     all_tasks: tuple[tuple[str, str, Decimal, Decimal], ...] = (),
     conflicts: int = 0,
     coverage: dict[tuple[str, int], Decimal] | None = None,
+    sprint_lengths: dict[int, int] | None = None,
 ) -> planner.Inputs:
+    """Вход планировщика. Календарь — как в БД: спринты подряд, длина по умолчанию 14.
+
+    `sprint_lengths` задаёт длину отдельных спринтов: короткий спринт
+    (например, `{7: 8}`) даёт пропорционально меньший фонд — ровно так, как
+    это делает `v_sprint_fund_factor` (ADR-017). Множитель округляется до
+    4 знаков, как `ROUND(..., 4)` в Postgres.
+    """
+    lengths = {n: (sprint_lengths or {}).get(n, 14) for n in range(1, sprint_count + 1)}
+    sprint_factors = {
+        n: (Decimal(days) / Decimal(14)).quantize(Decimal("0.0001"))
+        for n, days in lengths.items()
+    }
+    starts: dict[int, date] = {}
+    cursor = date(2026, 6, 1)
+    for n in range(1, sprint_count + 1):
+        starts[n] = cursor
+        cursor += timedelta(days=lengths[n])
+
     return planner.Inputs(
         pi_id="PI-TEST",
         sprint_count=sprint_count,
         fte_hours_per_sprint=fte,
+        # Фонд квартала — сумма фондов спринтов, а не «sprint_count × 80»:
+        # на календаре 92 дня это 6.5714 вместо 7 (ADR-017).
+        fund_factor=sum(sprint_factors.values(), Decimal("0")),
+        pi_days=sum(lengths.values()),
+        sprint_factors=sprint_factors,
         team_sp_per_sprint={team: Decimal(cap) for team, cap in (team_sp or {T1: 100}).items()},
         tasks=tuple(tasks),
         engineers=tuple(engineers),
@@ -98,10 +122,7 @@ def inputs(
         ),
         deps=tuple(deps),
         sprints={
-            n: (
-                date(2026, 6, 1) + timedelta(days=14 * (n - 1)),
-                date(2026, 6, 14) + timedelta(days=14 * (n - 1)),
-            )
+            n: (starts[n], starts[n] + timedelta(days=lengths[n] - 1))
             for n in range(1, sprint_count + 1)
         },
         all_tasks=tuple(all_tasks),
@@ -153,6 +174,100 @@ def test_engineer_fund_is_the_sum_of_all_orbits() -> None:
     for row in plan.assignments:
         per_sprint[row.sprint_no] += row.hours
     assert all(hours <= Decimal("80") for hours in per_sprint.values())
+
+
+def test_short_sprint_gives_proportionally_less_hours() -> None:
+    """ADR-017: короткий спринт даёт МЕНЬШЕ часов, а не «те же 80».
+
+    8 дней из 14 — множитель 0.5714, ставка 1.0 даёт 45.712 ЧЧ вместо 80.
+    Задача на 45 ЧЧ в такой спринт влезает, на 46 — уже нет; на полном
+    спринте влезают обе. Иначе фонд квартала вылез бы за 92 дня календаря.
+    """
+    short = {7: 8}
+    fits = planner.build_plan(
+        inputs(
+            [task("T-1", roles={1: 45}, earliest=7)],
+            [engineer("ENG-1")],
+            sprint_count=7,
+            sprint_lengths=short,
+        )
+    )
+    over = planner.build_plan(
+        inputs(
+            [task("T-1", roles={1: 46}, earliest=7)],
+            [engineer("ENG-1")],
+            sprint_count=7,
+            sprint_lengths=short,
+        )
+    )
+    full = planner.build_plan(
+        inputs([task("T-1", roles={1: 46}, earliest=7)], [engineer("ENG-1")], sprint_count=7)
+    )
+
+    assert [(a.sprint_no, a.hours) for a in fits.assignments] == [(7, Decimal("45"))]
+    assert over.schedule[0].decision == "deferred_next_pi"
+    assert over.schedule[0].decision_reason == planner.DEFERRED_REASON
+    assert over.assignments == ()
+    assert [(a.sprint_no, a.hours) for a in full.assignments] == [(7, Decimal("46"))]
+
+
+def test_pi_fund_is_proportional_to_calendar_length() -> None:
+    """Фонд квартала = 80 ЧЧ × fund_factor, где fund_factor = дни / 14.
+
+    Календарь Q3-2026: 6 × 14 + 8 = 92 дня → 6.5714 → 525.71 ЧЧ на ставку.
+    525 ЧЧ за квартал помещаются, 526 — уже нет (иначе «седьмой спринт
+    подарил бы 8 дней, которых в квартале нет»).
+    """
+    source = inputs(
+        [task("T-1", roles={1: 525})],
+        [engineer("ENG-1")],
+        sprint_count=7,
+        sprint_lengths={7: 8},
+    )
+
+    assert source.pi_days == 92
+    assert source.fund_factor == Decimal("6.5714")
+
+    plan = planner.build_plan(source)
+    assert sum(a.hours for a in plan.assignments) == Decimal("525")
+    assert plan.schedule[0].end_sprint == 7
+
+    too_much = planner.build_plan(
+        inputs(
+            [task("T-1", roles={1: 526})],
+            [engineer("ENG-1")],
+            sprint_count=7,
+            sprint_lengths={7: 8},
+        )
+    )
+    assert too_much.schedule[0].decision == "deferred_next_pi"
+    assert too_much.assignments == ()
+
+
+def test_calendar_lands_in_params() -> None:
+    """Прогон несёт календарь: без него фонд 525.71 ЧЧ необъясним (ADR-017)."""
+    plan = planner.build_plan(
+        inputs([task("T-1")], [engineer("ENG-1")], sprint_count=7, sprint_lengths={7: 8})
+    )
+
+    calendar = plan.params["calendar"]
+    assert calendar["sprint_count"] == 7
+    assert calendar["pi_days"] == 92
+    assert calendar["fund_factor"] == "6.5714"
+    assert calendar["fund_hh_per_fte"] == "525.71"
+    assert calendar["short_sprints"] == {"7": "0.5714"}
+    assert calendar["pi_start"] == "2026-06-01"
+    assert calendar["pi_end"] == "2026-08-31"
+
+
+def test_full_calendar_has_no_short_sprints_in_params() -> None:
+    """Календарь без коротких спринтов: множитель = числу спринтов, список пуст."""
+    plan = planner.build_plan(inputs([task("T-1")], [engineer("ENG-1")]))
+
+    calendar = plan.params["calendar"]
+    assert calendar["fund_factor"] == "6.0000"
+    assert calendar["fund_hh_per_fte"] == "480.00"
+    assert calendar["short_sprints"] == {}
 
 
 def test_own_orbit_goes_before_loan() -> None:

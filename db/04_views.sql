@@ -8,6 +8,38 @@ DROP VIEW IF EXISTS v_dq_summary, v_orbit_map, v_task_board, v_bus_factor,
      v_role_deficit, v_backlog_demand, v_role_supply_hh, v_satellite_capacity,
      v_task_remaining_hh, v_team_capacity_sp CASCADE;
 
+DROP VIEW IF EXISTS v_sprint_fund_factor, v_pi_fund_factor CASCADE;
+
+-- --------------------------------------------------------------------
+--  МНОЖИТЕЛЬ ФОНДА. Единственный источник ответа «сколько ЧЧ даёт
+--  ставка в этом спринте / за весь PI». Полный спринт — 1.0000,
+--  короткий 7-й (23.09..30.09.2026) — 8/14 = 0.5714 (ADR-017).
+--  Дублировать эту арифметику по пяти вьюхам нельзя: разъедется, и
+--  короткий спринт молча получит полный фонд.
+-- --------------------------------------------------------------------
+CREATE VIEW v_sprint_fund_factor AS
+SELECT s.pi_id, s.sprint_no, s.start_date, s.end_date, s.length_days,
+       ROUND(s.length_days::numeric / p.sprint_length_days, 4) AS factor
+FROM sprints s
+JOIN pi_periods p ON p.pi_id = s.pi_id;
+COMMENT ON VIEW v_sprint_fund_factor IS
+ 'Фонд спринта = rate × fte_hours_per_sprint × factor. Короткий спринт даёт МЕНЬШЕ часов, '
+ 'а не «те же 80»: иначе фонд квартала вылез бы за 92 дня календаря. Проверки ENGINEER_OVERLOAD '
+ 'и ORBIT_OVERLOAD берут фонд именно отсюда.';
+
+CREATE VIEW v_pi_fund_factor AS
+SELECT p.pi_id,
+       p.sprint_length_days,
+       SUM(s.length_days)                                           AS days_total,
+       ROUND(SUM(s.length_days)::numeric / p.sprint_length_days, 4) AS factor
+FROM pi_periods p
+JOIN sprints s ON s.pi_id = p.pi_id
+GROUP BY p.pi_id, p.sprint_length_days;
+COMMENT ON VIEW v_pi_fund_factor IS
+ 'Фонд ставки за весь PI, выраженный в «полных спринтах»: 1.0000 ставки × 80 ЧЧ × factor. '
+ 'На Q3-2026: 92 дня / 14 = 6.5714, то есть 525.71 ЧЧ за квартал (при 6 спринтах × 14 было 480). '
+ 'Используется вместо `sprint_count` везде, где считается фонд за квартал.';
+
 -- --------------------------------------------------------------------
 --  Ёмкость ядра в SP. Velocity × Focus Factor (онбординг, раздел 3А).
 -- --------------------------------------------------------------------
@@ -18,12 +50,14 @@ SELECT t.team_id,
        t.focus_factor,
        ROUND(AVG(h.velocity_achieved) * t.focus_factor, 2)   AS available_sp_per_sprint,
        ROUND(AVG(h.velocity_achieved) * t.focus_factor
-             * (SELECT sprint_count FROM pi_periods LIMIT 1), 2) AS available_sp_per_pi
+             * (SELECT factor FROM v_pi_fund_factor LIMIT 1), 2) AS available_sp_per_pi
 FROM teams t
 LEFT JOIN team_history h ON h.team_id = t.team_id
 GROUP BY t.team_id, t.focus_factor;
 COMMENT ON VIEW v_team_capacity_sp IS
- 'history_points = 2 на команду: среднее шаткое, на защите оговорить.';
+ 'history_points = 2 на команду: среднее шаткое, на защите оговорить. '
+ 'available_sp_per_sprint — фонд ОДНОГО ПОЛНОГО спринта; для короткого умножать на '
+ 'v_sprint_fund_factor.factor (так делает проверка SP_OVERFLOW).';
 
 -- --------------------------------------------------------------------
 --  Остаток часов по задаче и роли. Для InProgress факт берётся ТОЛЬКО
@@ -50,11 +84,16 @@ SELECT o.engineer_id, o.team_id, e.role_id, e.grade,
        s.pi_id, s.sprint_no, s.start_date, s.end_date,
        o.capacity_rate,
        (SELECT COUNT(*) > 1 FROM engineer_orbits x WHERE x.engineer_id = o.engineer_id) AS is_shared_orbit,
-       ROUND(o.capacity_rate * p.fte_hours_per_sprint, 2) AS hours_own
+       s.length_days,
+       ROUND(o.capacity_rate * p.fte_hours_per_sprint * f.factor, 2) AS hours_own
 FROM engineer_orbits o
 JOIN engineers  e ON e.engineer_id = o.engineer_id
 JOIN sprints    s ON TRUE
-JOIN pi_periods p ON p.pi_id = s.pi_id;
+JOIN pi_periods p ON p.pi_id = s.pi_id
+JOIN v_sprint_fund_factor f ON f.pi_id = s.pi_id AND f.sprint_no = s.sprint_no;
+COMMENT ON VIEW v_satellite_capacity IS
+ 'hours_own — фонд спутника на орбите в КОНКРЕТНОМ спринте: rate × 80 × factor спринта. '
+ 'В коротком 7-м спринте это 0.5714 от обычного.';
 
 -- --------------------------------------------------------------------
 --  Предложение часов по роли: в разрезе ядра и по всей компании.
@@ -64,12 +103,17 @@ SELECT r.role_id, r.canonical_name AS role_name, o.team_id,
        COUNT(DISTINCT o.engineer_id)                                     AS engineers,
        SUM(o.capacity_rate)                                              AS fte,
        ROUND(SUM(o.capacity_rate * p.fte_hours_per_sprint), 2)           AS hh_per_sprint,
-       ROUND(SUM(o.capacity_rate * p.fte_hours_per_sprint * p.sprint_count), 2) AS hh_per_pi
+       ROUND(SUM(o.capacity_rate * p.fte_hours_per_sprint)
+             * (SELECT factor FROM v_pi_fund_factor LIMIT 1), 2)         AS hh_per_pi
 FROM roles r
 JOIN engineers       e ON e.role_id = r.role_id
 JOIN engineer_orbits o ON o.engineer_id = e.engineer_id
 CROSS JOIN pi_periods p
 GROUP BY r.role_id, r.canonical_name, o.team_id;
+COMMENT ON VIEW v_role_supply_hh IS
+ 'hh_per_sprint — фонд одного ПОЛНОГО спринта. hh_per_pi — фонд всего квартала: '
+ '× v_pi_fund_factor.factor (92/14 = 6.5714), а НЕ × sprint_count, иначе короткий '
+ '7-й спринт подарил бы команде лишние 8 дней фонда.';
 
 -- --------------------------------------------------------------------
 --  Потребность живого бэклога по ядру и роли за квартал.
@@ -204,7 +248,8 @@ COMMENT ON VIEW v_engineer_role_coverage IS
 CREATE VIEW v_role_deficit_effective AS
 WITH supply AS (
     SELECT c.role_id, o.team_id,
-           SUM(o.capacity_rate * p.fte_hours_per_sprint * p.sprint_count) AS hh
+           SUM(o.capacity_rate * p.fte_hours_per_sprint)
+           * (SELECT factor FROM v_pi_fund_factor LIMIT 1) AS hh
     FROM v_engineer_role_coverage c
     JOIN engineer_orbits o ON o.engineer_id = c.engineer_id
     CROSS JOIN pi_periods p
@@ -237,7 +282,8 @@ WITH demand AS (
     SELECT c.role_id,
            COUNT(DISTINCT c.engineer_id)                                   AS people,
            COUNT(DISTINCT c.engineer_id) FILTER (WHERE c.is_native)        AS native_people,
-           SUM(e.total_capacity_rate * p.fte_hours_per_sprint * p.sprint_count) AS hh
+           SUM(e.total_capacity_rate * p.fte_hours_per_sprint)
+           * (SELECT factor FROM v_pi_fund_factor LIMIT 1) AS hh
     FROM v_engineer_role_coverage c
     JOIN engineers e ON e.engineer_id = c.engineer_id
     CROSS JOIN pi_periods p

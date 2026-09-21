@@ -1,7 +1,7 @@
 -- СГЕНЕРИРОВАНО etl/load.py — РУКАМИ НЕ ПРАВИТЬ.
 -- Источник: Хакатон_датасетс_правками_по_списку_вопросов_1.xlsx
 -- sha256:   a618cb80279e9931e7706166082d8322fafd41aefefea722e44d9116a1f2f22e
--- ETL:      v1.0.0   PI_START=2026-06-01   оценка=matrix_column_sum
+-- ETL:      v1.1.0   PI_START=2026-07-01   оценка=matrix_column_sum
 BEGIN;
 TRUNCATE kpi_snapshots, alerts, task_state, plan_assignments, plan_task_schedule,
          plan_baseline, plan_runs, dq_issues, task_sequence, sprints, pi_periods,
@@ -12,7 +12,7 @@ TRUNCATE kpi_snapshots, alerts, task_state, plan_assignments, plan_task_schedule
 
 -- прогон ETL: 1
 INSERT INTO load_batches (batch_id, source_file, source_sha256, etl_version, pi_start, row_counts) VALUES
-  (1, 'Хакатон_датасетс_правками_по_списку_вопросов_1.xlsx', 'a618cb80279e9931e7706166082d8322fafd41aefefea722e44d9116a1f2f22e', '1.0.0', '2026-06-01', '{"roles": 21, "skills": 117, "teams": 6, "engineers": 30, "engineer_orbits": 34, "engineer_skills": 183, "initiatives": 15, "tasks": 45, "task_role_estimates": 258, "task_role_spent": 24, "task_dependencies": 19, "team_history": 12, "sprints": 6, "dq_issues": 38}');
+  (1, 'Хакатон_датасетс_правками_по_списку_вопросов_1.xlsx', 'a618cb80279e9931e7706166082d8322fafd41aefefea722e44d9116a1f2f22e', '1.1.0', '2026-07-01', '{"roles": 21, "skills": 117, "teams": 6, "engineers": 30, "engineer_orbits": 34, "engineer_skills": 183, "initiatives": 15, "tasks": 45, "task_role_estimates": 258, "task_role_spent": 24, "task_dependencies": 19, "team_history": 12, "sprints": 7, "dq_issues": 38}');
 
 -- роли: 21
 INSERT INTO roles (role_id, canonical_name, role_group) VALUES
@@ -457,19 +457,19 @@ INSERT INTO engineer_skills (engineer_id, skill_id) VALUES
 -- инициативы: 15
 INSERT INTO initiatives (prodf_id, br_id, title, priority_rung) VALUES
   ('PRODF-7120', 'BR-151', 'Модернизация фискального ядра (Проект Ф-22)', 74),
-  ('PRODF-7121', 'BR-152', 'Реализация мобильного виджета доставки', 80),
-  ('PRODF-7122', 'BR-153', 'Проектирование очередей отказоустойчивости', 70),
-  ('PRODF-7123', 'BR-155', 'Сквозное тестирование сценариев синхронизации', 85),
-  ('PRODF-7124', 'BR-156', 'Развертывание отказоустойчивого кластера и CI/CD', 90),
+  ('PRODF-7121', 'BR-152', 'Адаптация UI под планшетные версии', 80),
+  ('PRODF-7122', 'BR-153', 'Автоматизация регрессионных тестов API', 70),
+  ('PRODF-7123', 'BR-155', 'Проектирование схемы данных шлюза маркетплейсов', 85),
+  ('PRODF-7124', 'BR-156', 'Аудит хранимых процедур и подготовка схемы миграции', 90),
   ('PRODF-7125', 'BR-157', 'Интеграция ИИ-модели с витриной оператора КЦ', 95),
   ('PRODF-7126', 'BR-158', 'Внедрение модуля динамического ценообразования', 92),
-  ('PRODF-7127', 'BR-159', 'Подключение резервных SMS-провайдеров', 71),
+  ('PRODF-7127', 'BR-159', 'Настройка каскадных правил отправки (SMS/Push)', 71),
   ('PRODF-7128', 'BR-160', 'Генерация закрывающих документов для юрлиц', 78),
-  ('PRODF-7129', 'BR-161', 'Проектирование витрины регламентированных справок', 83),
+  ('PRODF-7129', 'BR-161', 'ЕСИА-авторизация и проверка учетных записей', 83),
   ('PRODF-7130', 'BR-162', 'Архитектура шины обмена кадровыми документами', 67),
-  ('PRODF-7131', 'BR-163', 'Настройка алертинга критических сбоев', 89),
-  ('PRODF-7132', 'BR-164', 'Перевод эквайринга на асинхронную обработку', 81),
-  ('PRODF-7133', 'BR-165', 'Оптимизация витрин и агрегатов ClickHouse', 94),
+  ('PRODF-7131', 'BR-163', 'Визуализация дашбордов Grafana / Prometheus', 89),
+  ('PRODF-7132', 'BR-164', 'Анализ медленных запросов платежного шлюза', 81),
+  ('PRODF-7133', 'BR-165', 'Витрина данных коммерческой аналитики', 94),
   ('PRODF-7134', 'BR-166', 'Интеграция лояльности с кассовым ПО', 86);
 
 -- задачи: 45
@@ -847,16 +847,17 @@ INSERT INTO team_history (team_id, snapshot_date, velocity_achieved, planned_sp)
 
 -- период PI: 1
 INSERT INTO pi_periods (pi_id, start_date, end_date, sprint_count, sprint_length_days, fte_hours_per_sprint) VALUES
-  ('PI-2026-Q3', '2026-06-01', '2026-08-23', 6, 14, 80);
+  ('PI-2026-Q3', '2026-07-01', '2026-09-30', 7, 14, 80);
 
--- спринты: 6
+-- спринты: 7
 INSERT INTO sprints (pi_id, sprint_no, start_date, end_date) VALUES
-  ('PI-2026-Q3', 1, '2026-06-01', '2026-06-14'),
-  ('PI-2026-Q3', 2, '2026-06-15', '2026-06-28'),
-  ('PI-2026-Q3', 3, '2026-06-29', '2026-07-12'),
-  ('PI-2026-Q3', 4, '2026-07-13', '2026-07-26'),
-  ('PI-2026-Q3', 5, '2026-07-27', '2026-08-09'),
-  ('PI-2026-Q3', 6, '2026-08-10', '2026-08-23');
+  ('PI-2026-Q3', 1, '2026-07-01', '2026-07-14'),
+  ('PI-2026-Q3', 2, '2026-07-15', '2026-07-28'),
+  ('PI-2026-Q3', 3, '2026-07-29', '2026-08-11'),
+  ('PI-2026-Q3', 4, '2026-08-12', '2026-08-25'),
+  ('PI-2026-Q3', 5, '2026-08-26', '2026-09-08'),
+  ('PI-2026-Q3', 6, '2026-09-09', '2026-09-22'),
+  ('PI-2026-Q3', 7, '2026-09-23', '2026-09-30');
 
 -- порядок задач: 45
 INSERT INTO task_sequence (task_id, topo_order, depth, earliest_start_sprint, on_critical_path) VALUES
