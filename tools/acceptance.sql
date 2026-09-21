@@ -49,7 +49,7 @@ SELECT verdict, COUNT(*) AS pairs, ROUND(SUM(gap_hh), 2) AS gap_hh
 FROM v_role_deficit WHERE gap_hh > 0
 GROUP BY verdict ORDER BY gap_hh DESC;
 
-\echo '=== 4. Наём по компании: ожидаем 4 роли 1С и 132 ЧЧ ==='
+\echo '=== 4. Наём по компании: ожидаем 6 ролей и 665 ЧЧ (замещения отклонены, ADR-010) ==='
 SELECT role_name,
        ROUND(demand_hh, 2) AS demand_hh,
        ROUND(supply_hh, 2) AS supply_hh,
@@ -63,10 +63,15 @@ SELECT COUNT(*)              AS hiring_roles,
        ROUND(SUM(gap_hh), 2) AS hiring_hh
 FROM v_role_coverage_org WHERE verdict LIKE 'НАЙМ%';
 
-\echo '--- 4а. Замещение: 6 ролей вне штата, спрос 665 ЧЧ, 533 ЧЧ закрывает замещение ---'
+\echo '--- 4а. Роли вне штата: те же 6 ролей и 665 ЧЧ, закрывать нечем ---'
 SELECT COUNT(*) FILTER (WHERE bus_factor = 0)                          AS roles_not_in_staff,
        ROUND(SUM(demand_hh) FILTER (WHERE bus_factor = 0), 2)          AS demand_no_staff_hh
 FROM v_bus_factor WHERE demand_hh > 0;
+
+\echo '--- 4б. Строгий режим: замещений нет, покрытие только нативными ролями ---'
+SELECT (SELECT COUNT(*) FROM role_substitutions WHERE status <> 'rejected')  AS active_substitutions,
+       (SELECT COUNT(*) FROM v_engineer_role_coverage)                       AS coverage_rows,
+       (SELECT COUNT(*) FROM v_engineer_role_coverage WHERE NOT is_native)   AS substitution_rows;
 
 \echo '=== 5. Bus Factor: ожидаем 8 ролей с BF=1 и спрос 1429 ЧЧ ==='
 SELECT COUNT(*) FILTER (WHERE bus_factor = 1)                          AS bf1_roles,
