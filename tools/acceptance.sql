@@ -1,14 +1,32 @@
 -- =====================================================================
---  Приёмка M0 — шесть проверок слоя данных ДС после заливки.
+--  Приёмка M0 — проверки слоя данных ДС после заливки.
 --  Запуск:
 --    psql -h 127.0.0.1 -U postgres -d pi_planner -v ON_ERROR_STOP=1 -f tools/acceptance.sql
 --  Ожидаемые значения и что делать при расхождении — docs/RUNBOOK.md, раздел 7.
 --  Файл держим в UTF-8 (без BOM): в проверках есть кириллица.
+--
+--  Числа в комментариях — эталон для ETL 1.1.0 и календаря Q3-2026
+--  (01.07..30.09, 7 спринтов, 7-й короткий). Смена календаря меняет 0а/0б,
+--  3/4/5 не меняет: спрос считается из датасета, а не из спринтов.
 -- =====================================================================
 
 \echo '=== 0. Кодировка базы: ожидаем UTF8 ==='
 SELECT pg_encoding_to_char(encoding) AS encoding
 FROM pg_database WHERE datname = current_database();
+
+\echo '=== 0а. Календарь PI: ожидаем 01.07..30.09.2026, 92 дня, 7 спринтов ==='
+-- Фонд ставки за квартал = fte_hours_per_sprint × factor: 80 × 6.5714 = 525.71 ЧЧ.
+-- Было 480 (6 × 14 дней) — календарь стал точнее, фонд вырос на 9.5% (ADR-017).
+SELECT p.pi_id, p.start_date, p.end_date, p.sprint_count,
+       (SELECT SUM(length_days) FROM sprints s WHERE s.pi_id = p.pi_id) AS pi_days,
+       f.factor                                                        AS fund_factor,
+       ROUND(p.fte_hours_per_sprint * f.factor, 2)                     AS fund_hh_per_fte
+FROM pi_periods p
+JOIN v_pi_fund_factor f ON f.pi_id = p.pi_id;
+
+\echo '--- 0б. Фонд по спринтам: шесть полных (1.0000) и короткий 7-й (0.5714) ---'
+SELECT sprint_no, start_date, end_date, length_days, factor
+FROM v_sprint_fund_factor ORDER BY sprint_no;
 
 \echo '=== 1. Счётчики последней загрузки (load_batches.row_counts) ==='
 SELECT jsonb_pretty(row_counts)
@@ -25,7 +43,8 @@ UNION ALL SELECT 'team_history',         COUNT(*) FROM team_history
 UNION ALL SELECT 'dq_issues',            COUNT(*) FROM dq_issues
 ORDER BY tbl;
 
-\echo '=== 1б. Объекты схемы: ожидаем 29 таблиц + 15 вьюх ==='
+\echo '=== 1б. Объекты схемы: ожидаем 29 таблиц + 17 вьюх ==='
+-- 17 вьюх = 15 прежних + v_pi_fund_factor и v_sprint_fund_factor (ADR-017).
 SELECT
   (SELECT COUNT(*) FROM information_schema.tables
     WHERE table_schema='public' AND table_type='BASE TABLE') AS tables,
@@ -92,10 +111,33 @@ SELECT (SELECT COUNT(*) FROM v_plan_violations WHERE severity = 'error')   AS er
        (SELECT COUNT(*) FROM v_plan_violations WHERE severity = 'warning') AS warnings,
        (SELECT COUNT(*) FROM plan_runs)                                   AS runs;
 
-\echo '=== 7. Ёмкость в SP: перегружена только Team-Platform (104%) ==='
+\echo '=== 7. Ёмкость в SP: перегруженных команд нет, Team-Platform загружена на 95% ==='
 SELECT team_id,
        ROUND(avg_velocity, 2)           AS avg_velocity,
        focus_factor,
        ROUND(available_sp_per_sprint, 2) AS sp_per_sprint
 FROM v_team_capacity_sp
 ORDER BY sp_per_sprint DESC;
+
+\echo '--- 7а. Ёмкость ядра за квартал: × 6.5714 (92/14), а не × 7 спринтов ---'
+SELECT team_id,
+       ROUND(available_sp_per_sprint, 2) AS sp_per_sprint,
+       ROUND(available_sp_per_pi, 2)     AS sp_per_pi
+FROM v_team_capacity_sp
+ORDER BY sp_per_sprint DESC;
+
+\echo '--- 7б. Фонд часов по спринтам: 7-й короче, значит фонд меньше на 42.9% ---'
+-- Ровно то, что видит планировщик: 80 ЧЧ × ставка × factor спринта.
+SELECT s.sprint_no, s.length_days,
+       ROUND(SUM(s.hours_own), 2) AS fund_hh
+FROM v_satellite_capacity s
+GROUP BY s.sprint_no, s.length_days
+ORDER BY s.sprint_no;
+
+\echo '--- 7в. Часы по спринтам последнего прогона (для сверки глазами) ---'
+SELECT a.run_id, a.sprint_no,
+       ROUND(SUM(a.hours), 2)        AS assigned_hh,
+       COUNT(DISTINCT a.engineer_id) AS engineers
+FROM plan_assignments a
+GROUP BY a.run_id, a.sprint_no
+ORDER BY a.run_id, a.sprint_no;

@@ -69,10 +69,18 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"dsn: {db.dsn()}")
     inputs = planner.load_inputs()
+    pi_start = min(pair[0] for pair in inputs.sprints.values())
+    pi_end = max(pair[1] for pair in inputs.sprints.values())
     print(
         f"PI {inputs.pi_id}: {inputs.sprint_count} спринтов × {inputs.fte_hours_per_sprint} ЧЧ; "
         f"живых задач {len(inputs.tasks)}, инженеров {len(inputs.engineers)}, "
         f"зависимостей {len(inputs.deps)}"
+    )
+    print(
+        f"календарь: {pi_start}..{pi_end} ({inputs.pi_days} дней); "
+        f"фонд ставки за PI {inputs.fund_factor} × {inputs.fte_hours_per_sprint} = "
+        f"{inputs.fund_hours_per_fte} ЧЧ "
+        f"(короткие спринты: {inputs.short_sprints_note()})"
     )
     print(
         f"строгий режим: активных правил замещения {inputs.active_substitutions}; "

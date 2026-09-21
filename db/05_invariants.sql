@@ -20,29 +20,39 @@ DROP VIEW IF EXISTS v_plan_violations CASCADE;
 CREATE VIEW v_plan_violations AS
 
 -- A. Ёмкость команды в SP (SP засчитываются в start_sprint) ------------
+-- Ёмкость = available_sp_per_sprint × factor СВОЕГО спринта: 7-й спринт
+-- короче (8 дней), значит и SP в нём меньше (ADR-017).
 SELECT s.run_id, 'SP_OVERFLOW'::text AS check_code, 'error'::text AS severity,
        (t.team_id || ' / спринт ' || s.start_sprint)::text AS entity,
        ('запланировано ' || SUM(t.estimation_sp) || ' SP при ёмкости '
-        || MAX(c.available_sp_per_sprint))::text AS detail
+        || MAX(ROUND(c.available_sp_per_sprint * f.factor, 2))
+        || ' SP (полный спринт ' || MAX(c.available_sp_per_sprint)
+        || ' × ' || MAX(f.factor) || ')')::text AS detail
 FROM plan_task_schedule s
 JOIN tasks t             ON t.task_id = s.task_id
+JOIN plan_runs r         ON r.run_id = s.run_id
 JOIN v_team_capacity_sp c ON c.team_id = t.team_id
+JOIN v_sprint_fund_factor f ON f.pi_id = r.pi_id AND f.sprint_no = s.start_sprint
 WHERE s.decision = 'in_quarter' AND s.start_sprint IS NOT NULL
 GROUP BY s.run_id, t.team_id, s.start_sprint
-HAVING SUM(t.estimation_sp) > MAX(c.available_sp_per_sprint)
+HAVING SUM(t.estimation_sp) > MAX(c.available_sp_per_sprint * f.factor)
 
 -- B. Перегрузка инженера: считать по СУММЕ ВСЕХ ОРБИТ ------------------
+-- Фонд спринта — ставка × 80 ЧЧ × factor спринта (короткий 7-й = ×0.5714).
 UNION ALL
 SELECT a.run_id, 'ENGINEER_OVERLOAD', 'error',
        (a.engineer_id || ' / спринт ' || a.sprint_no)::text,
        ('назначено ' || SUM(a.hours) || ' ЧЧ при фонде '
-        || MAX(e.total_capacity_rate * p.fte_hours_per_sprint)
-        || ' (ставка ' || MAX(e.total_capacity_rate) || ')')::text
+        || MAX(e.total_capacity_rate * p.fte_hours_per_sprint * f.factor)
+        || ' (ставка ' || MAX(e.total_capacity_rate) || ', factor '
+        || MAX(f.factor) || ')')::text
 FROM plan_assignments a
 JOIN engineers e ON e.engineer_id = a.engineer_id
+JOIN plan_runs r ON r.run_id = a.run_id
 CROSS JOIN pi_periods p
+JOIN v_sprint_fund_factor f ON f.pi_id = r.pi_id AND f.sprint_no = a.sprint_no
 GROUP BY a.run_id, a.engineer_id, a.sprint_no
-HAVING SUM(a.hours) > MAX(e.total_capacity_rate * p.fte_hours_per_sprint)
+HAVING SUM(a.hours) > MAX(e.total_capacity_rate * p.fte_hours_per_sprint * f.factor)
 
 -- C. Инженер не умеет эту роль ----------------------------------------
 UNION ALL
@@ -284,12 +294,15 @@ UNION ALL
 SELECT a.run_id, 'ORBIT_OVER_BUDGET', 'error',
        (a.engineer_id || ' / ' || a.home_team_id || ' / спринт ' || a.sprint_no)::text,
        ('назначено ' || SUM(a.hours) || ' ЧЧ, бюджет орбиты '
-        || MAX(o.capacity_rate * p.fte_hours_per_sprint) || ' ЧЧ')::text
+        || MAX(o.capacity_rate * p.fte_hours_per_sprint * f.factor)
+        || ' ЧЧ (factor ' || MAX(f.factor) || ')')::text
 FROM plan_assignments a
 JOIN engineer_orbits o ON o.engineer_id = a.engineer_id AND o.team_id = a.home_team_id
+JOIN plan_runs r ON r.run_id = a.run_id
 CROSS JOIN pi_periods p
+JOIN v_sprint_fund_factor f ON f.pi_id = r.pi_id AND f.sprint_no = a.sprint_no
 GROUP BY a.run_id, a.engineer_id, a.home_team_id, a.sprint_no
-HAVING SUM(a.hours) > MAX(o.capacity_rate * p.fte_hours_per_sprint)
+HAVING SUM(a.hours) > MAX(o.capacity_rate * p.fte_hours_per_sprint * f.factor)
 
 -- Y. Назначение в закрытый спринт ----------------------------------------
 -- Пересчёт на начало спринта k не имеет права планировать в 1..k-1.
