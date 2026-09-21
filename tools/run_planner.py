@@ -4,10 +4,16 @@
     uv run python tools/run_planner.py --as-of-sprint 3   # пересчёт на начало 3-го спринта
     uv run python tools/run_planner.py --dry-run          # посчитать, но не писать
 
-Пишет контракт целиком одной транзакцией (`app.planner.write_plan`). Приёмка
-результата — одним запросом, пустой ответ означает корректный план:
+    # варианты правил (ADR-013); по умолчанию — как в приёмке M2:
+    uv run python tools/run_planner.py --dry-run --dependency-mode finish_start
+    uv run python tools/run_planner.py --dry-run --initiative-mode atomic
 
-    SELECT * FROM v_plan_violations WHERE run_id = <run_id>;
+Пишет контракт целиком одной транзакцией (`app.planner.write_plan`). Приёмка
+результата — одним запросом. Блокируют строки `severity = 'error'`; строки
+`severity = 'warning'` требуют показа в UI, но план не отменяют
+(docs/PLANNER_SPEC.md, раздел 7):
+
+    SELECT * FROM v_plan_violations WHERE run_id = <run_id> AND severity = 'error';
 
 **Заморозка.** После первого прогона базу не пересевать: `plan_runs` хранит
 историю пересчётов, а `build/seed.sql` её сносит (docs/RUNBOOK.md, разделы 3 и 6).
@@ -40,6 +46,25 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="посчитать план и показать сводку, но в базу не писать",
     )
+    parser.add_argument(
+        "--dependency-mode",
+        choices=planner.DEPENDENCY_MODES,
+        default=planner.DEPENDENCY_MODE_START_START,
+        help=(
+            "start_start (по умолчанию) — старт после СТАРТА блокирующей; "
+            "finish_start — старт после КОНЦА блокирующей (ADR-013)"
+        ),
+    )
+    parser.add_argument(
+        "--initiative-mode",
+        choices=planner.INITIATIVE_MODES,
+        default=planner.INITIATIVE_MODE_GREEDY,
+        help=(
+            "greedy (по умолчанию) — задача решается отдельно, частичная "
+            "инициатива допустима; atomic — пробная упаковка инициативы целиком "
+            "с откатом (ADR-013)"
+        ),
+    )
     args = parser.parse_args(argv)
 
     print(f"dsn: {db.dsn()}")
@@ -57,11 +82,24 @@ def main(argv: list[str] | None = None) -> int:
 
     baseline_starts = planner.load_baseline_starts() if args.as_of_sprint > 0 else {}
     plan = planner.build_plan(
-        inputs, as_of_sprint=args.as_of_sprint, baseline_starts=baseline_starts
+        inputs,
+        as_of_sprint=args.as_of_sprint,
+        baseline_starts=baseline_starts,
+        dependency_mode=args.dependency_mode,
+        initiative_mode=args.initiative_mode,
     )
 
     print(f"статус: {plan.status}")
     print(f"итог: {plan.note}")
+    print(
+        f"режимы: зависимости {plan.params['dependency_mode']}, инициативы "
+        f"{plan.params['initiative_mode']}, нижняя граница старта {plan.params['replan_floor']}"
+    )
+    print(
+        f"инициативы: целиком {plan.params['initiatives_complete']} из "
+        f"{plan.params['initiatives_planned']}, частично "
+        f"{len(plan.params['initiatives_partial'])}"
+    )
     print(
         f"строк контракта: расписание {len(plan.schedule)}, назначения {len(plan.assignments)}, "
         f"состояния {len(plan.states)}, алерты {len(plan.alerts)}, KPI {len(plan.kpis)}, "
@@ -84,7 +122,10 @@ def main(argv: list[str] | None = None) -> int:
         f"записано: run_id = {run_id} "
         f"(as_of_sprint = {plan.as_of_sprint}, алгоритм {planner.ALGORITHM})"
     )
-    print(f"приёмка: SELECT * FROM v_plan_violations WHERE run_id = {run_id};   -- пусто = план корректен")
+    print(
+        f"приёмка: SELECT * FROM v_plan_violations WHERE run_id = {run_id} "
+        f"AND severity = 'error';   -- пусто = нет ошибок"
+    )
     return 0
 
 
