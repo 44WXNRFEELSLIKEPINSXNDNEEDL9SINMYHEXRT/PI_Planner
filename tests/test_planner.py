@@ -14,6 +14,8 @@ from collections import defaultdict
 from datetime import date, timedelta
 from decimal import Decimal
 
+import pytest
+
 from app import planner
 
 T1, T2 = "Team-1", "Team-2"
@@ -78,6 +80,7 @@ def inputs(
     bus_factor: tuple[tuple[str, int, Decimal], ...] = (),
     all_tasks: tuple[tuple[str, str, Decimal, Decimal], ...] = (),
     conflicts: int = 0,
+    coverage: dict[tuple[str, int], Decimal] | None = None,
 ) -> planner.Inputs:
     return planner.Inputs(
         pi_id="PI-TEST",
@@ -86,6 +89,13 @@ def inputs(
         team_sp_per_sprint={team: Decimal(cap) for team, cap in (team_sp or {T1: 100}).items()},
         tasks=tuple(tasks),
         engineers=tuple(engineers),
+        # По умолчанию — «родная роль, efficiency = 1»: так же, как отдаёт
+        # v_engineer_role_coverage на живых данных (ADR-012).
+        coverage=(
+            coverage
+            if coverage is not None
+            else {(row.engineer_id, row.role_id): Decimal("1") for row in engineers}
+        ),
         deps=tuple(deps),
         sprints={
             n: (
@@ -368,3 +378,146 @@ def test_plan_is_deterministic() -> None:
     assert first.schedule == second.schedule
     assert first.assignments == second.assignments
     assert first.alerts == second.alerts
+
+
+# ---------------------------------------------------------------------------
+#  Ревью M2 (docs/REVIEW_RESPONSE.md): зависимости, атомарность инициатив,
+#  пересчёт, одна орбита на назначение, efficiency, кандидаты из вьюхи.
+# ---------------------------------------------------------------------------
+def test_dependency_finish_start_waits_for_the_end_of_the_blocker() -> None:
+    """ADR-013: `finish_start` — старт блокируемой после КОНЦА блокирующей.
+
+    A растянута на спринты 1..2 (120 ЧЧ при фонде 80), B зависит от A.
+    При `start_start` B влезает в спринт 2, при `finish_start` — только в 3-й.
+    """
+    tasks = [task("A", roles={1: 120}, topo=1), task("B", roles={1: 40}, topo=2)]
+    source = inputs(tasks, [engineer("ENG-1")], deps=(("A", "B", 1),))
+
+    start_start = planner.build_plan(source)
+    assert (start_start.schedule[0].start_sprint, start_start.schedule[0].end_sprint) == (1, 2)
+    assert starts_of(start_start) == {"A": 1, "B": 2}
+    assert start_start.params["dependency_mode"] == planner.DEPENDENCY_MODE_START_START
+
+    finish_start = planner.build_plan(source, dependency_mode=planner.DEPENDENCY_MODE_FINISH_START)
+    assert starts_of(finish_start) == {"A": 1, "B": 3}
+    assert finish_start.params["dependency_mode"] == planner.DEPENDENCY_MODE_FINISH_START
+
+
+def test_unknown_modes_are_rejected() -> None:
+    source = inputs([task("T-1")], [engineer("ENG-1")])
+    for bad in ("fs", "", "start_finish"):
+        with pytest.raises(ValueError):
+            planner.build_plan(source, dependency_mode=bad)
+        with pytest.raises(ValueError):
+            planner.build_plan(source, initiative_mode=bad)
+
+
+def test_replan_never_plans_into_closed_sprints() -> None:
+    """ADR-014: при `as_of_sprint = 3` спринты 1..2 уже прожиты."""
+    plan = planner.build_plan(inputs([task("T-1", earliest=1)], [engineer("ENG-1")]), as_of_sprint=3)
+
+    assert starts_of(plan) == {"T-1": 3}
+    assert plan.params["replan_floor"] == 3
+    assert all(row.sprint_no >= 3 for row in plan.assignments)
+
+
+def test_atomic_initiatives_defer_the_whole_initiative() -> None:
+    """ADR-013: «всё или ничего» — пробная упаковка с откатом.
+
+    Фонд — 80 ЧЧ за квартал, у P-1 две задачи по 80 ЧЧ, у P-2 одна.
+    Жадный режим закрывает половину P-1 и теряет ресурс; атомарный откатывает
+    P-1 и отдаёт освободившиеся часы P-2 — та закрывается целиком.
+    """
+    tasks = [
+        task("A1", roles={1: 80}, topo=1, prodf="P-1"),
+        task("A2", roles={1: 80}, topo=2, prodf="P-1"),
+        task("B1", roles={1: 80}, topo=3, prodf="P-2"),
+    ]
+    source = inputs(tasks, [engineer("ENG-1")], sprint_count=1)
+
+    greedy = planner.build_plan(source)
+    assert starts_of(greedy) == {"A1": 1, "A2": None, "B1": None}
+    assert greedy.params["initiative_mode"] == planner.INITIATIVE_MODE_GREEDY
+    assert greedy.params["initiatives_complete"] == 0
+    assert greedy.params["initiatives_partial"] == ["P-1"]
+
+    atomic = planner.build_plan(source, initiative_mode=planner.INITIATIVE_MODE_ATOMIC)
+    assert starts_of(atomic) == {"A1": None, "A2": None, "B1": 1}
+    assert atomic.params["initiatives_complete"] == 1
+    assert atomic.params["initiatives_partial"] == []
+    # Пробное назначение A1 откатано: в фонде остались ровно 80 ЧЧ под B1.
+    assert [(a.task_id, a.hours) for a in atomic.assignments] == [("B1", Decimal("80"))]
+
+
+def test_one_assignment_takes_hours_from_a_single_orbit() -> None:
+    """ADR-015: одна строка `plan_assignments` = одна орбита.
+
+    Парттаймер 0.5 + 0.5: бюджет орбиты — 40 ЧЧ. Задача на 80 ЧЧ получит
+    40 со своей орбиты в спринте 1 и 40 в спринте 2 — но не одной строкой.
+    """
+    part_timer = engineer("ENG-1", orbits=(T1, T2))
+    plan = planner.build_plan(inputs([task("T-1", team=T1, roles={1: 80})], [part_timer]))
+
+    assert [(a.sprint_no, a.hours, a.home_team_id) for a in plan.assignments] == [
+        (1, Decimal("40"), T1),
+        (2, Decimal("40"), T1),
+    ]
+    keys = [(a.task_id, a.sprint_no, a.engineer_id, a.role_id) for a in plan.assignments]
+    assert len(keys) == len(set(keys)), "ключ контракта обязан быть уникальным"
+
+
+def test_loan_comes_from_the_other_orbit_of_the_same_engineer() -> None:
+    """Своё ядро выбирается первым, но заём берётся с ЧУЖОЙ орбиты того же человека."""
+    part_timer = engineer("ENG-1", orbits=(T1, T2))
+    tasks = [
+        task("T-1", team=T2, roles={1: 40}, topo=1),
+        task("T-2", team=T2, roles={1: 40}, topo=2),
+    ]
+    plan = planner.build_plan(inputs(tasks, [part_timer], team_sp={T1: 100, T2: 100}))
+
+    assert [(a.task_id, a.sprint_no, a.home_team_id, a.serving_team_id) for a in plan.assignments] == [
+        ("T-1", 1, T2, T2),
+        ("T-2", 1, T1, T2),
+    ]
+
+
+def test_efficiency_multiplies_the_required_hours() -> None:
+    """ADR-016: смету 40 ЧЧ при `efficiency = 1.25` закрывают 50 часов исполнителя."""
+    plan = planner.build_plan(
+        inputs(
+            [task("T-1", roles={1: 40})],
+            [engineer("ENG-1")],
+            coverage={("ENG-1", 1): Decimal("1.25")},
+        )
+    )
+
+    assert [(a.sprint_no, a.hours) for a in plan.assignments] == [(1, Decimal("50.00"))]
+    assert plan.params["efficiency_note"] == planner.EFFICIENCY_NOTE
+
+
+def test_candidates_come_from_the_coverage_view() -> None:
+    """ADR-012: пару «инженер × роль» определяет вьюха, а не `engineers.role_id`."""
+    plan = planner.build_plan(
+        inputs(
+            [task("T-1", roles={1: 40})],
+            [engineer("ENG-1", role_id=7)],
+            coverage={("ENG-1", 1): Decimal("1")},
+        )
+    )
+
+    assert starts_of(plan) == {"T-1": 1}
+    assert plan.assignments[0].role_id == 1
+    assert plan.assignments[0].engineer_id == "ENG-1"
+
+
+def test_objective_and_modes_are_recorded_in_params() -> None:
+    """ADR-015: у прогона всегда есть объяснение, по каким правилам он построен."""
+    plan = planner.build_plan(inputs([task("T-1")], [engineer("ENG-1")]))
+
+    assert plan.params["objective"] == planner.OBJECTIVE
+    assert plan.params["initiative_mode"] == planner.INITIATIVE_MODE_GREEDY
+    assert plan.params["dependency_mode"] == planner.DEPENDENCY_MODE_START_START
+    assert plan.params["replan_floor"] == 1
+    assert plan.params["initiatives_planned"] == 1
+    assert plan.params["initiatives_complete"] == 1
+    assert plan.params["initiatives_partial"] == []
