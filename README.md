@@ -41,7 +41,9 @@ db/05_invariants.sql приёмка плана: v_plan_violations, 14 прове
 etl/config.py        все ручки: даты квартала, алиасы ролей, источник оценок
 etl/load.py          загрузчик; блоки ищет по маркерам, а не по номерам строк
 build/seed.sql       СГЕНЕРИРОВАНО, руками не править
-docs/DECISIONS.md    почему сделано именно так + как поменять (ADR-000…010)
+app/planner.py       планировщик: чтение витрин → чистая build_plan() → запись контракта
+tools/run_planner.py прогон планировщика: uv run python tools/run_planner.py --as-of-sprint 0
+docs/DECISIONS.md    почему сделано именно так + как поменять (ADR-000…011)
 docs/PLANNER_SPEC.md СПЕКА ДЛЯ БЭКЕНДА: правила планирования и ловушки в данных
 docs/SCHEMA.md       что читать бэкенду, примеры запросов
 docs/ANSWERS_ORGANIZERS.md  ответы организаторов и что после них поменялось
@@ -109,6 +111,10 @@ SELECT * FROM v_plan_violations WHERE run_id = :run_id;
 использованное замещение — но сейчас таких быть не должно: все правила
 `rejected` (ADR-010), поэтому проверка молчит, а любая её находка означает
 нарушение правила.
+
+Прогон планировщика — `uv run python tools/run_planner.py` (базовый план Недели 0,
+он же фиксирует `plan_baseline`; `--dry-run` считает без записи). Результат
+приёмки M2 — `docs/RUNBOOK.md`, раздел 9.
 
 ## Проверка после заливки
 
