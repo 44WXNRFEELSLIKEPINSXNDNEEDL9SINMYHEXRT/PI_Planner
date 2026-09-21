@@ -136,7 +136,8 @@ git switch -c feature/backend develop;   git push -u origin feature/backend
 | Тег | Когда | Гейт |
 |---|---|---|
 | `v0.1-m0-db` | БД поднята, приёмки M0 зелёные | 6 проверок из раздела 7 |
-| `v0.2-m2-planner` | планировщик пишет контракт | `v_plan_violations` пуст полностью (замещения отклонены, ADR-010) |
+| `v0.2-m2-planner` | планировщик пишет контракт | нет ошибок в `v_plan_violations` (warning допустим; замещения отклонены, ADR-010) |
+| `v0.2.1-m2-planner` | разбор ревью M2 | те же 0 ошибок + негативный тест срабатывает (раздел 9) |
 | `v0.3-m4-ui` | экраны работают | `run.bat` открывает UI и отдаёт данные |
 | `v1.0-demo` | сдача | прогон демо-сценария без правок «на ходу» |
 
@@ -198,7 +199,7 @@ git push origin develop --follow-tags
 | 5 | `v_bus_factor`, BF = 1 и спрос > 0 | 8 ролей, 1429 ЧЧ | 8 ролей, 1429.00 ЧЧ | ✅ |
 | 5а | кириллица | читаемый русский текст | «НАЙМ: закрыть некем» | ✅ |
 | 6 | `load_batches.source_sha256` | sha256 исходного xlsx | `a618cb80…f22e`, ETL 1.0.0, старт PI 2026-06-01 | ✅ |
-| 6а | `v_plan_violations` | 0 во всех прогонах планировщика | 0 нарушений при 2 прогонах (приёмка M2, раздел 9) | ✅ |
+| 6а | `v_plan_violations` | 0 ошибок во всех прогонах планировщика | 0 `error`; 9 `warning` суммарно — по 3 `PLANNED_END_OVERSAIL` в каждом из прогонов 1, 2, 4 (приёмка M2, раздел 9) | ✅ |
 | 7 | `v_team_capacity_sp`, SP/спринт | velocity × 0.8 | Team-K 12.80 … Team-Platform 7.20 | ✅ |
 
 ### Версии, на которых получен результат
@@ -274,24 +275,35 @@ KPI-плашки по `target_min` / `target_max`, звёздная карта �
 
 Прогон — `uv run python tools/run_planner.py` (по умолчанию `--as-of-sprint 0`:
 базовый план Недели 0, он же фиксирует `plan_baseline`). Флаг `--dry-run`
-считает план, но в базу не пишет. Приёмка — одним запросом, пустой ответ
-означает корректный план:
+считает план, но в базу не пишет. Варианты правил (ADR-013):
 
-```sql
-SELECT * FROM v_plan_violations WHERE run_id = 2;   -- 14 проверок из db/05_invariants.sql
+```bash
+uv run python tools/run_planner.py --dry-run --dependency-mode finish_start
+uv run python tools/run_planner.py --dry-run --initiative-mode atomic
 ```
 
-| № | Проверка | Ожидаемо | Факт |
+Приёмка — одним запросом. **Критерий: нет строк с `severity = 'error'`**;
+строки `severity = 'warning'` план не отменяют, но показываются в UI:
+
+```sql
+SELECT * FROM v_plan_violations WHERE run_id = 4;                          -- всё
+SELECT * FROM v_plan_violations WHERE run_id = 4 AND severity = 'error';   -- приёмка
+```
+
+| № | Проверка | Ожидаемо | Факт (прогон 4) |
 |---|---|---|---|
-| 1 | `v_plan_violations` | пусто | **0 строк** — и по `run_id = 2`, и по всем прогонам сразу |
-| 2 | `plan_task_schedule` | строка на каждую живую задачу | 37 (7 `in_quarter`, 30 `deferred_next_pi` / `M2`) |
-| 3 | `plan_assignments` | часы внутри окон и фондов | 18 строк, 522.01 ЧЧ, из них заём — 6 строк / 187.00 ЧЧ |
-| 4 | `plan_baseline` | только при `as_of_sprint = 0` | 37 строк, из них 7 `committed` |
-| 5 | `task_state` | слепок всех задач | 45 строк на `as_of_sprint = 0` |
-| 6 | `alerts` | red по инициативам, orange по ролям | 14 `red/deadline_miss` + 6 `orange/role_deficit`, жёлтых нет (первый прогон — сравнивать не с чем) |
-| 7 | `kpi_snapshots` | 3 KPI с нормами | `pi_predictability` 6.67 (норма 80–100), `say_do_ratio` 100.00 в каждом спринте, `bus_factor` 0.00 (норма > 1) |
-| 8 | `plan_runs.params` | источник часов проверен | `estimate_source = matrix_column_sum`, `estimate_validated = true`, `estimate_conflicts = 25`, `substitution_mode = rejected` |
-| 9 | `is_loan` | считает СУБД, не мы | 6 строк с `home_team_id <> serving_team_id`, в `INSERT` колонки нет |
+| 1 | `v_plan_violations`, `severity='error'` | пусто | **0 строк** по всем прогонам (1, 2, 4) |
+| 2 | `v_plan_violations`, `severity='warning'` | допустимо | 3 строки `PLANNED_END_OVERSAIL` (`MOB-7011`, `KP-0000`, `QA-9022`) — прогноз позже даты исходного плана, ADR-016 |
+| 3 | `plan_task_schedule` | строка на каждую живую задачу | 37 (7 `in_quarter`, 30 `deferred_next_pi` / `M2`, `M3` — 0) |
+| 4 | `plan_assignments` | часы внутри окон, фондов и бюджетов орбит | 18 строк, 522.01 ЧЧ, из них заём — 6 строк / 187.00 ЧЧ |
+| 5 | `plan_baseline` | только при `as_of_sprint = 0`, и не расходится с каноническим прогоном | 37 строк, 7 `committed`; совпадает с прогоном 1 |
+| 6 | `task_state` | слепок всех задач | 45 строк на `as_of_sprint = 0` |
+| 7 | `alerts` | red по инициативам, orange по ролям | 14 `red/deadline_miss` + 6 `orange/role_deficit`, жёлтых нет (первый прогон — сравнивать не с чем) |
+| 8 | `kpi_snapshots` | 1 + `sprint_count` + 1 | `pi_predictability` 6.67 (норма 80–100), `say_do_ratio` 100.00 в каждом спринте, `bus_factor` 0.00 (норма > 1) |
+| 9 | `plan_runs.params` | правила прогона записаны | `estimate_source = matrix_column_sum`, `estimate_validated = true`, `estimate_conflicts = 25`, `substitution_mode = rejected`, `objective`, `dependency_mode = start_start`, `initiative_mode = greedy`, `replan_floor = 1`, `initiatives_planned = 15`, `initiatives_complete = 1`, `initiatives_partial = [5 инициатив]` |
+| 10 | `is_loan` | считает СУБД, не мы | 6 строк с `home_team_id <> serving_team_id`, в `INSERT` колонки нет |
+| 11 | Проверок в `db/05_invariants.sql` | 29 (A…AC) | см. таблицу кодов в `docs/PLANNER_SPEC.md`, раздел 7 |
+
 
 **Шесть оранжевых алертов — ровно те роли, что в приёмке M0 (п. 4):**
 `Руководитель проекта` 449 ЧЧ, `Разработчик 1С` 107, `Специалист поддержки` 84,
@@ -309,11 +321,68 @@ SELECT * FROM v_plan_violations WHERE run_id = 2;   -- 14 проверок из 
 Роли есть, а рук на всё не хватает — это честнее и совпадает с выводом M0 про
 ресурсы, а не граф.
 
-**Прогоны 1 и 2.** Прогон 1 — первый: на нём нашлась неточность формулы
+**Прогоны 1, 2 и 4.** Прогон 1 — первый: на нём нашлась неточность формулы
 `say_do_ratio` (считался кумулятивно, а спека требует «в спринте / на спринт»).
 Прогон 2 — приёмочный: тот же алгоритм и то же расписание, отличается только KPI.
-Обе строки остались в `plan_runs` — история пересчётов не перезаписывается, а
-обещание Недели 0 берётся из ПЕРВОГО базового прогона (`MIN(run_id)`).
+Прогон 4 — после разбора ревью M2: добавлены `params`, инициативные счётчики
+и три новых warning-а. Все строки остались в `plan_runs` — история пересчётов
+не перезаписывается, а обещание Недели 0 берётся из ПЕРВОГО базового прогона
+(`MIN(run_id) = 1`).
+
+Номера 1, 2, 4 без 3: значение последовательности израсходовала транзакция
+негативного теста (см. ниже). Пропуск в нумерации — норма,
+`run_id` не претендует на непрерывность.
+
+Расписание и назначения прогонов 2 и 4 совпадают побитово; это проверено
+запросом, а не глазами:
+
+```sql
+SELECT count(*) FROM (
+  SELECT task_id, sprint_no, engineer_id, role_id, hours, home_team_id, serving_team_id
+    FROM plan_assignments WHERE run_id = 2
+  EXCEPT
+  SELECT task_id, sprint_no, engineer_id, role_id, hours, home_team_id, serving_team_id
+    FROM plan_assignments WHERE run_id = 4
+) x;   -- 0
+```
+
+**Варианты правил (ADR-013).** Обе новые ветки прогоняются по живому датасету
+и меняют результат измеримо:
+
+| Запуск | Задачи в квартале | Инициатив целиком | Назначений | Займов | `pi_predictability` |
+|---|---|---|---|---|---|
+| `--dependency-mode start_start` (по умолчанию) | 7 | 1 из 15 | 18 | 6 / 187.00 ЧЧ | 6.67 |
+| `--dependency-mode finish_start` | 7 | 1 из 15 | 18 | 6 / 187.00 ЧЧ | 6.67 |
+| `--initiative-mode atomic` | 2 | 1 из 15 | 5 | 0 | 6.67 |
+
+`start_start` выбран потому, что ровно эту семантику реализует предпосчитанный
+`task_sequence.earliest_start_sprint`: на текущем сиде режимы совпадают, но
+правило теперь выбрано явно, а не подразумевается. `atomic` не выбран как
+значение по умолчанию: он стоит 5 задач из 7 и не приносит ни одного пункта KPI.
+
+**Негативный тест.** Проверки, которые всегда молчат, ничего не доказывают.
+Синтетический «плохой» прогон собирается внутри транзакции и откатывается:
+
+```sql
+BEGIN;
+-- ... вставка заведомо битого прогона (закрытый спринт, перенос без причины,
+--     часы сверх фонда, нарушенная зависимость, пустой KPI, нет алертов) ...
+SELECT DISTINCT check_code FROM v_plan_violations WHERE run_id = :bad;   -- ждём P..AA
+ROLLBACK;
+```
+
+Факт: сработали `DEPENDENCY_BLOCKER_DEFERRED`, `START_BEFORE_EARLIEST`,
+`WINDOW_OUTSIDE_PI`, `DEFERRED_WITHOUT_REASON`, `ORBIT_OVER_BUDGET`,
+`ASSIGNMENT_IN_CLOSED_SPRINT`, `STATE_SNAPSHOT_INCOMPLETE`, `ALERTS_MISSING`,
+`KPI_INCOMPLETE` — 72 строки нарушений, после `ROLLBACK` база не изменилась.
+Проверка новых кодов выполнена на транзакции, а не на живых прогонах: живые
+прогоны получают 0 ошибок, и «нулей» для доказательства мало.
+
+**Разбор ревью M2.** `docs/REVIEW_RESPONSE.md`: 10 пунктов ревью, у каждого —
+что сделано и какой ADR это закрепил; все 10 закрыты. Там же 5 вопросов, которые
+остались к организаторам (семантика зависимостей для длинных задач, ценность
+частичной инициативы, даты плана как обязательство, приоритет своей команды над
+займом, фактические часы по спринтам) — они требуют ответа заказчика, а не кода.
 
 **Заморозка.** После этих прогонов базу не пересевать: `build/seed.sql` сносит
 `plan_runs` вместе со всей историей. Откат — дамп `pg_dump -Fc` в
