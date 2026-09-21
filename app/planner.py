@@ -29,12 +29,36 @@
   ADR-002); расхождения трёх источников проверяются и уезжают в
   `plan_runs.params` — этого требует ответ организаторов №4;
 * замещения ролей отклонены организаторами (ответ №2, ADR-010), поэтому
-  исполнители берутся ТОЛЬКО из родных строк `v_engineer_role_coverage`;
+  исполнители берутся ТОЛЬКО из родных строк `v_engineer_role_coverage`, и
+  КАНДИДАТЫ на роль — тоже из этой вьюхи, а не из `engineers.role_id`
+  (ADR-012): вьюха остаётся единственным источником правды о паре
+  «инженер × роль», включая `efficiency`;
+* `efficiency` (множитель часов замещающего) применяется к потребности:
+  чтобы закрыть `remaining_hours` сметы, исполнителю нужно
+  `remaining_hours × efficiency` своих часов. Сейчас в данных везде `1.00`,
+  поэтому поведение не меняется, но формула уже верна (ADR-016);
 * фонд часов — по орбитам: сначала своё ядро, невыбранный остаток уходит в заём
-  (`is_loan` считает СУБД, ADR-001);
+  (`is_loan` считает СУБД, ADR-001). Одна строка `plan_assignments` берёт часы
+  РОВНО С ОДНОЙ орбиты: `home_team_id` не входит в первичный ключ
+  `(task_id, sprint_no, engineer_id, role_id)`, поэтому размазать одно
+  назначение по двум орбитам контракт не позволяет (ADR-015);
 * задача с нулевым остатком (работа фактически сделана) получает символическое
   назначение `0.01` ЧЧ: иначе `CHECK (hours > 0)` и инвариант
-  `IN_QUARTER_WITHOUT_ASSIGNMENTS` несовместимы друг с другом.
+  `IN_QUARTER_WITHOUT_ASSIGNMENTS` несовместимы друг с другом;
+* в закрытые спринты план не пишется: при `as_of_sprint = k` нижняя граница
+  старта — `max(1, k, earliest_start_sprint)` (ADR-014).
+
+Режимы (по умолчанию — как в приёмке M2, оба параметра уезжают в
+`plan_runs.params`):
+
+* `dependency_mode`: `start_start` (по умолчанию) —
+  `start(blocked) ≥ start(blocking) + gap`, как в предпосчитанном
+  `task_sequence.earliest_start_sprint`; `finish_start` —
+  `start(blocked) ≥ end(blocking) + gap` (ADR-013);
+* `initiative_mode`: `greedy` (по умолчанию) — задача решается по отдельности,
+  частично закрытая инициатива допустима; `atomic` — пробная упаковка всей
+  инициативы с откатом: не влезла хоть одна задача, переносится вся
+  инициатива (ADR-013).
 """
 from __future__ import annotations
 
@@ -56,6 +80,31 @@ DEFERRED_REASON = "M2"  # Отсутствие ресурсов
 DEFERRED_REASON_BLOCKED = "M3"  # Отсутствует готовность смежных команд
 DONE_STATUS = "Done"
 
+# Семантика зависимостей (ADR-013). `start_start` — значение по умолчанию:
+# именно её реализует предпосчитанный `task_sequence.earliest_start_sprint`.
+DEPENDENCY_MODE_START_START = "start_start"
+DEPENDENCY_MODE_FINISH_START = "finish_start"
+DEPENDENCY_MODES = (DEPENDENCY_MODE_START_START, DEPENDENCY_MODE_FINISH_START)
+
+# Атомарность инициатив (ADR-013). `greedy` — частичная инициатива допустима.
+INITIATIVE_MODE_GREEDY = "greedy"
+INITIATIVE_MODE_ATOMIC = "atomic"
+INITIATIVE_MODES = (INITIATIVE_MODE_GREEDY, INITIATIVE_MODE_ATOMIC)
+
+# Целевая функция (ADR-015): лексикографическая, без перестановок.
+OBJECTIVE = "lexicographic: initiatives.priority_rung DESC, task_sequence.topo_order ASC, start_sprint ASC"
+OBJECTIVE_NOTE = (
+    "жадный обход без перестановок: deferred_next_pi значит «не влезло при уже "
+    "принятых назначениях», а не «невыполнимо в принципе». Счётчики "
+    "initiatives_complete/initiatives_partial в params показывают цену этого выбора"
+)
+
+# `plan_assignments.hours` — часы ИСПОЛНИТЕЛЯ, а не эквивалент работы (ADR-016).
+EFFICIENCY_NOTE = (
+    "hours = человеко-часы исполнителя: смету remaining_hours закрывают "
+    "remaining_hours × v_engineer_role_coverage.efficiency часов (сейчас везде 1.00)"
+)
+
 KPI_TARGETS: dict[str, tuple[Decimal | None, Decimal | None]] = {
     "pi_predictability": (Decimal("80"), Decimal("100")),
     "say_do_ratio": (Decimal("90"), Decimal("105")),
@@ -66,17 +115,23 @@ KPI_TARGETS: dict[str, tuple[Decimal | None, Decimal | None]] = {
 #  Запросы на чтение. Все — к витринам: планировщик не знает ядро изнутри.
 # ---------------------------------------------------------------------------
 PI_SQL = """
-SELECT pi_id, sprint_count, fte_hours_per_sprint
-FROM pi_periods
-ORDER BY pi_id
+SELECT p.pi_id, p.start_date, p.end_date, p.sprint_count, p.fte_hours_per_sprint,
+       COALESCE(f.days_total, p.sprint_count * p.sprint_length_days) AS pi_days,
+       COALESCE(f.factor, p.sprint_count)                            AS fund_factor
+FROM pi_periods p
+LEFT JOIN v_pi_fund_factor f ON f.pi_id = p.pi_id
+ORDER BY p.pi_id
 LIMIT 1
 """
 
+# factor спринта — из вьюхи, а не «из головы»: короткий 7-й спринт даёт
+# 0.5714 фонда, и планировщик обязан считать так же, как инварианты.
 SPRINTS_SQL = """
-SELECT sprint_no, start_date, end_date
-FROM sprints
-WHERE pi_id = %s
-ORDER BY sprint_no
+SELECT s.sprint_no, s.start_date, s.end_date, s.length_days, f.factor
+FROM sprints s
+JOIN v_sprint_fund_factor f ON f.pi_id = s.pi_id AND f.sprint_no = s.sprint_no
+WHERE s.pi_id = %s
+ORDER BY s.sprint_no
 """
 
 # Порядок обхода — правило из спеки: инициатива по скорингу, задача по топологии.
@@ -102,9 +157,11 @@ WHERE t.status IN ('ToDo', 'InProgress')
 ORDER BY rm.task_id, rm.role_id
 """
 
-# Строгий режим: замещения отклонены, поэтому берём только родные строки (ADR-010).
+# Единственный источник правды о паре «инженер × роль» (ADR-012): и кандидаты
+# на роль, и множитель часов берутся отсюда. Строгий режим — замещения
+# отклонены организаторами (ответ №2, ADR-010), поэтому только родные строки.
 COVERAGE_SQL = """
-SELECT c.engineer_id, c.role_id, r.canonical_name AS role_name, c.is_native
+SELECT c.engineer_id, c.role_id, r.canonical_name AS role_name, c.is_native, c.efficiency
 FROM v_engineer_role_coverage c
 JOIN roles r ON r.role_id = c.role_id
 WHERE c.is_native
@@ -224,9 +281,17 @@ class Inputs:
     pi_id: str
     sprint_count: int
     fte_hours_per_sprint: int
+    # Календарь: PI — это КАЛЕНДАРНЫЙ квартал, а не «N × 14 дней» (ADR-017).
+    # `fund_factor` — сколько полных спринтов в квартале (92/14 = 6.5714),
+    # `sprint_factors` — множитель фонда по каждому спринту (7-й = 0.5714).
+    # Фонд ставки за PI = fte_hours_per_sprint × fund_factor = 525.71 ЧЧ.
+    fund_factor: Decimal
+    pi_days: int
+    sprint_factors: dict[int, Decimal]
     team_sp_per_sprint: dict[str, Decimal]
     tasks: tuple[TaskInput, ...]
     engineers: tuple[EngineerInput, ...]
+    coverage: dict[tuple[str, int], Decimal]  # (engineer_id, role_id) -> efficiency
     deps: tuple[tuple[str, str, int], ...]  # (blocking, blocked, min_gap)
     sprints: dict[int, tuple[date, date]]
     all_tasks: tuple[tuple[str, str, Decimal, Decimal], ...]  # id, статус, SP, остаток ЧЧ
@@ -235,12 +300,34 @@ class Inputs:
     estimate_conflict_warnings: int
     active_substitutions: int
 
+    @property
+    def fund_hours_per_fte(self) -> Decimal:
+        """Фонд одной ставки за весь PI в ЧЧ: 80 × 6.5714 = 525.71."""
+        return (self.fund_factor * Decimal(self.fte_hours_per_sprint)).quantize(
+            Decimal("0.01")
+        )
+
+    def short_sprints_note(self) -> str:
+        """Короткие спринты человеческим языком — для логов прогона и UI."""
+        short = {no: f for no, f in sorted(self.sprint_factors.items()) if f < 1}
+        if not short:
+            return "нет"
+        return ", ".join(f"спринт {no} — ×{factor}" for no, factor in short.items())
+
 
 def load_inputs() -> Inputs:
     """Читает всё, что нужно для плана. Только SELECT: сессия read-only."""
     pi = db.query_one(PI_SQL)
     if not pi:
         raise RuntimeError("pi_periods пуст: сначала залейте схему, seed и витрины (docs/RUNBOOK.md)")
+
+    # Календарь читаем один раз: из него и границы спринтов, и множители фонда.
+    sprint_rows = db.query_dicts(SPRINTS_SQL, (pi["pi_id"],))
+    if len(sprint_rows) != int(pi["sprint_count"]):
+        raise RuntimeError(
+            f"календарь PI разъехался: sprints содержит {len(sprint_rows)} строк, "
+            f"а pi_periods.sprint_count = {pi['sprint_count']} (docs/RUNBOOK.md, раздел 7)"
+        )
 
     roles_by_task: dict[str, dict[int, Decimal]] = defaultdict(dict)
     names_by_task: dict[str, dict[int, str]] = defaultdict(dict)
@@ -279,6 +366,15 @@ def load_inputs() -> Inputs:
         )
         item["orbits"][row["team_id"]] = Decimal(row["capacity_rate"])
 
+    # Кандидаты на роль и множитель часов — из вьюхи покрытия (ADR-012).
+    coverage: dict[tuple[str, int], Decimal] = {}
+    for row in db.query_dicts(COVERAGE_SQL):
+        coverage[(row["engineer_id"], row["role_id"])] = Decimal(row["efficiency"])
+    # Страховка: инженера нет в вьюхе — свою родную роль он всё равно закрывает.
+    # Иначе человек молча выпал бы из плана, а инварианты этого не заметили бы.
+    for engineer_id, item in engineers.items():
+        coverage.setdefault((engineer_id, item["role_id"]), Decimal("1"))
+
     conflicts = db.query_one(ESTIMATE_CONFLICT_SQL) or {}
     substitutions = db.query_one(SUBSTITUTION_ROWS_SQL) or {}
 
@@ -286,6 +382,11 @@ def load_inputs() -> Inputs:
         pi_id=pi["pi_id"],
         sprint_count=int(pi["sprint_count"]),
         fte_hours_per_sprint=int(pi["fte_hours_per_sprint"]),
+        fund_factor=Decimal(pi["fund_factor"]),
+        pi_days=int(pi["pi_days"]),
+        sprint_factors={
+            int(row["sprint_no"]): Decimal(row["factor"]) for row in sprint_rows
+        },
         team_sp_per_sprint={
             row["team_id"]: Decimal(row["available_sp_per_sprint"])
             for row in db.query_dicts(TEAM_CAPACITY_SQL)
@@ -301,13 +402,13 @@ def load_inputs() -> Inputs:
             )
             for engineer_id, item in sorted(engineers.items())
         ),
+        coverage=coverage,
         deps=tuple(
             (row["blocking_task_id"], row["blocked_task_id"], int(row["min_gap_sprints"]))
             for row in db.query_dicts(LIVE_DEPS_SQL)
         ),
         sprints={
-            row["sprint_no"]: (row["start_date"], row["end_date"])
-            for row in db.query_dicts(SPRINTS_SQL, (pi["pi_id"],))
+            row["sprint_no"]: (row["start_date"], row["end_date"]) for row in sprint_rows
         },
         all_tasks=tuple(
             (
@@ -436,6 +537,10 @@ class _Funds:
 
     def __init__(self, inputs: Inputs) -> None:
         self.fte = Decimal(inputs.fte_hours_per_sprint)
+        # Множитель фонда по спринтам. Короткий 7-й спринт даёт 0.5714 от
+        # обычного (ADR-017). Нет ключа — считаем спринт полным: безопасный
+        # дефолт для тестов и для календарей без коротких спринтов.
+        self.factors: dict[int, Decimal] = dict(inputs.sprint_factors)
         self.engineers: dict[str, EngineerInput] = {e.engineer_id: e for e in inputs.engineers}
         self._budget: dict[tuple[str, str], Decimal] = {
             (engineer.engineer_id, team_id): rate * self.fte
@@ -445,9 +550,16 @@ class _Funds:
         self._spent: dict[tuple[str, str, int], Decimal] = defaultdict(Decimal)
         self.used_sp: dict[tuple[str, int], Decimal] = defaultdict(Decimal)
 
+    def sprint_factor(self, sprint_no: int) -> Decimal:
+        """Доля фонда полного спринта, которую даёт спринт `sprint_no`."""
+        return self.factors.get(sprint_no, Decimal("1"))
+
     # ---- часы ------------------------------------------------------------
     def orbit_left(self, engineer_id: str, team_id: str, sprint_no: int) -> Decimal:
-        budget = self._budget.get((engineer_id, team_id), Decimal("0"))
+        budget = (
+            self._budget.get((engineer_id, team_id), Decimal("0"))
+            * self.sprint_factor(sprint_no)
+        )
         return budget - self._spent[(engineer_id, team_id, sprint_no)]
 
     def total_left(self, engineer_id: str, sprint_no: int) -> Decimal:
@@ -456,7 +568,9 @@ class _Funds:
             (self._spent[(engineer_id, team_id, sprint_no)] for team_id in engineer.orbits),
             Decimal("0"),
         )
-        return engineer.total_capacity_rate * self.fte - spent
+        return (
+            engineer.total_capacity_rate * self.fte * self.sprint_factor(sprint_no) - spent
+        )
 
     def spend(self, engineer_id: str, team_id: str, sprint_no: int, hours: Decimal) -> None:
         self._spent[(engineer_id, team_id, sprint_no)] += hours
@@ -478,10 +592,11 @@ def _candidate_engineers(
 ) -> list[str]:
     """Кого можно поставить на роль: свои орбиты первыми, потом заёмщики.
 
-    Порядок внутри групп — по убыванию свободных часов, затем по `engineer_id`:
-    без этого один и тот же вход давал бы разные планы. Инженер со своей орбитой
-    идёт первым даже если её бюджет на этот спринт уже выбран: остаток он отдаст
-    с другой своей орбиты, и это будет заём (`_spend_from`).
+    Порядок внутри групп — по убыванию свободных часов орбиты (у заёмщиков —
+    по общему остатку), затем по `engineer_id`: без этого один и тот же вход
+    давал бы разные планы. «Своя орбита» значит «у инженера есть бюджет этой
+    команды в этом спринте»: бюджет орбиты заранее не резервируется, но и в заём
+    не отдаётся раньше, чем свои задачи получат шанс (ADR-015).
     """
     own: list[tuple[Decimal, Decimal, str]] = []
     loans: list[tuple[Decimal, str]] = []
@@ -502,7 +617,15 @@ def _candidate_engineers(
 def _spend_from(
     engineer: EngineerInput, task_team: str, sprint_no: int, need: Decimal, funds: _Funds
 ) -> tuple[Decimal, str | None]:
-    """Списать до `need` часов с орбит инженера. Возвращает (часы, home_team_id)."""
+    """Списать до `need` часов РОВНО С ОДНОЙ орбиты. Возвращает (часы, home_team_id).
+
+    Одна строка `plan_assignments` = одна орбита: `home_team_id` не входит в
+    первичный ключ `(task_id, sprint_no, engineer_id, role_id)`, поэтому
+    разложить одно назначение по двум орбитам контракт не позволяет, а указать
+    первую орбиту при часах с двух — значит соврать в отчётности по орбитам.
+    Не влезло в одну орбиту — остаток возьмёт следующий кандидат или следующий
+    спринт (`_allocate_task`).
+    """
     order = [task_team] if task_team in engineer.orbits else []  # своё ядро — первым
     order.extend(
         sorted(
@@ -514,8 +637,6 @@ def _spend_from(
         )
     )
 
-    taken = Decimal("0")
-    home: str | None = None
     for team_id in order:
         left = min(
             funds.orbit_left(engineer.engineer_id, team_id, sprint_no),
@@ -523,16 +644,12 @@ def _spend_from(
         )
         if left <= 0:
             continue
-        take = min(left, need - taken)
+        take = min(left, need)
         if take <= 0:
             break
         funds.spend(engineer.engineer_id, team_id, sprint_no, take)
-        taken += take
-        if home is None:
-            home = team_id  # орбита, с которой списаны часы (она же home_team_id)
-        if taken >= need:
-            break
-    return taken, home
+        return take, team_id
+    return Decimal("0"), None
 
 
 def _allocate_task(
@@ -541,12 +658,27 @@ def _allocate_task(
     funds: _Funds,
     by_role: dict[int, list[str]],
     sprint_count: int,
+    coverage: dict[tuple[str, int], Decimal],
 ) -> tuple[list[Assignment], int, int] | None:
     """Разложить остаток задачи по спринтам и людям, начиная со `start_sprint`.
 
-    Часы роли, не поместившиеся в спринт, переезжают в следующий — так задача
-    растягивается (`end_sprint > start_sprint`). Если до конца квартала часы не
-    нашлись, все сделанные списания откатываются: задача уйдёт в перенос.
+    Механика распределения часов (ADR-015, ревью M2, пункт 5):
+
+    * роли внутри одного спринта закрываются ПАРАЛЛЕЛЬНО и независимо: цикл идёт
+      по ролям, каждая берёт столько часов, сколько дают свободные исполнители;
+    * одну роль в одном спринте могут закрывать НЕСКОЛЬКО человек — на каждого
+      пишется своя строка `plan_assignments`;
+    * часы роли, не поместившиеся в спринт, переезжают в следующий: задача
+      растягивается (`end_sprint > start_sprint`);
+    * окно задачи — `[min, max]` ФАКТИЧЕСКИ использованных спринтов; разрывы
+      внутри окна не запрещены (задача ждёт конкретную роль), но подсвечиваются
+      инвариантом `WINDOW_HAS_GAP` как warning;
+    * если до конца квартала часы не нашлись, ВСЕ сделанные списания
+      откатываются (`funds.free`): задача уйдёт в перенос, её часы вернутся
+      в фонд — пробные назначения не «залипают»;
+    * `efficiency` умножает потребность: чтобы закрыть смету `remaining_hours`,
+      исполнителю нужно `remaining_hours × efficiency` СВОИХ часов (сейчас
+      в данных везде `1.00`, поэтому формула вырождается в тождество).
 
     Возвращает (назначения, ПЕРВЫЙ использованный спринт, последний). Первый
     использованный, а не запрошенный: иначе задача «стартовала» бы в спринте,
@@ -584,15 +716,17 @@ def _allocate_task(
             if need <= 0:
                 continue
             for engineer_id in _candidate_engineers(task.team_id, role_id, sprint_no, funds, by_role):
+                # efficiency: смету закрывают ЧАСЫ ИСПОЛНИТЕЛЯ, а не сметы.
+                efficiency = coverage.get((engineer_id, role_id), Decimal("1"))
                 taken, home = _spend_from(
-                    funds.engineers[engineer_id], task.team_id, sprint_no, need, funds
+                    funds.engineers[engineer_id], task.team_id, sprint_no, need * efficiency, funds
                 )
                 if taken <= 0 or home is None:
                     continue
                 assignments.append(
                     Assignment(task.task_id, sprint_no, engineer_id, role_id, taken, home, task.team_id)
                 )
-                need -= taken
+                need -= taken / efficiency
                 remaining[role_id] = need
                 if need <= 0:
                     break
@@ -608,16 +742,36 @@ def _allocate_task(
 #  ЧИСТАЯ ЛОГИКА: вход → план
 # ---------------------------------------------------------------------------
 def build_plan(
-    inputs: Inputs, as_of_sprint: int = 0, baseline_starts: dict[str, int] | None = None
+    inputs: Inputs,
+    as_of_sprint: int = 0,
+    baseline_starts: dict[str, int] | None = None,
+    dependency_mode: str = DEPENDENCY_MODE_START_START,
+    initiative_mode: str = INITIATIVE_MODE_GREEDY,
 ) -> Plan:
-    """Строит план. Ни одного обращения к базе: всё, что нужно, уже во `Inputs`."""
+    """Строит план. Ни одного обращения к базе: всё, что нужно, уже во `Inputs`.
+
+    `dependency_mode` и `initiative_mode` — решения ADR-013; оба уезжают
+    в `plan_runs.params`, поэтому любой прогон сам объясняет, по каким правилам
+    он построен. Значения по умолчанию — те, на которых прошла приёмка M2.
+    """
     if not 0 <= as_of_sprint <= 12:
         raise ValueError(f"as_of_sprint={as_of_sprint} вне диапазона 0..12 (CHECK в plan_runs)")
+    if dependency_mode not in DEPENDENCY_MODES:
+        raise ValueError(f"dependency_mode={dependency_mode!r} не из {DEPENDENCY_MODES}")
+    if initiative_mode not in INITIATIVE_MODES:
+        raise ValueError(f"initiative_mode={initiative_mode!r} не из {INITIATIVE_MODES}")
+
+    # В закрытые спринты план не пишется (ADR-014): при `as_of_sprint = k` спринт
+    # k начинается «сегодня», всё до него — история. Инвариант
+    # `ASSIGNMENT_IN_CLOSED_SPRINT` проверяет это независимо от алгоритма.
+    replan_floor = max(1, as_of_sprint)
 
     by_id = {task.task_id: task for task in inputs.tasks}
+    # Кандидаты на роль — из покрытия (ADR-012), а не из `engineers.role_id`:
+    # вьюха — единственный источник правды о паре «инженер × роль».
     by_role: dict[int, list[str]] = defaultdict(list)
-    for engineer in inputs.engineers:
-        by_role[engineer.role_id].append(engineer.engineer_id)
+    for engineer_id, role_id in inputs.coverage:
+        by_role[role_id].append(engineer_id)
     for ids in by_role.values():
         ids.sort()
 
@@ -645,20 +799,63 @@ def build_plan(
             funds.release_sp(task.team_id, starts.pop(task_id), task.estimation_sp)
         ends.pop(task_id, None)
 
+    def release_initiative(prodf_id: str) -> list[str]:
+        """Откат ВСЕЙ инициативы: вернуть в фонд её SP и часы (ADR-013)."""
+        rolled = [
+            task.task_id for task in ordered if task.prodf_id == prodf_id and task.task_id in starts
+        ]
+        for task_id in rolled:
+            release(task_id)
+        return rolled
+
+    def ready_from(blocking: str, gap: int) -> int:
+        """С какого спринта блокируемая задача вправе стартовать (ADR-013).
+
+        `start_start`: старт блокирующей + зазор. `finish_start`: КОНЕЦ
+        блокирующей + зазор. Блокирующая могла быть снята с плана между
+        проходами — тогда ограничение не действует и берётся нижняя граница
+        пересчёта.
+        """
+        if dependency_mode == DEPENDENCY_MODE_FINISH_START:
+            return (ends.get(blocking) or starts.get(blocking, replan_floor)) + gap
+        return starts.get(blocking, replan_floor) + gap
+
+    def blocked_reason(task: TaskInput) -> str:
+        """M3 — если задачу держит перенесённая блокирующая чужая команда."""
+        for blocking, _gap in deps_by_blocked.get(task.task_id, ()):
+            if blocking in deferred and by_id[blocking].team_id != task.team_id:
+                return DEFERRED_REASON_BLOCKED
+        return DEFERRED_REASON
+
+    def lower_bound(task: TaskInput) -> int:
+        """Нижняя граница старта: закрытые спринты, граф и уже принятые зазоры."""
+        lower = max(replan_floor, task.earliest_start_sprint)
+        for blocking, gap in deps_by_blocked.get(task.task_id, ()):
+            if blocking in starts:  # блокирующая уже поставлена — держим зазор
+                lower = max(lower, ready_from(blocking, gap))
+        return lower
+
     def place(task: TaskInput, lower: int) -> bool:
         """Поставить задачу в минимальный подходящий спринт. False — не влезла.
 
         Часы раскладываем первыми, SP проверяем по ФАКТИЧЕСКОМУ спринту старта:
         инвариант `SP_OVERFLOW` группирует SP по `start_sprint`, поэтому если
-        задача начала работать в спринте 3, ёмкость нужна именно там.
+        задача начала работать в спринте 3, ёмкость нужна именно там. Ёмкость
+        спринта = `available_sp_per_sprint` × factor спринта: в коротком 7-м
+        спринте SP меньше (ADR-017).
         """
         capacity = inputs.team_sp_per_sprint.get(task.team_id, Decimal("0"))
-        for candidate in range(max(1, lower), inputs.sprint_count + 1):
-            result = _allocate_task(task, candidate, funds, by_role, inputs.sprint_count)
+        for candidate in range(max(replan_floor, lower), inputs.sprint_count + 1):
+            result = _allocate_task(
+                task, candidate, funds, by_role, inputs.sprint_count, inputs.coverage
+            )
             if result is None:
                 continue
             rows, start_used, end_sprint = result
-            if funds.used_sp[(task.team_id, start_used)] + task.estimation_sp > capacity:
+            if (
+                funds.used_sp[(task.team_id, start_used)] + task.estimation_sp
+                > capacity * funds.sprint_factor(start_used)
+            ):
                 funds.free(rows)  # SP не влезли в спринт старта — откат и пробуем позже
                 continue
             funds.take_sp(task.team_id, start_used, task.estimation_sp)
@@ -669,17 +866,31 @@ def build_plan(
             return True
         return False
 
-    # ---- проход 1: жадный обход в порядке приоритетов ---------------------
-    for task in ordered:
-        lower = max(1, task.earliest_start_sprint)
-        for blocking, gap in deps_by_blocked.get(task.task_id, ()):
-            if blocking in starts:  # блокирующая уже поставлена — держим зазор
-                lower = max(lower, starts[blocking] + gap)
-        if not place(task, lower):
-            deferred[task.task_id] = DEFERRED_REASON
+    # ---- проход 1: обход в порядке приоритетов ----------------------------
+    if initiative_mode == INITIATIVE_MODE_ATOMIC:
+        # Пробная упаковка инициативы целиком (ADR-013): не влезла хоть одна
+        # задача — откат всех. Иначе дефицитный исполнитель занят инициативой,
+        # которая всё равно не завершится, а KPI считает только завершённые.
+        groups: dict[str, list[TaskInput]] = defaultdict(list)
+        for task in ordered:  # `ordered` уже отсортирован — порядок инициатив сохранён
+            groups[task.prodf_id].append(task)
+        for prodf_id, members in groups.items():
+            for task in members:
+                if not place(task, lower_bound(task)):
+                    break
+            else:
+                continue
+            release_initiative(prodf_id)
+            for task in members:
+                deferred[task.task_id] = blocked_reason(task)
+    else:
+        for task in ordered:
+            if not place(task, lower_bound(task)):
+                deferred[task.task_id] = DEFERRED_REASON
 
     # ---- проход 2: перенесённая блокирующая тянет за собой ----------------
     # Ставить зависимую задачу в квартал нельзя: блокирующая в него не попала.
+    # Инвариант `DEPENDENCY_BLOCKER_DEFERRED` проверяет это независимо от кода.
     changed = True
     while changed:
         changed = False
@@ -690,28 +901,30 @@ def build_plan(
                 if blocking not in deferred:
                     continue
                 release(task.task_id)
-                deferred[task.task_id] = (
-                    DEFERRED_REASON_BLOCKED
-                    if by_id[blocking].team_id != task.team_id
-                    else DEFERRED_REASON
-                )
+                deferred[task.task_id] = blocked_reason(task)
+                if initiative_mode == INITIATIVE_MODE_ATOMIC:
+                    release_initiative(task.prodf_id)  # инициатива — целиком
                 changed = True
                 break
 
     # ---- проход 3: догон зазоров, если блокирующая уехала позже ------------
     for _ in range(len(ordered) + 1):
         violations = [
-            (blocking, blocked, gap, starts[blocking])
+            (blocking, blocked, gap)
             for blocking, blocked, gap in inputs.deps
-            if blocking in starts and blocked in starts and starts[blocked] < starts[blocking] + gap
+            if blocking in starts
+            and blocked in starts
+            and starts[blocked] < ready_from(blocking, gap)
         ]
         if not violations:
             break
-        for _blocking, blocked, gap, blocking_start in violations:
+        for _blocking, blocked, gap in violations:
             task = by_id[blocked]
             release(blocked)
-            if not place(task, max(task.earliest_start_sprint, blocking_start + gap)):
-                deferred[blocked] = DEFERRED_REASON
+            if not place(task, max(lower_bound(task), ready_from(_blocking, gap))):
+                deferred[blocked] = blocked_reason(task)
+                if initiative_mode == INITIATIVE_MODE_ATOMIC:
+                    release_initiative(task.prodf_id)
 
     # ---- расписание -------------------------------------------------------
     schedule: list[ScheduleRow] = []
@@ -728,7 +941,18 @@ def build_plan(
         )
 
     assignments = [_round_hours(row) for task in ordered for row in placed.get(task.task_id, [])]
-    return _assemble(inputs, as_of_sprint, schedule, assignments, baseline_starts or {})
+    return _assemble(
+        inputs,
+        as_of_sprint,
+        schedule,
+        assignments,
+        baseline_starts or {},
+        {
+            "dependency_mode": dependency_mode,
+            "initiative_mode": initiative_mode,
+            "replan_floor": replan_floor,
+        },
+    )
 
 
 def _round_hours(row: Assignment) -> Assignment:
@@ -750,8 +974,13 @@ def _assemble(
     schedule: list[ScheduleRow],
     assignments: list[Assignment],
     baseline_starts: dict[str, int],
+    modes: dict[str, Any] | None = None,
 ) -> Plan:
-    """Собирает `Plan`: алерты, KPI, базовая линия, слепок состояния, params."""
+    """Собирает `Plan`: алерты, KPI, базовая линия, слепок состояния, params.
+
+    `modes` — режимы прогона (ADR-013/014): уезжают в `plan_runs.params`, чтобы
+    у каждого результата было объяснение, по каким правилам он получен.
+    """
     by_id = {task.task_id: task for task in inputs.tasks}
     in_quarter = [row for row in schedule if row.decision == "in_quarter"]
     deferred = [row for row in schedule if row.decision != "in_quarter"]
@@ -778,9 +1007,45 @@ def _assemble(
         (row.hours for row in assignments if row.home_team_id != row.serving_team_id), Decimal("0")
     )
 
+    # Видимость цены целевой функции (ADR-015): сколько инициатив закрыто целиком,
+    # сколько осталось частично. В `greedy`-режиме частичные — норма, но заказчик
+    # должен видеть их число, а не только агрегат KPI.
+    by_initiative: dict[str, list[str]] = defaultdict(list)
+    for task in inputs.tasks:
+        by_initiative[task.prodf_id].append(task.task_id)
+    in_quarter_ids = {row.task_id for row in in_quarter}
+    complete_initiatives = [
+        prodf_id for prodf_id, ids in by_initiative.items() if set(ids) <= in_quarter_ids
+    ]
+    partial_initiatives = sorted(
+        prodf_id
+        for prodf_id, ids in by_initiative.items()
+        if 0 < len(set(ids) & in_quarter_ids) < len(ids)
+    )
+
+    # Календарь уезжает в `plan_runs.params`: прогон без границ PI невозможно
+    # сопоставить с кварталом, а фонд 525.71 ЧЧ выглядит «взятым с потолка»,
+    # если рядом нет 92 дней и множителя 6.5714 (ADR-017).
+    pi_start = min((pair[0] for pair in inputs.sprints.values()), default=None)
+    pi_end = max((pair[1] for pair in inputs.sprints.values()), default=None)
+    short_sprints = {
+        str(no): str(factor)
+        for no, factor in sorted(inputs.sprint_factors.items())
+        if factor < 1
+    }
+
     params: dict[str, Any] = {
         "algorithm": ALGORITHM,
         "estimate_source": ESTIMATE_SOURCE,
+        "calendar": {
+            "pi_start": str(pi_start) if pi_start else None,
+            "pi_end": str(pi_end) if pi_end else None,
+            "sprint_count": inputs.sprint_count,
+            "pi_days": inputs.pi_days,
+            "fund_factor": str(inputs.fund_factor),
+            "fund_hh_per_fte": str(inputs.fund_hours_per_fte),
+            "short_sprints": short_sprints,
+        },
         "estimate_validated": True,
         "estimate_conflicts": inputs.estimate_conflicts,
         "estimate_conflicts_note": (
@@ -796,11 +1061,20 @@ def _assemble(
         "deferred_hh": str(deferred_hh),
         "loan_hh": str(loan_hh),
         "baseline_starts_used": bool(baseline_starts),
+        "objective": OBJECTIVE,
+        "objective_note": OBJECTIVE_NOTE,
+        "efficiency_note": EFFICIENCY_NOTE,
+        "initiatives_planned": len(by_initiative),
+        "initiatives_complete": len(complete_initiatives),
+        "initiatives_partial": partial_initiatives,
     }
+    params.update(modes or {})
     note = (
         f"{len(in_quarter)} из {len(inputs.tasks)} живых задач в квартале, "
-        f"{len(deferred)} перенесено (M2/M3); алертов {len(alerts)}; "
-        f"займов {loan_hh} ЧЧ; замещения отклонены (ответ №2, ADR-010)"
+        f"{len(deferred)} перенесено (M2/M3); инициатив целиком "
+        f"{len(complete_initiatives)} из {len(by_initiative)}"
+        f"{f', частично {len(partial_initiatives)}' if partial_initiatives else ''}; "
+        f"алертов {len(alerts)}; займов {loan_hh} ЧЧ; замещения отклонены (ответ №2, ADR-010)"
     )
     return Plan(
         pi_id=inputs.pi_id,
@@ -848,7 +1122,11 @@ def _build_alerts(
 
     supply: dict[int, Decimal] = defaultdict(Decimal)
     for engineer in inputs.engineers:
-        supply[engineer.role_id] += engineer.total_capacity_rate * fte * inputs.sprint_count
+        # Фонд за квартал — через fund_factor (92/14 = 6.5714), а не sprint_count:
+        # иначе короткий 7-й спринт приписал бы роли лишние 8 дней работы.
+        supply[engineer.role_id] += (
+            engineer.total_capacity_rate * fte * inputs.fund_factor
+        )
 
     for role_id in sorted(demand):
         need = demand[role_id]

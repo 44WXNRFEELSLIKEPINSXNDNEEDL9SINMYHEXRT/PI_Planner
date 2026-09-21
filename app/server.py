@@ -1,29 +1,61 @@
-"""HTTP-сервер демо: `/api/health` и статика собранного фронта.
+"""HTTP-сервер демо: `/api/*`, `/metrics`, статика из `web/dist`.
 
 Запускается ровно так, как его зовёт `run.bat`:
 
     uv run python -m app.server --port 8000
 
-Только стандартная библиотека: в `pyproject.toml` HTTP-фреймворка нет, и
-ради одного эндпоинта тянуть FastAPI/uvicorn не нужно — `uv.lock` остаётся
-без изменений.
+Только стандартная библиотека: в `pyproject.toml` HTTP-фреймворка нет, и ради
+нескольких эндпоинтов тянуть FastAPI/uvicorn не нужно — `uv.lock` остаётся без
+изменений. Метрики отдаются в текстовом формате Prometheus (version=0.0.4)
+руками, без `prometheus_client`; имена метрик — **замороженный контракт** для
+devops, описан в docs/RUNBOOK.md («Контракт для мониторинга»). Переименование
+метрики или лейбла = сломанный дашборд, а не рефакторинг.
 
-Отношение к базе — **read-only**: единственный запрос к PostgreSQL это
-`app.db.health()`, а он идёт в read-only сессии. Ни один маршрут этого
-сервера не пишет в контракт планировщика.
+Роли эндпоинтов разные, и путать их нельзя:
+
+* `/api/livez` — процесс жив, база **не** трогается: liveness-проба. Рестарт по
+  ней недопустим, иначе контейнер перезапускается из-за упавшей базы;
+* `/api/health` — готовность: 200 только если база отвечает, иначе 503 с
+  причиной и подсказкой;
+* `/api/version` — версии приложения и ETL, работает без базы;
+* `/api/views` — справочник витрин, `/api/views/{view}` — строки витрины как
+  есть (белый список и конверт — `app/views.py`, ADR-019): маршрут один, имя
+  витрины — параметр пути, иначе фиксированный набор лейблов `route` раздулся бы
+  до числа экранов;
+* `/metrics` — всегда 200, даже при мёртвой базе (`pi_planner_db_up 0`): иначе
+  мониторинг теряет вместе с метриками и причину их отсутствия.
+
+Отношение к базе — **read-only**: единственные запросы к PostgreSQL это
+`app.db.health()`, `app.db.query_one()` для бизнес-метрик и `app.views.fetch()`
+для витрин, все три идут в read-only сессии. Ни один маршрут этого сервера не
+пишет в контракт планировщика.
 """
+
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import signal
 import sys
+import threading
+import time
+from collections import defaultdict
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
-from app import db
+from app import __version__ as APP_VERSION
+from app import db, views
+from app.metrics import NO_RESPONSE_STATUS, PROMETHEUS_CONTENT_TYPE, Metrics
+
+try:  # версия ETL и PI живут в одном месте — etl/config.py, а не здесь
+    from etl.config import ETL_VERSION, PI_ID
+except Exception:  # noqa: BLE001 — сервер обязан подниматься и без ETL-пакета
+    ETL_VERSION, PI_ID = "unknown", None
 
 ROOT = Path(__file__).resolve().parent.parent
 DIST = ROOT / "web" / "dist"
@@ -31,6 +63,11 @@ INDEX = DIST / "index.html"
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
+
+# Сколько живёт снимок бизнес-метрик из базы. Без кэша каждый scrape
+# (у Prometheus это раз в 15 секунд, у нескольких инстансов — чаще) дёргал бы
+# `v_plan_violations` — самую тяжёлую вьюху контракта.
+METRICS_TTL_SECONDS = float(os.environ.get("PI_PLANNER_METRICS_TTL", "15"))
 
 # mimetypes на Windows берёт типы из реестра и про UTF-8 не знает, поэтому
 # для текстовых файлов кодировку выставляем сами: иначе кириллица в UI поедет.
@@ -44,7 +81,48 @@ MIME_OVERRIDES = {
     ".svg": "image/svg+xml",
 }
 
-KNOWN_API = ("/api/health",)
+# Публичный контракт для фронта и devops. `/metrics` тоже здесь: он известен
+# серверу, но наружу его закрывает Caddy (`respond 404`) — см. RUNBOOK.
+# `/api/views` — справочник витрин; сами витрины живут под ним же, но лейблом
+# `route` становится `/api/views/{view}` (см. app/metrics.py).
+KNOWN_API = ("/api/health", "/api/livez", "/api/version", "/api/views", "/metrics")
+
+# Реестр метрик один на процесс: Handler создаётся на каждый запрос.
+METRICS = Metrics(
+    app_version=APP_VERSION,
+    etl_version=ETL_VERSION,
+    pi_id=PI_ID,
+    known_api=KNOWN_API,
+    ttl=METRICS_TTL_SECONDS,
+)
+
+STARTED_AT = time.time()
+LOG_FORMAT = "text"  # переключается --log-format / PI_PLANNER_LOG_FORMAT
+
+
+def log_event(event: str, level: str = "info", **fields: Any) -> None:
+    """Одна строка на событие: `text` для демо-консоли, `json` для devops.
+
+    JSON-режим включается флагом `--log-format json` (или переменной
+    `PI_PLANNER_LOG_FORMAT=json`): devops разбирает такие строки парсером, а
+    не регулярками, и в каждой есть `ts`, `level`, `event` и `version`.
+    """
+    if LOG_FORMAT == "json":
+        payload = {
+            "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds"),
+            "level": level,
+            "event": event,
+            "service": "pi-planner",
+            "version": APP_VERSION,
+            **fields,
+        }
+        sys.stdout.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+    else:
+        tail = " ".join(f"{key}={value}" for key, value in fields.items())
+        sys.stdout.write(f"[server] {event} {tail}".rstrip() + "\n")
+    sys.stdout.flush()
+
+
 
 
 def unavailable_payload(exc: Exception) -> dict[str, Any]:
@@ -76,8 +154,34 @@ def unavailable_payload(exc: Exception) -> dict[str, Any]:
     }
 
 
+def version_payload() -> dict[str, Any]:
+    """Версии и границы контракта. Базы не касается — отвечает и без неё.
+
+    `git_sha` приходит из окружения (`PI_PLANNER_GIT_SHA`): на сборке его
+    проставляет CI, локально он пуст — и это честнее, чем выдуманное значение.
+    """
+    return {
+        "service": "pi-planner",
+        "version": APP_VERSION,
+        "etl_version": ETL_VERSION,
+        "pi_id": PI_ID,
+        "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        "git_sha": os.environ.get("PI_PLANNER_GIT_SHA") or None,
+        "started_at": datetime.fromtimestamp(STARTED_AT, timezone.utc)
+        .astimezone()
+        .isoformat(timespec="seconds"),
+        "uptime_seconds": round(time.time() - STARTED_AT, 3),
+        "pid": os.getpid(),
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
-    """GET/HEAD: `/api/*` — JSON, остальное — собранный фронт."""
+    """GET/HEAD: `/api/*` и `/metrics` — данные, остальное — собранный фронт.
+
+    Каждый запрос логируется один раз и попадает в метрики: код ответа,
+    маршрут из фиксированного набора и длительность. Штатный `log_request`
+    молчит (см. ниже), иначе строка запроса печаталась бы дважды.
+    """
 
     server_version = "pi-planner"
     sys_version = ""  # не светим версию Python в ответах и логах
@@ -85,10 +189,34 @@ class Handler(BaseHTTPRequestHandler):
     # ---------------------------------------------------------------- GET/HEAD
     def do_GET(self) -> None:  # noqa: N802 — имя задано стандартной библиотекой
         path = urlparse(self.path).path
-        if path.startswith("/api/"):
-            self._api(path)
-        else:
-            self._static(path)
+        self._route = METRICS.route_label(path)
+        self._status: Any = None
+        self._bytes = 0
+        started = time.perf_counter()
+        METRICS.enter()
+        try:
+            if path.startswith("/api/") or path == "/metrics":
+                self._api(path)
+            else:
+                self._static(path)
+        finally:
+            # finally, а не после вызова: необработанное исключение в хендлере
+            # тоже должно оставить след в логе и в счётчике (status=0 —
+            # «ответ не отправлен»), иначе всплеск ошибок будет невидимым.
+            METRICS.leave()
+            seconds = time.perf_counter() - started
+            status = self._status if self._status is not None else NO_RESPONSE_STATUS
+            METRICS.observe(self.command, self._route, status, seconds)
+            log_event(
+                "http_request",
+                method=self.command,
+                path=path,
+                route=self._route,
+                status=status,
+                duration_ms=round(seconds * 1000, 3),
+                bytes=self._bytes,
+                client=self.address_string(),
+            )
 
     def do_HEAD(self) -> None:  # noqa: N802
         self.do_GET()
@@ -105,14 +233,91 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, payload)
             return
 
+        if path == "/api/livez":
+            # Liveness: базу не трогаем вообще. Если проба ходит в базу,
+            # оркестратор начинает перезапускать живой контейнер из-за чужой
+            # аварии, а перезапуск базу не поднимает.
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "status": "alive",
+                    "version": APP_VERSION,
+                    "uptime_seconds": round(time.time() - STARTED_AT, 3),
+                    "pid": os.getpid(),
+                },
+            )
+            return
+
+        if path == "/api/version":
+            self._send_json(HTTPStatus.OK, version_payload())
+            return
+
+        if path == "/api/views":
+            # Справочник витрин: фронт получает контракт (имена, колонки сортировки,
+            # экран) не из переписки, а из живого сервера.
+            self._send_json(HTTPStatus.OK, views.catalog())
+            return
+
+        if path.startswith("/api/views/"):
+            self._views(path)
+            return
+
+        if path == "/metrics":
+            # Всегда 200, даже если база мертва: иначе мониторинг теряет вместе
+            # с метриками и причину их отсутствия (`pi_planner_db_up 0`).
+            self._respond(
+                HTTPStatus.OK,
+                PROMETHEUS_CONTENT_TYPE,
+                METRICS.render().encode("utf-8"),
+            )
+            return
+
         self._send_json(
             HTTPStatus.NOT_FOUND,
             {
                 "error": "not_found",
                 "message": f"нет такого эндпоинта: {path}",
                 "known": list(KNOWN_API),
+                "hint": "витрины: GET /api/views (справочник), GET /api/views/{view} (строки)",
             },
         )
+
+    def _views(self, path: str) -> None:
+        """`GET /api/views/{view}` — строки витрины как есть плюс конверт (ADR-019).
+
+        Три разных «плохо» различаются кодами, и фронт должен уметь их различать:
+        404 — витрины нет в белом списке, 400 — параметр не прошёл проверку
+        (включая попытку подсунуть SQL в `order`), 503 — база не отвечает.
+        Пустая витрина — не ошибка: 200 и `count: 0`.
+        """
+        name = unquote(path[len("/api/views/") :])
+        query = parse_qs(urlparse(self.path).query)
+        try:
+            payload = views.fetch(
+                name,
+                run_id=views.parse_run_id(self._query_param(query, "run_id")),
+                limit=views.parse_limit(self._query_param(query, "limit")),
+                offset=views.parse_offset(self._query_param(query, "offset")),
+                order=self._query_param(query, "order"),
+            )
+        except views.UnknownView as exc:
+            self._send_json(HTTPStatus.NOT_FOUND, exc.payload())
+            return
+        except views.BadRequest as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, exc.payload())
+            return
+        except Exception as exc:  # noqa: BLE001 — как у /api/health: фронту нужен
+            # внятный 503, а не оборванное соединение; демо-машина может стартовать
+            # раньше PostgreSQL, а браузер кэширует «сервер недоступен» надолго
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, unavailable_payload(exc))
+            return
+        self._send_json(HTTPStatus.OK, payload)
+
+    @staticmethod
+    def _query_param(query: dict[str, list[str]], key: str) -> str | None:
+        """Первый параметр запроса или None: пустая строка значит «не задан»."""
+        values = query.get(key) or []
+        return values[0] if values and values[0] != "" else None
 
     # ---------------------------------------------------------------- статика
     def _static(self, path: str) -> None:
@@ -150,6 +355,10 @@ class Handler(BaseHTTPRequestHandler):
         self._respond(HTTPStatus.OK, ctype, body)
 
     def _respond(self, status: HTTPStatus, ctype: str, body: bytes) -> None:
+        # Факт ответа запоминаем для метрик и лога: `do_GET` смотрит сюда,
+        # чтобы отличить «ответили 404» от «ответ не отправился вовсе».
+        self._status = int(status)
+        self._bytes = len(body)
         try:
             self.send_response(status)
             self.send_header("Content-Type", ctype)
@@ -164,37 +373,102 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     # ------------------------------------------------------------------ логи
+    def log_request(self, code: Any = "-", size: Any = "-") -> None:  # noqa: N802
+        """Молчим: запрос уже залогирован в `do_GET` — с длительностью и метриками."""
+        return
+
     def log_message(self, fmt: str, *args: Any) -> None:
-        sys.stdout.write(f"[server] {self.address_string()} {fmt % args}\n")
-        sys.stdout.flush()
+        """Сообщения самой библиотеки: битый запрос, неподдерживаемый метод."""
+        log_event("http_note", message=fmt % args, client=self.address_string())
 
     def log_error(self, fmt: str, *args: Any) -> None:
-        self.log_message(fmt, *args)
+        log_event("http_note", level="error", message=fmt % args, client=self.address_string())
+
+
+def _install_signal_handlers(httpd: ThreadingHTTPServer) -> dict[str, Any]:
+    """Штатная остановка по SIGTERM/SIGINT (на Windows ещё и SIGBREAK).
+
+    `httpd.shutdown()` обязан вызываться из другого потока: из того же он ждёт
+    завершения `serve_forever` и получается deadlock. Смысл в том, чтобы
+    `docker stop` и оркестратор гасили процесс штатно, а не убивали его по
+    таймауту вместе с недописанными ответами.
+
+    Возвращаем изменяемый словарь: в него обработчик кладёт имя сигнала,
+    чтобы `main` написал в лог, ПОЧЕМУ сервер встал.
+    """
+    state: dict[str, Any] = {"signal": None}
+
+    def stop(signum: int, _frame: Any) -> None:
+        state["signal"] = signal.Signals(signum).name
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+    for name in ("SIGTERM", "SIGINT", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, stop)
+        except (ValueError, OSError):  # не главный поток или сигнал недоступен
+            continue
+    return state
 
 
 def main(argv: list[str] | None = None) -> int:
+    global LOG_FORMAT
+
     parser = argparse.ArgumentParser(
         prog="python -m app.server",
-        description="Демо-сервер PI-Planner: /api/health и собранный фронт из web/dist.",
+        description="Демо-сервер PI-Planner: API, метрики и собранный фронт из web/dist.",
     )
     parser.add_argument("--host", default=DEFAULT_HOST, help="по умолчанию 127.0.0.1")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="по умолчанию 8000")
+    parser.add_argument(
+        "--log-format",
+        choices=("text", "json"),
+        default=os.environ.get("PI_PLANNER_LOG_FORMAT", "text"),
+        help="text — для консоли демо, json — для сборщика логов devops",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"pi-planner {APP_VERSION} (ETL {ETL_VERSION}, PI {PI_ID})",
+    )
     args = parser.parse_args(argv)
+    LOG_FORMAT = args.log_format
 
     if not INDEX.is_file():
-        print(f"[server] ВНИМАНИЕ: {INDEX} отсутствует, соберите фронт (npm run build)", flush=True)
+        log_event(
+            "frontend_missing",
+            level="warning",
+            index=str(INDEX),
+            hint="соберите фронт: cd web && npm run build",
+        )
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     url = f"http://{args.host}:{args.port}"
-    print(f"[server] слушаю {url}   (статика: {DIST})", flush=True)
-    print(f"[server] проверка живости: {url}/api/health", flush=True)
+    state = _install_signal_handlers(httpd)
+    log_event(
+        "server_started",
+        url=url,
+        static=str(DIST),
+        pi_id=PI_ID,
+        log_format=LOG_FORMAT,
+        liveness=f"{url}/api/livez",
+        readiness=f"{url}/api/health",
+        views=f"{url}/api/views",
+        metrics=f"{url}/metrics",
+    )
     try:
         httpd.serve_forever()
-    except KeyboardInterrupt:
-        print("", flush=True)
-        print("[server] остановлен по Ctrl+C", flush=True)
+    except KeyboardInterrupt:  # Ctrl+C: обработчик сигнала мог не успеть
+        state["signal"] = state["signal"] or "KeyboardInterrupt"
     finally:
         httpd.server_close()
+    log_event(
+        "server_stopped",
+        reason=state["signal"] or "shutdown",
+        uptime_seconds=round(time.time() - STARTED_AT, 3),
+    )
     return 0
 
 

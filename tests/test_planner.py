@@ -14,6 +14,8 @@ from collections import defaultdict
 from datetime import date, timedelta
 from decimal import Decimal
 
+import pytest
+
 from app import planner
 
 T1, T2 = "Team-1", "Team-2"
@@ -78,20 +80,49 @@ def inputs(
     bus_factor: tuple[tuple[str, int, Decimal], ...] = (),
     all_tasks: tuple[tuple[str, str, Decimal, Decimal], ...] = (),
     conflicts: int = 0,
+    coverage: dict[tuple[str, int], Decimal] | None = None,
+    sprint_lengths: dict[int, int] | None = None,
 ) -> planner.Inputs:
+    """Вход планировщика. Календарь — как в БД: спринты подряд, длина по умолчанию 14.
+
+    `sprint_lengths` задаёт длину отдельных спринтов: короткий спринт
+    (например, `{7: 8}`) даёт пропорционально меньший фонд — ровно так, как
+    это делает `v_sprint_fund_factor` (ADR-017). Множитель округляется до
+    4 знаков, как `ROUND(..., 4)` в Postgres.
+    """
+    lengths = {n: (sprint_lengths or {}).get(n, 14) for n in range(1, sprint_count + 1)}
+    sprint_factors = {
+        n: (Decimal(days) / Decimal(14)).quantize(Decimal("0.0001"))
+        for n, days in lengths.items()
+    }
+    starts: dict[int, date] = {}
+    cursor = date(2026, 6, 1)
+    for n in range(1, sprint_count + 1):
+        starts[n] = cursor
+        cursor += timedelta(days=lengths[n])
+
     return planner.Inputs(
         pi_id="PI-TEST",
         sprint_count=sprint_count,
         fte_hours_per_sprint=fte,
+        # Фонд квартала — сумма фондов спринтов, а не «sprint_count × 80»:
+        # на календаре 92 дня это 6.5714 вместо 7 (ADR-017).
+        fund_factor=sum(sprint_factors.values(), Decimal("0")),
+        pi_days=sum(lengths.values()),
+        sprint_factors=sprint_factors,
         team_sp_per_sprint={team: Decimal(cap) for team, cap in (team_sp or {T1: 100}).items()},
         tasks=tuple(tasks),
         engineers=tuple(engineers),
+        # По умолчанию — «родная роль, efficiency = 1»: так же, как отдаёт
+        # v_engineer_role_coverage на живых данных (ADR-012).
+        coverage=(
+            coverage
+            if coverage is not None
+            else {(row.engineer_id, row.role_id): Decimal("1") for row in engineers}
+        ),
         deps=tuple(deps),
         sprints={
-            n: (
-                date(2026, 6, 1) + timedelta(days=14 * (n - 1)),
-                date(2026, 6, 14) + timedelta(days=14 * (n - 1)),
-            )
+            n: (starts[n], starts[n] + timedelta(days=lengths[n] - 1))
             for n in range(1, sprint_count + 1)
         },
         all_tasks=tuple(all_tasks),
@@ -143,6 +174,100 @@ def test_engineer_fund_is_the_sum_of_all_orbits() -> None:
     for row in plan.assignments:
         per_sprint[row.sprint_no] += row.hours
     assert all(hours <= Decimal("80") for hours in per_sprint.values())
+
+
+def test_short_sprint_gives_proportionally_less_hours() -> None:
+    """ADR-017: короткий спринт даёт МЕНЬШЕ часов, а не «те же 80».
+
+    8 дней из 14 — множитель 0.5714, ставка 1.0 даёт 45.712 ЧЧ вместо 80.
+    Задача на 45 ЧЧ в такой спринт влезает, на 46 — уже нет; на полном
+    спринте влезают обе. Иначе фонд квартала вылез бы за 92 дня календаря.
+    """
+    short = {7: 8}
+    fits = planner.build_plan(
+        inputs(
+            [task("T-1", roles={1: 45}, earliest=7)],
+            [engineer("ENG-1")],
+            sprint_count=7,
+            sprint_lengths=short,
+        )
+    )
+    over = planner.build_plan(
+        inputs(
+            [task("T-1", roles={1: 46}, earliest=7)],
+            [engineer("ENG-1")],
+            sprint_count=7,
+            sprint_lengths=short,
+        )
+    )
+    full = planner.build_plan(
+        inputs([task("T-1", roles={1: 46}, earliest=7)], [engineer("ENG-1")], sprint_count=7)
+    )
+
+    assert [(a.sprint_no, a.hours) for a in fits.assignments] == [(7, Decimal("45"))]
+    assert over.schedule[0].decision == "deferred_next_pi"
+    assert over.schedule[0].decision_reason == planner.DEFERRED_REASON
+    assert over.assignments == ()
+    assert [(a.sprint_no, a.hours) for a in full.assignments] == [(7, Decimal("46"))]
+
+
+def test_pi_fund_is_proportional_to_calendar_length() -> None:
+    """Фонд квартала = 80 ЧЧ × fund_factor, где fund_factor = дни / 14.
+
+    Календарь Q3-2026: 6 × 14 + 8 = 92 дня → 6.5714 → 525.71 ЧЧ на ставку.
+    525 ЧЧ за квартал помещаются, 526 — уже нет (иначе «седьмой спринт
+    подарил бы 8 дней, которых в квартале нет»).
+    """
+    source = inputs(
+        [task("T-1", roles={1: 525})],
+        [engineer("ENG-1")],
+        sprint_count=7,
+        sprint_lengths={7: 8},
+    )
+
+    assert source.pi_days == 92
+    assert source.fund_factor == Decimal("6.5714")
+
+    plan = planner.build_plan(source)
+    assert sum(a.hours for a in plan.assignments) == Decimal("525")
+    assert plan.schedule[0].end_sprint == 7
+
+    too_much = planner.build_plan(
+        inputs(
+            [task("T-1", roles={1: 526})],
+            [engineer("ENG-1")],
+            sprint_count=7,
+            sprint_lengths={7: 8},
+        )
+    )
+    assert too_much.schedule[0].decision == "deferred_next_pi"
+    assert too_much.assignments == ()
+
+
+def test_calendar_lands_in_params() -> None:
+    """Прогон несёт календарь: без него фонд 525.71 ЧЧ необъясним (ADR-017)."""
+    plan = planner.build_plan(
+        inputs([task("T-1")], [engineer("ENG-1")], sprint_count=7, sprint_lengths={7: 8})
+    )
+
+    calendar = plan.params["calendar"]
+    assert calendar["sprint_count"] == 7
+    assert calendar["pi_days"] == 92
+    assert calendar["fund_factor"] == "6.5714"
+    assert calendar["fund_hh_per_fte"] == "525.71"
+    assert calendar["short_sprints"] == {"7": "0.5714"}
+    assert calendar["pi_start"] == "2026-06-01"
+    assert calendar["pi_end"] == "2026-08-31"
+
+
+def test_full_calendar_has_no_short_sprints_in_params() -> None:
+    """Календарь без коротких спринтов: множитель = числу спринтов, список пуст."""
+    plan = planner.build_plan(inputs([task("T-1")], [engineer("ENG-1")]))
+
+    calendar = plan.params["calendar"]
+    assert calendar["fund_factor"] == "6.0000"
+    assert calendar["fund_hh_per_fte"] == "480.00"
+    assert calendar["short_sprints"] == {}
 
 
 def test_own_orbit_goes_before_loan() -> None:
@@ -368,3 +493,146 @@ def test_plan_is_deterministic() -> None:
     assert first.schedule == second.schedule
     assert first.assignments == second.assignments
     assert first.alerts == second.alerts
+
+
+# ---------------------------------------------------------------------------
+#  Ревью M2 (docs/REVIEW_RESPONSE.md): зависимости, атомарность инициатив,
+#  пересчёт, одна орбита на назначение, efficiency, кандидаты из вьюхи.
+# ---------------------------------------------------------------------------
+def test_dependency_finish_start_waits_for_the_end_of_the_blocker() -> None:
+    """ADR-013: `finish_start` — старт блокируемой после КОНЦА блокирующей.
+
+    A растянута на спринты 1..2 (120 ЧЧ при фонде 80), B зависит от A.
+    При `start_start` B влезает в спринт 2, при `finish_start` — только в 3-й.
+    """
+    tasks = [task("A", roles={1: 120}, topo=1), task("B", roles={1: 40}, topo=2)]
+    source = inputs(tasks, [engineer("ENG-1")], deps=(("A", "B", 1),))
+
+    start_start = planner.build_plan(source)
+    assert (start_start.schedule[0].start_sprint, start_start.schedule[0].end_sprint) == (1, 2)
+    assert starts_of(start_start) == {"A": 1, "B": 2}
+    assert start_start.params["dependency_mode"] == planner.DEPENDENCY_MODE_START_START
+
+    finish_start = planner.build_plan(source, dependency_mode=planner.DEPENDENCY_MODE_FINISH_START)
+    assert starts_of(finish_start) == {"A": 1, "B": 3}
+    assert finish_start.params["dependency_mode"] == planner.DEPENDENCY_MODE_FINISH_START
+
+
+def test_unknown_modes_are_rejected() -> None:
+    source = inputs([task("T-1")], [engineer("ENG-1")])
+    for bad in ("fs", "", "start_finish"):
+        with pytest.raises(ValueError):
+            planner.build_plan(source, dependency_mode=bad)
+        with pytest.raises(ValueError):
+            planner.build_plan(source, initiative_mode=bad)
+
+
+def test_replan_never_plans_into_closed_sprints() -> None:
+    """ADR-014: при `as_of_sprint = 3` спринты 1..2 уже прожиты."""
+    plan = planner.build_plan(inputs([task("T-1", earliest=1)], [engineer("ENG-1")]), as_of_sprint=3)
+
+    assert starts_of(plan) == {"T-1": 3}
+    assert plan.params["replan_floor"] == 3
+    assert all(row.sprint_no >= 3 for row in plan.assignments)
+
+
+def test_atomic_initiatives_defer_the_whole_initiative() -> None:
+    """ADR-013: «всё или ничего» — пробная упаковка с откатом.
+
+    Фонд — 80 ЧЧ за квартал, у P-1 две задачи по 80 ЧЧ, у P-2 одна.
+    Жадный режим закрывает половину P-1 и теряет ресурс; атомарный откатывает
+    P-1 и отдаёт освободившиеся часы P-2 — та закрывается целиком.
+    """
+    tasks = [
+        task("A1", roles={1: 80}, topo=1, prodf="P-1"),
+        task("A2", roles={1: 80}, topo=2, prodf="P-1"),
+        task("B1", roles={1: 80}, topo=3, prodf="P-2"),
+    ]
+    source = inputs(tasks, [engineer("ENG-1")], sprint_count=1)
+
+    greedy = planner.build_plan(source)
+    assert starts_of(greedy) == {"A1": 1, "A2": None, "B1": None}
+    assert greedy.params["initiative_mode"] == planner.INITIATIVE_MODE_GREEDY
+    assert greedy.params["initiatives_complete"] == 0
+    assert greedy.params["initiatives_partial"] == ["P-1"]
+
+    atomic = planner.build_plan(source, initiative_mode=planner.INITIATIVE_MODE_ATOMIC)
+    assert starts_of(atomic) == {"A1": None, "A2": None, "B1": 1}
+    assert atomic.params["initiatives_complete"] == 1
+    assert atomic.params["initiatives_partial"] == []
+    # Пробное назначение A1 откатано: в фонде остались ровно 80 ЧЧ под B1.
+    assert [(a.task_id, a.hours) for a in atomic.assignments] == [("B1", Decimal("80"))]
+
+
+def test_one_assignment_takes_hours_from_a_single_orbit() -> None:
+    """ADR-015: одна строка `plan_assignments` = одна орбита.
+
+    Парттаймер 0.5 + 0.5: бюджет орбиты — 40 ЧЧ. Задача на 80 ЧЧ получит
+    40 со своей орбиты в спринте 1 и 40 в спринте 2 — но не одной строкой.
+    """
+    part_timer = engineer("ENG-1", orbits=(T1, T2))
+    plan = planner.build_plan(inputs([task("T-1", team=T1, roles={1: 80})], [part_timer]))
+
+    assert [(a.sprint_no, a.hours, a.home_team_id) for a in plan.assignments] == [
+        (1, Decimal("40"), T1),
+        (2, Decimal("40"), T1),
+    ]
+    keys = [(a.task_id, a.sprint_no, a.engineer_id, a.role_id) for a in plan.assignments]
+    assert len(keys) == len(set(keys)), "ключ контракта обязан быть уникальным"
+
+
+def test_loan_comes_from_the_other_orbit_of_the_same_engineer() -> None:
+    """Своё ядро выбирается первым, но заём берётся с ЧУЖОЙ орбиты того же человека."""
+    part_timer = engineer("ENG-1", orbits=(T1, T2))
+    tasks = [
+        task("T-1", team=T2, roles={1: 40}, topo=1),
+        task("T-2", team=T2, roles={1: 40}, topo=2),
+    ]
+    plan = planner.build_plan(inputs(tasks, [part_timer], team_sp={T1: 100, T2: 100}))
+
+    assert [(a.task_id, a.sprint_no, a.home_team_id, a.serving_team_id) for a in plan.assignments] == [
+        ("T-1", 1, T2, T2),
+        ("T-2", 1, T1, T2),
+    ]
+
+
+def test_efficiency_multiplies_the_required_hours() -> None:
+    """ADR-016: смету 40 ЧЧ при `efficiency = 1.25` закрывают 50 часов исполнителя."""
+    plan = planner.build_plan(
+        inputs(
+            [task("T-1", roles={1: 40})],
+            [engineer("ENG-1")],
+            coverage={("ENG-1", 1): Decimal("1.25")},
+        )
+    )
+
+    assert [(a.sprint_no, a.hours) for a in plan.assignments] == [(1, Decimal("50.00"))]
+    assert plan.params["efficiency_note"] == planner.EFFICIENCY_NOTE
+
+
+def test_candidates_come_from_the_coverage_view() -> None:
+    """ADR-012: пару «инженер × роль» определяет вьюха, а не `engineers.role_id`."""
+    plan = planner.build_plan(
+        inputs(
+            [task("T-1", roles={1: 40})],
+            [engineer("ENG-1", role_id=7)],
+            coverage={("ENG-1", 1): Decimal("1")},
+        )
+    )
+
+    assert starts_of(plan) == {"T-1": 1}
+    assert plan.assignments[0].role_id == 1
+    assert plan.assignments[0].engineer_id == "ENG-1"
+
+
+def test_objective_and_modes_are_recorded_in_params() -> None:
+    """ADR-015: у прогона всегда есть объяснение, по каким правилам он построен."""
+    plan = planner.build_plan(inputs([task("T-1")], [engineer("ENG-1")]))
+
+    assert plan.params["objective"] == planner.OBJECTIVE
+    assert plan.params["initiative_mode"] == planner.INITIATIVE_MODE_GREEDY
+    assert plan.params["dependency_mode"] == planner.DEPENDENCY_MODE_START_START
+    assert plan.params["replan_floor"] == 1
+    assert plan.params["initiatives_planned"] == 1
+    assert plan.params["initiatives_complete"] == 1
+    assert plan.params["initiatives_partial"] == []

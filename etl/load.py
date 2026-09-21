@@ -465,7 +465,11 @@ def parse(path: Path):
         if len(set(rungs)) > 1:
             dq.add("initiatives", prodf, "RUNG_NOT_UNIFORM", "warning",
                    f"rung внутри инициативы неоднороден: {sorted(set(rungs))}. Свёрнут через '{agg}' -> {pr}.")
-        title = max(set(v["titles"]), key=v["titles"].count) if v["titles"] else None
+        # max() по set() НЕдетерминирован: порядок строк в set зависит от
+        # PYTHONHASHSEED, поэтому при равных частотах заголовок «прыгал» от
+        # прогона к прогону и build/seed.sql не воспроизводился. Тай-брейк —
+        # лексикографически старший заголовок: одинаково на любой машине.
+        title = max(sorted(set(v["titles"])), key=v["titles"].count) if v["titles"] else None
         ini_rows.append((prodf, v["br"], title, pr))
 
     D.update(tasks=tasks, initiatives=ini_rows, estimates=estimates, spent=spent,
@@ -480,12 +484,36 @@ def parse(path: Path):
 #  календарь и граф                                                     #
 # ===================================================================== #
 def build_sprints():
+    """Сетка спринтов внутри ТОЧНЫХ границ PI (ADR-007 + ADR-017).
+
+    Спринты идут по 14 дней от `PI_START`; последний обрезается по `PI_END`
+    и потому может быть короче. Длина спринта — не косметика: фонд часов
+    масштабируется ею (`v_pi_fund_factor`), и на живых данных 7-й спринт
+    короче всех (23.09..30.09.2026 = 8 дней, множитель 0.5714).
+
+    Guard: сетка обязана закрыть квартал ровно — без дыр и нахлёстов.
+    Ошибка в `PI_START`/`PI_END`/`SPRINT_COUNT` не должна доехать до
+    витрин, иначе фонд и календарь разъедутся молча.
+    """
     rows = []
     for n in range(1, C.SPRINT_COUNT + 1):
         s = C.PI_START + timedelta(days=(n - 1) * C.SPRINT_LENGTH_DAYS)
-        rows.append((C.PI_ID, n, s, s + timedelta(days=C.SPRINT_LENGTH_DAYS - 1)))
-    pi_end = C.PI_START + timedelta(days=C.SPRINT_COUNT * C.SPRINT_LENGTH_DAYS - 1)
-    return (C.PI_ID, C.PI_START, pi_end, C.SPRINT_COUNT, C.SPRINT_LENGTH_DAYS,
+        if s > C.PI_END:
+            raise ValueError(
+                f"календарь PI: спринт {n} начинается {s}, а квартал кончается "
+                f"{C.PI_END} — SPRINT_COUNT={C.SPRINT_COUNT} не влезает в границы"
+            )
+        e = min(s + timedelta(days=C.SPRINT_LENGTH_DAYS - 1), C.PI_END)
+        rows.append((C.PI_ID, n, s, e))
+
+    covered = sum((e - s).days + 1 for _pi, _n, s, e in rows)
+    expected = (C.PI_END - C.PI_START).days + 1
+    if covered != expected:
+        raise ValueError(
+            f"календарь PI: спринты покрывают {covered} дней из {expected} "
+            f"({C.PI_START}..{C.PI_END}) — есть дыра или нахлёст"
+        )
+    return (C.PI_ID, C.PI_START, C.PI_END, C.SPRINT_COUNT, C.SPRINT_LENGTH_DAYS,
             C.HOURS_PER_SPRINT_FTE), rows
 
 

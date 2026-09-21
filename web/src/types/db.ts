@@ -83,7 +83,7 @@ export interface load_batches {
   row_counts: Json;
 }
 
-/** таблица public.pi_periods — 6 кол. */
+/** таблица public.pi_periods — 6 кол. · Границы PI (ADR-007). С 1.1.0 — КАЛЕНДАРНЫЙ квартал: 01.07..30.09.2026 (92 дня). Фонд ставки за весь PI = fte_hours_per_sprint × v_pi_fund_factor.factor = 525.71 ЧЧ. */
 export interface pi_periods {
   pi_id: string;
   start_date: string;
@@ -188,12 +188,13 @@ export interface skills {
   normalized_name: string;
 }
 
-/** таблица public.sprints — 4 кол. · Генерится ETL из PI_START (ADR-007). Датасет границы квартала явно не задаёт. */
+/** таблица public.sprints — 5 кол. · Генерится ETL из PI_START по PI_END (ADR-007, ADR-017). Датасет границы квартала явно не задаёт. Последний спринт обрезается по PI_END и потому короче: 23.09..30.09.2026 = 8 дней. */
 export interface sprints {
   pi_id: string;
   sprint_no: number;
   start_date: string;
   end_date: string;
+  length_days: number | null;
 }
 
 /** таблица public.task_dependencies — 4 кол. · Канонизировано как «A блокирует B» по заголовкам колонок листа. Все 3 типа (has to be done before / is required for / depends on) семантически одинаковы — проверено по смыслу задач, A везде предшествует B (ADR-003). */
@@ -329,6 +330,14 @@ export interface v_orbit_map {
   risk: string | null;
 }
 
+/** вьюха public.v_pi_fund_factor — 4 кол. · Фонд ставки за весь PI, выраженный в «полных спринтах»: 1.0000 ставки × 80 ЧЧ × factor. На Q3-2026: 92 дня / 14 = 6.5714, то есть 525.71 ЧЧ за квартал (при 6 спринтах × 14 было 480). Используется вместо `sprint_count` везде, где считается фонд за квартал. */
+export interface v_pi_fund_factor {
+  pi_id: string | null;
+  sprint_length_days: number | null;
+  days_total: number | null;
+  factor: number | null;
+}
+
 /** вьюха public.v_plan_assignment_detail — 12 кол. · is_substitution — инженер работает не по своей роли. Обязательно показывать в UI: «всё спланировалось» без ответа «кем» на защите не проходит. */
 export interface v_plan_assignment_detail {
   run_id: number | null;
@@ -345,7 +354,7 @@ export interface v_plan_assignment_detail {
   grade: string | null;
 }
 
-/** вьюха public.v_plan_violations — 5 кол. · Приёмка плана. Пустой результат = план корректен. severity=warning не блокирует, но требует отображения в UI. Правила — docs/PLANNER_SPEC.md. */
+/** вьюха public.v_plan_violations — 5 кол. · Приёмка плана: нет строк с severity = error. Строки severity = warning план не отменяют, но требуют отображения в UI. Правила — docs/PLANNER_SPEC.md, раздел 7; разбор ревью M2 — docs/REVIEW_RESPONSE.md. */
 export interface v_plan_violations {
   run_id: number | null;
   check_code: string | null;
@@ -385,7 +394,7 @@ export interface v_role_deficit_effective {
   verdict: string | null;
 }
 
-/** вьюха public.v_role_supply_hh — 7 кол. */
+/** вьюха public.v_role_supply_hh — 7 кол. · hh_per_sprint — фонд одного ПОЛНОГО спринта. hh_per_pi — фонд всего квартала: × v_pi_fund_factor.factor (92/14 = 6.5714), а НЕ × sprint_count, иначе короткий 7-й спринт подарил бы команде лишние 8 дней фонда. */
 export interface v_role_supply_hh {
   role_id: number | null;
   role_name: string | null;
@@ -396,7 +405,7 @@ export interface v_role_supply_hh {
   hh_per_pi: number | null;
 }
 
-/** вьюха public.v_satellite_capacity — 11 кол. */
+/** вьюха public.v_satellite_capacity — 12 кол. · hours_own — фонд спутника на орбите в КОНКРЕТНОМ спринте: rate × 80 × factor спринта. В коротком 7-м спринте это 0.5714 от обычного. */
 export interface v_satellite_capacity {
   engineer_id: string | null;
   team_id: string | null;
@@ -408,7 +417,18 @@ export interface v_satellite_capacity {
   end_date: string | null;
   capacity_rate: number | null;
   is_shared_orbit: boolean | null;
+  length_days: number | null;
   hours_own: number | null;
+}
+
+/** вьюха public.v_sprint_fund_factor — 6 кол. · Фонд спринта = rate × fte_hours_per_sprint × factor. Короткий спринт даёт МЕНЬШЕ часов, а не «те же 80»: иначе фонд квартала вылез бы за 92 дня календаря. Проверки ENGINEER_OVERLOAD и ORBIT_OVERLOAD берут фонд именно отсюда. */
+export interface v_sprint_fund_factor {
+  pi_id: string | null;
+  sprint_no: number | null;
+  start_date: string | null;
+  end_date: string | null;
+  length_days: number | null;
+  factor: number | null;
 }
 
 /** вьюха public.v_task_board — 24 кол. */
@@ -448,7 +468,7 @@ export interface v_task_remaining_hh {
   remaining_hours: number | null;
 }
 
-/** вьюха public.v_team_capacity_sp — 6 кол. · history_points = 2 на команду: среднее шаткое, на защите оговорить. */
+/** вьюха public.v_team_capacity_sp — 6 кол. · history_points = 2 на команду: среднее шаткое, на защите оговорить. available_sp_per_sprint — фонд ОДНОГО ПОЛНОГО спринта; для короткого умножать на v_sprint_fund_factor.factor (так делает проверка SP_OVERFLOW). */
 export interface v_team_capacity_sp {
   team_id: string | null;
   history_points: number | null;
@@ -494,6 +514,7 @@ export type RelationName =
   | 'v_dq_summary'
   | 'v_engineer_role_coverage'
   | 'v_orbit_map'
+  | 'v_pi_fund_factor'
   | 'v_plan_assignment_detail'
   | 'v_plan_violations'
   | 'v_role_coverage_org'
@@ -501,6 +522,7 @@ export type RelationName =
   | 'v_role_deficit_effective'
   | 'v_role_supply_hh'
   | 'v_satellite_capacity'
+  | 'v_sprint_fund_factor'
   | 'v_task_board'
   | 'v_task_remaining_hh'
   | 'v_team_capacity_sp'
