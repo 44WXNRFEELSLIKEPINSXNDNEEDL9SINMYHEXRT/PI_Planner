@@ -1,6 +1,6 @@
 # Схема БД: что читать бэкенду
 
-**29 таблиц + 15 вьюх**, схема `public`. Бэкенду нужны не все — ниже только то,
+**29 таблиц + 17 вьюх**, схема `public`. Бэкенду нужны не все — ниже только то,
 что стоит отдавать наружу.
 
 Правило разделения: **DS-слой пишет, бэкенд читает.** Единственное исключение —
@@ -17,10 +17,33 @@
 | `v_team_capacity_sp` | 6 | Ёмкость команды в SP: velocity, focus factor, доступно на спринт и на квартал. |
 | `v_role_deficit` | — | **Главная аналитическая витрина.** Дефицит по связке «команда × роль» с вердиктом. |
 | `v_bus_factor` | 21 | Незаменимость по ролям, включая роли, которых нет в штате вообще. |
-| `sprints` | 6 | Сетка квартала: номер спринта, даты начала и конца. |
+| `sprints` | 7 | Сетка квартала: номер спринта, даты, **`length_days`** (генерируемая колонка; у 7-го спринта 8 дней). |
 | `initiatives` | 15 | Инициативы PRODF со скорингом. |
 | `ref_result_options` | 8 | Справочник «Варианты выбора цели» — выпадашки в UI планирования. |
 | `v_dq_summary` | — | Сводка по качеству исходных данных. Годится отдельным экраном «Диагностика». |
+
+### Календарь и фонд часов (ADR-007, ADR-017)
+
+Квартал — **календарный**: `PI-2026-Q3` = 01.07.2026–30.09.2026, 92 дня,
+**7 спринтов**, последний (7-й) короткий — 23.09–30.09, 8 дней. Фонд часов
+пропорционален длине спринта, поэтому множитель нельзя «посчитать по числу
+спринтов»: 80 ЧЧ × 7 = 560 приписали бы кварталу 4.29 ЧЧ, которых в нём нет.
+
+| Вьюха | Что даёт | На Q3-2026 |
+|---|---|---|
+| `v_sprint_fund_factor` | множитель фонда спринта: `length_days / sprint_length_days` | спринты 1–6 — **1.0000**, 7-й — **0.5714** |
+| `v_pi_fund_factor` | множитель фонда всего PI: `Σ length_days / sprint_length_days`, `days_total` | **6.5714**, 92 дня → **525.71 ЧЧ** на ставку |
+| `sprints.length_days` | длина спринта в днях (генерируемая колонка, ETL её не пишет) | 14 … 14, последний 8 |
+
+Фонд **одного полного** спринта лежит в `v_team_capacity_sp.available_sp_per_sprint`
+и в `v_satellite_capacity.hours_own` (он уже умножен на множитель своего спринта);
+для короткого спринта ёмкость в SP умножайте на `v_sprint_fund_factor.factor` —
+так делает проверка `SP_OVERFLOW`. Фонд **всего квартала** — `available_sp_per_pi`
+и `v_role_supply_hh.hh_per_pi`, они уже посчитаны через `v_pi_fund_factor`.
+
+> Бэкенду арифметику «92 / 14» повторять не надо и **нельзя**: единственный
+> источник правды — эти две вьюхи, иначе ваш фонд разъедется с инвариантами и
+> приёмкой. Готовые границы прогона (`params.calendar`) — в `plan_runs`.
 
 ### Взаимозаменяемость ролей (ADR-009)
 
@@ -86,7 +109,9 @@ SELECT * FROM v_plan_violations WHERE run_id = :run_id AND severity = 'error';
 `load_batches`, `dq_issues`, `role_aliases`, `task_sequence`,
 `task_role_estimates`, `task_role_spent`, `skills`, `engineer_skills`,
 `team_history`, `pi_periods`. Лежат в той же БД, читать можно, но наружу
-отдавать нечего.
+отдавать нечего: границы PI и длины спринтов бэкенд получает через `sprints`,
+`v_pi_fund_factor` и `v_sprint_fund_factor`, а ещё они продублированы в
+`plan_runs.params.calendar`.
 
 ---
 
@@ -110,6 +135,16 @@ FROM plan_task_schedule s
 JOIN v_task_board b USING (task_id)
 WHERE s.run_id = $1 AND s.decision = 'in_quarter'
 ORDER BY s.start_sprint, b.priority_rung DESC;
+```
+
+**Календарь квартала и множители фонда (для шапки ганта):**
+```sql
+SELECT s.sprint_no, s.start_date, s.end_date, s.length_days, f.factor
+FROM sprints s
+JOIN v_sprint_fund_factor f USING (pi_id, sprint_no)
+JOIN (SELECT pi_id FROM pi_periods ORDER BY start_date DESC LIMIT 1) p USING (pi_id)
+ORDER BY s.sprint_no;
+-- 1..6: 14 дней / 1.0000, 7: 23.09..30.09, 8 дней / 0.5714
 ```
 
 **Что перенесли и почему:**
