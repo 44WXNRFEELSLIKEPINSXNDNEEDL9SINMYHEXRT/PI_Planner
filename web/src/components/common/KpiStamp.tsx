@@ -63,6 +63,8 @@ export function KpiStamp({
 }: Props) {
   const shown = actual ?? forecast ?? 0
   const tone = toneOf(shown, targetMin, targetMax)
+  // У прогноза и факта свой тон: прогноз в норме и факт ниже нормы — разные сигналы.
+  const forecastTone = forecast !== null ? toneOf(forecast, targetMin, targetMax) : tone
   const forecastRing = forecast !== null ? ringOffset(R_OUTER, forecast / domainMax) : null
   const actualRing = actual !== null ? ringOffset(R_INNER, actual / domainMax) : null
 
@@ -95,7 +97,7 @@ export function KpiStamp({
             cy={CENTER}
             r={R_OUTER}
             fill="none"
-            stroke={toneColor(tone)}
+            stroke={toneColor(forecastTone)}
             strokeWidth={3}
             strokeLinecap="round"
             strokeDasharray={forecastRing.circumference}

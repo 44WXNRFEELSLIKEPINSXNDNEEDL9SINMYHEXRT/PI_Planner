@@ -1,4 +1,4 @@
-# HANDOFF — фронтенд PI-Planner: осталось четыре экрана
+# HANDOFF — фронтенд PI-Planner: осталось два экрана
 
 Ветка `fix/tz-compliance`. Состояние **рабочее**: `npx tsc --noEmit` и
 `npm run build` проходят с нулём ошибок, приложение запускается и три экрана
@@ -19,6 +19,14 @@
 | Загрузка | `src/screens/upload/*` — `DatasetDropzone`, `ActualsDropzone`, `UploadHistory`, `UploadScreen` |
 | План квартала | `src/screens/plan/*` — `PlanScreen`, `GanttGrid`, `TaskDetailDrawer`, `usePlanData` |
 | Риски | `src/screens/risks/*` — `RisksScreen`, `RiskSpine`, `AlertCard`, `PlanChanges`, `SprintDeviation`, `ViolationsPanel`, `labels.ts` |
+| Звёздная карта | `src/screens/starmap/*` — `layout.ts` (детерминированная раскладка: порядок команд перебором, чтобы все 4 пары парттаймеров были соседями), `StarMapSvg`, `EngineerDrawer` (тёмная), `SkillBusFactor`, `HiringGap`, `risk.ts`, `darkStyles.ts` |
+| KPI | `src/screens/kpi/KpiScreen.tsx` — штемпель процента квартала, шесть штемпелей say/do в спринтовой сетке, плашка-число Bus Factor |
+
+Звёздная карта и KPI проверены в браузере: `problems=0` на 1440 и 390 px,
+вложенность чистая, панель инженера открывается и тёмная. `KpiStamp` теперь
+красит кольцо прогноза и дугу факта каждое своим тоном (раньше оба — по факту).
+
+**Осталось: «Роли и ёмкость» и «Профили» — их делает другой человек (§4.2–4.3).**
 
 Инфраструктура:
 
