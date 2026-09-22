@@ -40,6 +40,12 @@ export const theme = createTheme({
         root: { boxShadow: 'none' },
       },
     },
+    // Дефолтный капс Mantine запрещён (UI_DESIGN §6).
+    Badge: {
+      styles: {
+        label: { textTransform: 'none' },
+      },
+    },
     Table: {
       styles: {
         table: { fontVariantNumeric: 'tabular-nums' },
