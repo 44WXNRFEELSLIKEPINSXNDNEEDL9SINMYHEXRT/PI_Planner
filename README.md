@@ -34,6 +34,10 @@ cp .env.example .env              # задать пароли в .env
 docker compose up -d --build prometheus grafana
 ```
 
+При первом запуске Compose одноразовый сервис `bootstrap-plan` строит базовый
+план по датасету из `build/seed.sql`; `app` стартует только после него. Если в
+`plan_runs` уже есть успешный базовый прогон, шаг ничего не меняет.
+
 Grafana откроется через Caddy на `https://grafana.localhost`. Prometheus не
 публикует host-порт, а datasource создаётся автоматически. Настройка, проверки
 и контракт метрик описаны в `docs/OBSERVABILITY.md`.

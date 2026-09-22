@@ -48,6 +48,14 @@ def main(argv: list[str] | None = None) -> int:
         help="посчитать план и показать сводку, но в базу не писать",
     )
     parser.add_argument(
+        "--if-empty",
+        action="store_true",
+        help=(
+            "ничего не делать, если уже есть успешный базовый прогон; "
+            "используется при первом запуске контейнерного стека"
+        ),
+    )
+    parser.add_argument(
         "--dependency-mode",
         choices=planner.DEPENDENCY_MODES,
         default=planner.DEPENDENCY_MODE_START_START,
@@ -69,6 +77,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     print(f"dsn: {db.dsn()}")
+    if args.if_empty:
+        baselines = int(
+            db.scalar(
+                "SELECT COUNT(*) FROM plan_runs WHERE as_of_sprint = 0 AND status = 'ok'"
+            )
+            or 0
+        )
+        if baselines > 0:
+            print(f"пропуск: успешный базовый прогон уже существует ({baselines})")
+            return 0
+
     total_started = time.perf_counter()
     phase_started = time.perf_counter()
     inputs = planner.load_inputs()

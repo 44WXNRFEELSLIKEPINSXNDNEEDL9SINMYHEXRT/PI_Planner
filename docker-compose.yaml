@@ -63,10 +63,41 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      bootstrap-plan:
+        condition: service_completed_successfully
     networks:
       - backend
       - frontend
       - monitoring
+
+  # seed.sql содержит исходный датасет, но не результат планировщика. Без этого
+  # одноразового шага свежий контейнер показывает задачи и пустой экран KPI.
+  bootstrap-plan:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "tools/run_planner.py", "--if-empty"]
+    restart: "no"
+    init: true
+    cpus: ${APP_CPU_LIMIT:-0.5}
+    mem_limit: ${APP_MEMORY_LIMIT:-256m}
+    pids_limit: ${APP_PIDS_LIMIT:-100}
+    environment:
+      PI_PLANNER_DSN: >-
+        host=db port=5432 dbname=${POSTGRES_DB:-pi_planner}
+        user=${POSTGRES_USER:-postgres} password=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - backend
 
   # Запускается перед каждым релизом: docker compose run --rm migrate.
   # Не добавлен в обычный `up`, чтобы локальный demo-старт не требовал
