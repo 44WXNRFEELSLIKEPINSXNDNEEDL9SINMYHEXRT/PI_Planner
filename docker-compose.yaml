@@ -102,6 +102,9 @@ services:
 
   backup:
     image: postgres:17-bookworm
+    # Bind-mount должен быть доступен тому же uid/gid, что владеет BACKUP_DIR
+    # на хосте. Иначе root без capabilities не может писать даже в 0755.
+    user: "${BACKUP_UID:-1000}:${BACKUP_GID:-1000}"
     restart: unless-stopped
     init: true
     stop_grace_period: 30s
