@@ -26,6 +26,17 @@ psql "$DSN" -v ON_ERROR_STOP=1 -f db/05_invariants.sql
 python3 etl/load.py --dsn "$DSN"
 ```
 
+Локальный стек с PostgreSQL, приложением, Prometheus и Grafana:
+
+```bash
+cp .env.example .env              # задать пароли в .env
+docker compose up -d --build prometheus grafana
+```
+
+Grafana откроется через Caddy на `https://grafana.localhost`. Prometheus не
+публикует host-порт, а datasource создаётся автоматически. Настройка, проверки
+и контракт метрик описаны в `docs/OBSERVABILITY.md`.
+
 Перезалив идемпотентен: `seed.sql` начинается с `TRUNCATE … RESTART IDENTITY`,
 гонять можно сколько угодно. Когда организаторы пришлют версию датасета —
 просто положить новый файл и перезапустить ETL.
@@ -45,6 +56,7 @@ app/planner.py       планировщик: чтение витрин → чи�
 app/server.py        HTTP: статика + /api/health, /api/livez, /api/version, /api/views, /metrics
 app/views.py         белый список витрин для фронта: /api/views/{view} (ADR-019)
 app/metrics.py       контракт метрик для devops: формат Prometheus 0.0.4 своими руками
+docs/OBSERVABILITY.md полный контракт observability: метрики, labels, PromQL, алерты и dashboard
 tools/run_planner.py прогон планировщика: uv run python tools/run_planner.py --as-of-sprint 0
 tools/acceptance.sql приёмка M0: календарь, фонд, витрины, счётчики
 tools/negative_test.sql негативный тест инвариантов: битый прогон + ROLLBACK
@@ -148,11 +160,11 @@ SELECT * FROM v_plan_violations WHERE run_id = :run_id AND severity = 'error';
 | `/api/health` | читает | readiness: 503, если база недоступна |
 | `/api/version` | не трогает | версии приложения, ETL и PI |
 | `/api/views`, `/api/views/{view}` | читает | витрины для фронта: `?run_id=&limit=&offset=&order=` |
-| `/metrics` | читает, с кэшем 15 с | Prometheus: 17 метрик `pi_planner_*` |
+| `/metrics` | читает, с кэшем 15 с | Prometheus: process, HTTP, DB и бизнес-метрики `pi_planner_*` |
 
 **Данные для фронта** отдаются одним маршрутом поверх белого списка из 25 витрин
 (`app/views.py`, ADR-019): имя витрины — параметр пути, а не отдельный эндпоинт,
-поэтому список экранов и список метрик не растут вместе. Ответ — «строка витрины
+поэтому набор HTTP route labels не растёт вместе с экранами. Ответ — «строка витрины
 как есть» плюс конверт (`as_of`, `run_id`, `count`, `columns`, `items`). Имя
 витрины не подставляется в SQL, `ORDER BY` собирается только из колонок витрины,
 чтение идёт в read-only сессии. Что показывать на шести экранах и чего фронт не
@@ -164,14 +176,14 @@ SELECT * FROM v_plan_violations WHERE run_id = :run_id AND severity = 'error';
 `pi_planner_calendar_info{fund_factor="6.5714"}` — календарь виден на дашборде, а
 не только в логах. `/metrics` отвечает 200 и при мёртвой базе: вместо бизнес-серий
 приходят `pi_planner_db_up 0` и `pi_planner_db_metrics_error{error_class}`.
-Все витрины дают в метриках **одну** серию `route="/api/views/{view}"` — не по
-серии на витрину.
+Все витрины дают одну HTTP-серию `route="/api/views/{view}"`. Отдельные
+`pi_planner_view_*` используют имя только из закрытого whitelist, чтобы видеть
+медленные витрины без пользовательской кардинальности.
 
 Имена метрик заморожены для devops (ADR-018). Полный список с лейблами,
-scrape-конфиг, разумные алерты и Caddy-правило (`respond 404`, чтобы метрики не
-уехали в публичный интернет) — `docs/RUNBOOK.md`, раздел «Контракт для
-мониторинга». Логи: текст для демо или `--log-format json` — одна строка, один
-объект.
+scrape-конфиг, алерты и Caddy-правило (`respond 404`, чтобы метрики не уехали в
+публичный интернет) — `docs/OBSERVABILITY.md`. Логи: текст для демо или
+`--log-format json` — одна строка, один объект.
 
 ## Проверка после заливки
 

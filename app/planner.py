@@ -63,6 +63,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date
@@ -1357,7 +1358,9 @@ def write_plan(plan: Plan) -> int:
 
     `is_loan` не пишем никогда — это генерируемая колонка (см. RUNBOOK, раздел 6).
     """
-    with db.transaction() as cur:
+    started = time.perf_counter()
+    plan.params.setdefault("observability", {})
+    with db.transaction(operation="planner_write") as cur:
         cur.execute(
             """
             INSERT INTO plan_runs (pi_id, as_of_sprint, algorithm, params, status, note)
@@ -1493,5 +1496,20 @@ def write_plan(plan: Plan) -> int:
                 )
                 for row in plan.kpis
             ],
+        )
+        write_seconds = round(time.perf_counter() - started, 6)
+        plan.params.setdefault("observability", {})["write_plan_seconds"] = write_seconds
+        cur.execute(
+            """
+            UPDATE plan_runs
+            SET params = jsonb_set(
+                params,
+                '{observability,write_plan_seconds}',
+                to_jsonb(%s::numeric),
+                true
+            )
+            WHERE run_id = %s
+            """,
+            (write_seconds, run_id),
         )
     return run_id

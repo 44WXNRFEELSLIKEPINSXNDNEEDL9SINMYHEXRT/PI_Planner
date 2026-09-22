@@ -29,6 +29,10 @@ SNAPSHOT = {
         "warnings": 12,
         "in_quarter": 7,
         "assigned_hh": Decimal("522.01"),
+        "loan_hh": Decimal("40.00"),
+        "load_seconds": Decimal("0.12"),
+        "build_seconds": Decimal("0.34"),
+        "write_seconds": Decimal("0.05"),
     },
     "calendar": {
         "pi_id": "PI-2026-Q3",
@@ -38,6 +42,27 @@ SNAPSHOT = {
         "fund_factor": Decimal("6.5714"),
         "fund_hh_per_fte": Decimal("525.71"),
     },
+    "decisions": [
+        {"decision": "in_quarter", "reason": "none", "tasks": 7, "hours": Decimal("522")},
+        {"decision": "deferred_next_pi", "reason": "M2", "tasks": 4, "hours": Decimal("132")},
+    ],
+    "alerts": [{"level": "orange", "alert_type": "role_deficit", "count": 4}],
+    "kpis": [
+        {
+            "sprint_no": 3,
+            "kpi_code": "say_do_ratio",
+            "value": Decimal("92.5"),
+            "target_min": Decimal("90"),
+            "target_max": Decimal("105"),
+        }
+    ],
+    "dq": [{"severity": "warning", "count": 35}],
+    "etl": {
+        "loaded_epoch": Decimal("1789996000"),
+        "etl_version": "1.1.0",
+        "pi_start": date(2026, 7, 1),
+    },
+    "migrations": {"applied": 2, "pending": 0, "last_applied_epoch": 1_789_996_100},
 }
 
 
@@ -88,6 +113,15 @@ def test_render_reports_the_last_run_and_the_calendar() -> None:
     assert parsed['pi_planner_plan_violations{run_id="2",severity="warning"}'] == 12.0
     assert parsed['pi_planner_plan_tasks_in_quarter{run_id="2"}'] == 7.0
     assert parsed['pi_planner_plan_assigned_hours{run_id="2"}'] == 522.01
+    assert parsed["pi_planner_plan_last_run_id"] == 2.0
+    assert parsed["pi_planner_plan_loan_hours"] == 40.0
+    assert parsed['pi_planner_plan_tasks{decision="deferred_next_pi",reason="M2"}'] == 4.0
+    assert parsed['pi_planner_plan_alerts{level="orange",type="role_deficit"}'] == 4.0
+    assert parsed['pi_planner_plan_kpi_value{kpi="say_do_ratio",sprint="3"}'] == 92.5
+    assert parsed['pi_planner_data_quality_issues{severity="warning"}'] == 35.0
+    assert parsed['pi_planner_job_last_duration_seconds{phase="build_plan"}'] == 0.34
+    assert parsed["pi_planner_migrations_applied"] == 2.0
+    assert parsed["pi_planner_migrations_pending"] == 0.0
     assert (
         'pi_planner_calendar_info{pi_id="PI-2026-Q3",pi_start="2026-07-01",'
         'pi_end="2026-09-30",sprint_count="7",fund_factor="6.5714"} 525.71' in registry().render()
@@ -148,6 +182,26 @@ def test_counters_are_labelled_by_route_and_status() -> None:
     assert (
         parsed['pi_planner_http_request_duration_seconds_sum{method="GET",route="/api/livez"}'] == 0.04
     )
+    assert (
+        parsed[
+            'pi_planner_http_request_duration_seconds_bucket{method="GET",route="/api/livez",le="0.05"}'
+        ]
+        == 2.0
+    )
+
+
+def test_response_bytes_exceptions_and_view_metrics_are_bounded() -> None:
+    reg = registry()
+    reg.observe("GET", "/api/*", 0, 0.02, response_bytes=17, error_class="RuntimeError")
+    reg.observe_view("v_task_board", "success", 0.03, rows=5, truncated=True)
+
+    parsed = parse(reg.render())
+
+    assert parsed['pi_planner_http_response_bytes_total{method="GET",route="/api/*"}'] == 17.0
+    assert parsed['pi_planner_http_exceptions_total{route="/api/*",error_class="RuntimeError"}'] == 1.0
+    assert parsed['pi_planner_view_requests_total{view="v_task_board",outcome="success"}'] == 1.0
+    assert parsed['pi_planner_view_rows_returned_total{view="v_task_board"}'] == 5.0
+    assert parsed['pi_planner_view_truncated_total{view="v_task_board"}'] == 1.0
 
 
 def test_snapshot_is_cached_for_the_ttl() -> None:

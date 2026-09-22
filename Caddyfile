@@ -25,10 +25,38 @@
 		max_size 10MB
 	}
 
+	# Prometheus будет ходить прямо в app:8000 по внутренней Docker-сети.
+	# Структуру БД и внутренние бизнес-метрики наружу не публикуем.
+	@metrics path /metrics
+	respond @metrics 404
+
 	reverse_proxy app:8000 {
 		transport http {
 			dial_timeout 3s
 			response_header_timeout 20s
+		}
+	}
+}
+
+{$GRAFANA_DOMAIN} {
+	encode zstd gzip
+
+	log {
+		output stdout
+		format json
+	}
+
+	header {
+		-Server
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+	}
+
+	reverse_proxy grafana:3000 {
+		transport http {
+			dial_timeout 3s
+			response_header_timeout 30s
 		}
 	}
 }

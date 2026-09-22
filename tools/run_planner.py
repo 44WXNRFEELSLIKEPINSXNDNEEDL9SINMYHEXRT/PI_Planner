@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -68,7 +69,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     print(f"dsn: {db.dsn()}")
+    total_started = time.perf_counter()
+    phase_started = time.perf_counter()
     inputs = planner.load_inputs()
+    load_inputs_seconds = time.perf_counter() - phase_started
     pi_start = min(pair[0] for pair in inputs.sprints.values())
     pi_end = max(pair[1] for pair in inputs.sprints.values())
     print(
@@ -88,7 +92,10 @@ def main(argv: list[str] | None = None) -> int:
         f"(авторитетен столбец матрицы сметы, ADR-002)"
     )
 
+    phase_started = time.perf_counter()
     baseline_starts = planner.load_baseline_starts() if args.as_of_sprint > 0 else {}
+    load_baseline_seconds = time.perf_counter() - phase_started
+    phase_started = time.perf_counter()
     plan = planner.build_plan(
         inputs,
         as_of_sprint=args.as_of_sprint,
@@ -96,6 +103,13 @@ def main(argv: list[str] | None = None) -> int:
         dependency_mode=args.dependency_mode,
         initiative_mode=args.initiative_mode,
     )
+    build_plan_seconds = time.perf_counter() - phase_started
+    plan.params["observability"] = {
+        "load_inputs_seconds": round(load_inputs_seconds, 6),
+        "load_baseline_seconds": round(load_baseline_seconds, 6),
+        "build_plan_seconds": round(build_plan_seconds, 6),
+        "before_write_seconds": round(time.perf_counter() - total_started, 6),
+    }
 
     print(f"статус: {plan.status}")
     print(f"итог: {plan.note}")

@@ -13,6 +13,9 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
+from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -25,6 +28,99 @@ DSN_FILE = ROOT / "dsn.json"
 
 DEFAULT_DSN = "host=127.0.0.1 port=5432 dbname=pi_planner user=postgres password=postgres"
 DEFAULT_STATEMENT_TIMEOUT_MS = 15_000
+DB_DURATION_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 15.0)
+
+
+class _DbTelemetry:
+    """Ограниченная по кардинальности телеметрия DB-клиента.
+
+    `operation` задаёт вызывающий код или имя обёртки. SQL и параметры сюда
+    никогда не попадают: они содержат данные и создают неограниченные серии.
+    """
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.connections = 0
+        self.operations = 0
+        self.connection_total: dict[str, int] = defaultdict(int)
+        self.connection_sum = 0.0
+        self.connection_count = 0
+        self.connection_buckets: dict[float, int] = defaultdict(int)
+        self.operation_total: dict[tuple[str, str], int] = defaultdict(int)
+        self.operation_sum: dict[str, float] = defaultdict(float)
+        self.operation_count: dict[str, int] = defaultdict(int)
+        self.operation_buckets: dict[tuple[str, float], int] = defaultdict(int)
+        self.rows_total: dict[str, int] = defaultdict(int)
+
+    def connect(self, outcome: str, seconds: float) -> None:
+        with self.lock:
+            self.connection_total[outcome] += 1
+            self.connection_sum += seconds
+            self.connection_count += 1
+            for bound in DB_DURATION_BUCKETS:
+                if seconds <= bound:
+                    self.connection_buckets[bound] += 1
+
+    def operation_enter(self) -> None:
+        with self.lock:
+            self.operations += 1
+
+    def operation_leave(self, operation: str, outcome: str, seconds: float, rows: int = 0) -> None:
+        with self.lock:
+            self.operations -= 1
+            self.operation_total[(operation, outcome)] += 1
+            self.operation_sum[operation] += seconds
+            self.operation_count[operation] += 1
+            self.rows_total[operation] += max(0, rows)
+            for bound in DB_DURATION_BUCKETS:
+                if seconds <= bound:
+                    self.operation_buckets[(operation, bound)] += 1
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "connections": self.connections,
+                "operations": self.operations,
+                "connection_total": dict(self.connection_total),
+                "connection_sum": self.connection_sum,
+                "connection_count": self.connection_count,
+                "connection_buckets": dict(self.connection_buckets),
+                "operation_total": dict(self.operation_total),
+                "operation_sum": dict(self.operation_sum),
+                "operation_count": dict(self.operation_count),
+                "operation_buckets": dict(self.operation_buckets),
+                "rows_total": dict(self.rows_total),
+            }
+
+    def reset(self) -> None:
+        with self.lock:
+            self.__init_unlocked()
+
+    def __init_unlocked(self) -> None:
+        self.connections = 0
+        self.operations = 0
+        self.connection_total.clear()
+        self.connection_sum = 0.0
+        self.connection_count = 0
+        self.connection_buckets.clear()
+        self.operation_total.clear()
+        self.operation_sum.clear()
+        self.operation_count.clear()
+        self.operation_buckets.clear()
+        self.rows_total.clear()
+
+
+_TELEMETRY = _DbTelemetry()
+
+
+def metrics_snapshot() -> dict[str, Any]:
+    """Снимок внутренних метрик DB-клиента для `/metrics`."""
+    return _TELEMETRY.snapshot()
+
+
+def reset_metrics() -> None:
+    """Сброс только для изолированных тестов."""
+    _TELEMETRY.reset()
 
 
 def load_config() -> dict[str, Any]:
@@ -77,91 +173,202 @@ def connection(read_only: bool | None = None) -> Iterator[psycopg.Connection]:
     if effective_read_only:
         opts.append("default_transaction_read_only=on")
 
-    with psycopg.connect(
-        cfg["dsn"],
-        options=" ".join(f"-c {opt}" for opt in opts),
-        row_factory=dict_row,
-    ) as conn:
-        yield conn
+    started = time.perf_counter()
+    try:
+        conn = psycopg.connect(
+            cfg["dsn"],
+            options=" ".join(f"-c {opt}" for opt in opts),
+            row_factory=dict_row,
+        )
+    except Exception:
+        _TELEMETRY.connect("error", time.perf_counter() - started)
+        raise
+    _TELEMETRY.connect("success", time.perf_counter() - started)
+    with _TELEMETRY.lock:
+        _TELEMETRY.connections += 1
+    try:
+        with conn:
+            yield conn
+    finally:
+        with _TELEMETRY.lock:
+            _TELEMETRY.connections -= 1
 
 
-def query_dicts(sql: str, params: Sequence[Any] | None = None) -> list[dict[str, Any]]:
+def _finish_operation(operation: str, started: float, outcome: str, rows: int = 0) -> None:
+    _TELEMETRY.operation_leave(operation, outcome, time.perf_counter() - started, rows)
+
+
+def query_dicts(
+    sql: str,
+    params: Sequence[Any] | None = None,
+    *,
+    operation: str = "query_dicts",
+) -> list[dict[str, Any]]:
     """SELECT → список словарей (имена колонок как есть из БД)."""
-    with connection(read_only=True) as conn, conn.cursor() as cur:
-        cur.execute(sql, tuple(params or ()))
-        return list(cur.fetchall())
+    started = time.perf_counter()
+    _TELEMETRY.operation_enter()
+    try:
+        with connection(read_only=True) as conn, conn.cursor() as cur:
+            cur.execute(sql, tuple(params or ()))
+            rows = list(cur.fetchall())
+    except Exception:
+        _finish_operation(operation, started, "error")
+        raise
+    _finish_operation(operation, started, "success", len(rows))
+    return rows
 
 
-def query_one(sql: str, params: Sequence[Any] | None = None) -> dict[str, Any] | None:
-    rows = query_dicts(sql, params)
+def query_one(
+    sql: str,
+    params: Sequence[Any] | None = None,
+    *,
+    operation: str = "query_one",
+) -> dict[str, Any] | None:
+    rows = query_dicts(sql, params, operation=operation)
     return rows[0] if rows else None
 
 
-def scalar(sql: str, params: Sequence[Any] | None = None) -> Any:
-    """Первое значение первой строки — для COUNT/SUM в проверках."""
+def query_bundle(queries: Sequence[tuple[str, str, bool]]) -> dict[str, Any]:
+    """Несколько SELECT в одном согласованном read-only снимке.
+
+    Элемент: `(operation, sql, one)`. При `one=True` возвращается первая строка
+    или `{}`, иначе список строк. Каждая операция измеряется отдельно, но
+    соединение и repeatable-read snapshot у набора общие.
+    """
+    result: dict[str, Any] = {}
     with connection(read_only=True) as conn, conn.cursor() as cur:
-        cur.execute(sql, tuple(params or ()))
-        row = cur.fetchone()
+        cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        for operation, sql, one in queries:
+            started = time.perf_counter()
+            _TELEMETRY.operation_enter()
+            try:
+                cur.execute(sql)
+                rows = list(cur.fetchall())
+            except Exception:
+                _finish_operation(operation, started, "error")
+                raise
+            _finish_operation(operation, started, "success", len(rows))
+            result[operation] = (rows[0] if rows else {}) if one else rows
+    return result
+
+
+def scalar(
+    sql: str,
+    params: Sequence[Any] | None = None,
+    *,
+    operation: str = "scalar",
+) -> Any:
+    """Первое значение первой строки — для COUNT/SUM в проверках."""
+    started = time.perf_counter()
+    _TELEMETRY.operation_enter()
+    try:
+        with connection(read_only=True) as conn, conn.cursor() as cur:
+            cur.execute(sql, tuple(params or ()))
+            row = cur.fetchone()
+    except Exception:
+        _finish_operation(operation, started, "error")
+        raise
+    _finish_operation(operation, started, "success", 1 if row else 0)
     if not row:
         return None
     return next(iter(row.values()))
 
 
-def execute(sql: str, params: Sequence[Any] | None = None) -> int:
+def execute(
+    sql: str,
+    params: Sequence[Any] | None = None,
+    *,
+    operation: str = "execute",
+) -> int:
     """Запись, уважающая конфигурацию: при `read_only=true` упадёт.
 
     Так защита работает по умолчанию: чтобы писать, нужно либо явно вызвать
     `execute_write()`, либо поставить `"read_only": false` в dsn.json.
     """
-    with connection(read_only=None) as conn, conn.cursor() as cur:
-        cur.execute(sql, tuple(params or ()))
-        return cur.rowcount
+    started = time.perf_counter()
+    _TELEMETRY.operation_enter()
+    try:
+        with connection(read_only=None) as conn, conn.cursor() as cur:
+            cur.execute(sql, tuple(params or ()))
+            rows = cur.rowcount
+    except Exception:
+        _finish_operation(operation, started, "error")
+        raise
+    _finish_operation(operation, started, "success", rows)
+    return rows
 
 
-def execute_write(sql: str, params: Sequence[Any] | None = None) -> int:
+def execute_write(
+    sql: str,
+    params: Sequence[Any] | None = None,
+    *,
+    operation: str = "execute_write",
+) -> int:
     """Запись в обход конфигурации. Вызывать осознанно."""
-    with connection(read_only=False) as conn, conn.cursor() as cur:
-        cur.execute(sql, tuple(params or ()))
-        return cur.rowcount
+    started = time.perf_counter()
+    _TELEMETRY.operation_enter()
+    try:
+        with connection(read_only=False) as conn, conn.cursor() as cur:
+            cur.execute(sql, tuple(params or ()))
+            rows = cur.rowcount
+    except Exception:
+        _finish_operation(operation, started, "error")
+        raise
+    _finish_operation(operation, started, "success", rows)
+    return rows
 
 
 @contextmanager
-def transaction() -> Iterator[psycopg.Cursor]:
+def transaction(*, operation: str = "transaction") -> Iterator[psycopg.Cursor]:
     """Одна транзакция на много запросов — планировщик пишет контракт целиком.
 
     При исключении psycopg откатит всё: частично записанного прогона не бывает.
     """
-    with connection(read_only=False) as conn:
-        with conn.cursor() as cur:
-            yield cur
+    started = time.perf_counter()
+    _TELEMETRY.operation_enter()
+    try:
+        with connection(read_only=False) as conn:
+            with conn.cursor() as cur:
+                yield cur
+    except Exception:
+        _finish_operation(operation, started, "rollback")
+        raise
+    _finish_operation(operation, started, "commit")
 
 
 def health() -> dict[str, Any]:
     """Быстрая проверка живости базы — используется сервером и run.bat."""
-    with connection(read_only=True) as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT current_setting('server_version')  AS server_version,
-                   current_database()                 AS dbname
-            """
-        )
-        info = cur.fetchone() or {}
-        cur.execute(
-            """
-            SELECT COUNT(*) AS tables
-            FROM information_schema.tables
-            WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
-            """
-        )
-        tables = cur.fetchone() or {}
-        cur.execute(
-            """
-            SELECT COUNT(*) AS views
-            FROM information_schema.views
-            WHERE table_schema = 'public'
-            """
-        )
-        views = cur.fetchone() or {}
+    started = time.perf_counter()
+    _TELEMETRY.operation_enter()
+    try:
+        with connection(read_only=True) as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT current_setting('server_version')  AS server_version,
+                       current_database()                 AS dbname
+                """
+            )
+            info = cur.fetchone() or {}
+            cur.execute(
+                """
+                SELECT COUNT(*) AS tables
+                FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+                """
+            )
+            tables = cur.fetchone() or {}
+            cur.execute(
+                """
+                SELECT COUNT(*) AS views
+                FROM information_schema.views
+                WHERE table_schema = 'public'
+                """
+            )
+            views = cur.fetchone() or {}
+    except Exception:
+        _finish_operation("health", started, "error")
+        raise
+    _finish_operation("health", started, "success", 3)
     return {
         "dsn": dsn(),
         "server_version": info.get("server_version"),

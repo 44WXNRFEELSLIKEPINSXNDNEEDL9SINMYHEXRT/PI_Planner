@@ -455,7 +455,7 @@ def test_empty_view_is_200_with_zero_count(base_url: str, fake_db) -> None:
 
 
 def test_all_views_share_one_route_label(base_url: str, fake_db) -> None:
-    """Много витрин — одна серия в метриках: иначе дашборд растёт с каждым экраном."""
+    """HTTP route общий, а отдельный view label ограничен серверным whitelist."""
     fake_db.rows = []
     for name in ("v_task_board", "v_orbit_map", "plan_runs"):
         get(f"{base_url}/api/views/{name}")
@@ -468,4 +468,6 @@ def test_all_views_share_one_route_label(base_url: str, fake_db) -> None:
         ]
         == 3.0
     )
-    assert not [key for key in parsed if "v_task_board" in key or "v_orbit_map" in key]
+    assert parsed['pi_planner_view_requests_total{view="v_task_board",outcome="success"}'] == 1.0
+    assert parsed['pi_planner_view_requests_total{view="v_orbit_map",outcome="success"}'] == 1.0
+    assert parsed['pi_planner_view_requests_total{view="plan_runs",outcome="success"}'] == 1.0

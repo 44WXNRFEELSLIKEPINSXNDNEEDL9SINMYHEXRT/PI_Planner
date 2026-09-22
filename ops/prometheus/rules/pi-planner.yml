@@ -1,0 +1,79 @@
+groups:
+  - name: pi-planner-availability
+    rules:
+      - alert: PiPlannerDown
+        expr: up{job="pi-planner"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: PI-Planner недоступен для Prometheus
+          description: Prometheus не может получить app:8000/metrics больше минуты.
+
+      - alert: PiPlannerDatabaseDown
+        expr: pi_planner_db_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: PostgreSQL недоступен для PI-Planner
+          description: Business scrape базы не проходит больше двух минут.
+
+      - alert: PiPlannerMetricsStale
+        expr: time() - pi_planner_db_metrics_timestamp_seconds > 120
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Бизнес-метрики PI-Planner устарели
+          description: Снимок из PostgreSQL не обновлялся больше двух минут.
+
+  - name: pi-planner-http
+    rules:
+      - alert: PiPlannerHighHttpErrorRate
+        expr: |
+          sum(rate(pi_planner_http_requests_total{status=~"5..|0"}[5m]))
+          /
+          clamp_min(sum(rate(pi_planner_http_requests_total[5m])), 0.001)
+          > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Высокая доля ошибок PI-Planner
+          description: Более 5% HTTP-запросов завершаются 5xx или без ответа.
+
+      - alert: PiPlannerHighApiLatency
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (
+              rate(pi_planner_http_request_duration_seconds_bucket{route=~"/api/.*"}[5m])
+            )
+          ) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Высокая latency API PI-Planner
+          description: p95 API превышает одну секунду в течение пяти минут.
+
+  - name: pi-planner-data
+    rules:
+      - alert: PiPlannerContractViolation
+        expr: pi_planner_plan_violations{severity="error"} > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Нарушен контракт плана
+          description: Последний прогон содержит ошибки v_plan_violations.
+
+      - alert: PiPlannerMigrationsPending
+        expr: pi_planner_migrations_pending > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Не применены миграции PI-Planner
+          description: В образе есть миграции, отсутствующие в текущей БД.

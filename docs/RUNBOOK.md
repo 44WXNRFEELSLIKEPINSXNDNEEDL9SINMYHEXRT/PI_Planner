@@ -177,7 +177,7 @@ git push -u origin feature/frontend
 | `v0.2.1-m2-planner` | разбор ревью M2 | те же 0 ошибок + негативный тест срабатывает (раздел 9) |
 | `v0.2.2-data-calendar` | точный календарь PI + детерминированный ETL | приёмка M0 (раздел 7) зелёная, два прогона дают побайтово одинаковый `build/seed.sql`, `57 passed` |
 | `v0.2.3-backend-metrics` | контракт метрик для devops | `/metrics` отдаёт `pi_planner_db_up 1` и `fund_factor="6.5714"`, `/metrics` закрыт снаружи (Caddy `respond 404`) |
-| `v0.2.4-backend-views` | витрины для фронта (`/api/views`, ADR-019) | 25 витрин отвечают на живых данных, инъекция в имя витрины и в `order` не доходит до SQL, `89 passed` |
+| `v0.2.4-backend-views` | витрины для фронта (`/api/views`, ADR-019) | 25 витрин отвечают на живых данных, инъекция в имя витрины и в `order` не доходит до SQL |
 | `v0.3-m4-ui` | экраны работают | `run.bat` открывает UI и отдаёт данные |
 | `v1.0-demo` | сдача | прогон демо-сценария без правок «на ходу» |
 
@@ -371,8 +371,7 @@ UI проверяется глазами: после `run.bat` вкладка о
 «Сервер» должна показать 17.11 / `pi_planner` / 29 / 17 и не показывать блок
 «API недоступен».
 
-Тесты: `uv run pytest -q` → `89 passed` (26 сервер + 20 витрины + 10 метрики +
-29 планировщик + 4 календарь ETL). Файл
+Тесты: `uv run pytest -q` → `92 passed`. Файл
 `tests/test_server.py` поднимает сервер на свободном порту (`--port 0`) в потоке и
 дёргает его по HTTP; живая база не нужна — `app.db.health` и сборщик
 бизнес-метрик подменяются через
@@ -389,6 +388,9 @@ UI проверяется глазами: после `run.bat` вкладка о
 витрины дают одну серию `/api/views/{view}`.
 
 ### Контракт для мониторинга (devops)
+
+Полный актуальный контракт, включая histogram, DB-клиент, витрины, batch и
+backup: `docs/OBSERVABILITY.md`. Ниже сохранён краткий контракт исходной версии.
 
 Бэкенд заморожен: ниже — то, чем devops может пользоваться, не заглядывая в код.
 Переименование метрики, лейбла или эндпоинта — breaking change и объявляется
@@ -407,8 +409,9 @@ UI проверяется глазами: после `run.bat` вкладка о
 
 `/api/views/*` — read-only витрины (ADR-019); 503 при мёртвой базе, 404 на
 неизвестное имя витрины с полным списком в теле, 400 на плохой параметр. В
-метриках они **не** заводят отдельную серию на витрину: лейбл один —
-`route="/api/views/{view}"`.
+HTTP-метрики не заводят отдельную серию маршрута на витрину: лейбл один —
+`route="/api/views/{view}"`. Специализированные `pi_planner_view_*` используют
+имя витрины из закрытого whitelist для диагностики медленных запросов.
 
 `/metrics` отвечает 200 и при мёртвой базе: вместо бизнес-серий приходят
 `pi_planner_db_up 0` и `pi_planner_db_metrics_error{error_class="..."}`. Если
@@ -424,7 +427,7 @@ UI проверяется глазами: после `run.bat` вкладка о
 | `pi_planner_build_info` | gauge | `version`, `etl_version`, `pi_id`, `python` | что именно запущено, всегда 1 |
 | `pi_planner_uptime_seconds` | gauge | — | секунды с запуска |
 | `pi_planner_http_requests_total` | counter | `method`, `route`, `status` | запросы |
-| `pi_planner_http_request_duration_seconds` | summary | `method`, `route` | `_sum` и `_count`; квантилей нет — их считает Prometheus |
+| `pi_planner_http_request_duration_seconds` | histogram | `method`, `route`, `le` | `_bucket`, `_sum`, `_count`; p95/p99 через `histogram_quantile` |
 | `pi_planner_http_requests_in_flight` | gauge | — | обработка «прямо сейчас» |
 | `pi_planner_db_up` | gauge | — | 1/0 — прошёл ли последний сбор из базы |
 | `pi_planner_db_metrics_timestamp_seconds` | gauge | — | когда снят снимок: алерт на устаревание |
@@ -449,7 +452,7 @@ UI проверяется глазами: после `run.bat` вкладка о
 
 | Условие | Что значит |
 |---|---|
-| `pi_planner_up == 0` дольше 1 минуты | процесс не отвечает — рестарт |
+| `up{job="pi-planner"} == 0` дольше 1 минуты | Prometheus не может опросить процесс — рестарт |
 | `pi_planner_db_up == 0` дольше 2 минут | база недоступна: смотреть `/api/health` и `pi_planner_db_metrics_error` |
 | `pi_planner_plan_violations{severity="error"} > 0` | контракт плана сломан, приёмка не пройдена |
 | `time() - pi_planner_db_metrics_timestamp_seconds > 120` | снимок устарел: сбор падает или залип |
@@ -462,7 +465,7 @@ scrape_configs:
   - job_name: pi-planner
     metrics_path: /metrics
     static_configs:
-      - targets: ["pi-planner:8000"]
+      - targets: ["app:8000"]
 ```
 
 `/metrics` — внутренний эндпоинт: наружу его закрывает Caddy, чтобы метрики
@@ -657,4 +660,3 @@ psql -h 127.0.0.1 -U postgres -d pi_planner -v ON_ERROR_STOP=1 -f tools/negative
 → прогоны заново (`tools/run_planner.py`, затем `--as-of-sprint 3`) → негативный
 тест. Обновить ожидаемые числа в разделах 7 и 9 этого файла, если календарь
 или фонд поехали.
-

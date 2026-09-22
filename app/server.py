@@ -193,12 +193,16 @@ class Handler(BaseHTTPRequestHandler):
         self._status: Any = None
         self._bytes = 0
         started = time.perf_counter()
+        error_class: str | None = None
         METRICS.enter()
         try:
             if path.startswith("/api/") or path == "/metrics":
                 self._api(path)
             else:
                 self._static(path)
+        except Exception as exc:
+            error_class = type(exc).__name__
+            raise
         finally:
             # finally, а не после вызова: необработанное исключение в хендлере
             # тоже должно оставить след в логе и в счётчике (status=0 —
@@ -206,7 +210,14 @@ class Handler(BaseHTTPRequestHandler):
             METRICS.leave()
             seconds = time.perf_counter() - started
             status = self._status if self._status is not None else NO_RESPONSE_STATUS
-            METRICS.observe(self.command, self._route, status, seconds)
+            METRICS.observe(
+                self.command,
+                self._route,
+                status,
+                seconds,
+                response_bytes=self._bytes,
+                error_class=error_class,
+            )
             log_event(
                 "http_request",
                 method=self.command,
@@ -291,6 +302,11 @@ class Handler(BaseHTTPRequestHandler):
         Пустая витрина — не ошибка: 200 и `count: 0`.
         """
         name = unquote(path[len("/api/views/") :])
+        metric_view = name if name in views.BY_NAME else "_unknown"
+        started = time.perf_counter()
+        outcome = "error"
+        returned = 0
+        truncated = False
         query = parse_qs(urlparse(self.path).query)
         try:
             payload = views.fetch(
@@ -301,17 +317,28 @@ class Handler(BaseHTTPRequestHandler):
                 order=self._query_param(query, "order"),
             )
         except views.UnknownView as exc:
+            outcome = "not_found"
             self._send_json(HTTPStatus.NOT_FOUND, exc.payload())
-            return
         except views.BadRequest as exc:
+            outcome = "bad_request"
             self._send_json(HTTPStatus.BAD_REQUEST, exc.payload())
-            return
         except Exception as exc:  # noqa: BLE001 — как у /api/health: фронту нужен
             # внятный 503, а не оборванное соединение; демо-машина может стартовать
             # раньше PostgreSQL, а браузер кэширует «сервер недоступен» надолго
             self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, unavailable_payload(exc))
-            return
-        self._send_json(HTTPStatus.OK, payload)
+        else:
+            outcome = "success"
+            returned = int(payload.get("returned") or 0)
+            truncated = bool(payload.get("truncated"))
+            self._send_json(HTTPStatus.OK, payload)
+        finally:
+            METRICS.observe_view(
+                metric_view,
+                outcome,
+                time.perf_counter() - started,
+                rows=returned,
+                truncated=truncated,
+            )
 
     @staticmethod
     def _query_param(query: dict[str, list[str]], key: str) -> str | None:

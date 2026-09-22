@@ -46,6 +46,8 @@ services:
     pids_limit: ${APP_PIDS_LIMIT:-100}
     environment:
       APP_PORT: 8000
+      PI_PLANNER_LOG_FORMAT: ${PI_PLANNER_LOG_FORMAT:-json}
+      PI_PLANNER_METRICS_TTL: ${PI_PLANNER_METRICS_TTL:-15}
       PI_PLANNER_DSN: >-
         host=db port=5432 dbname=${POSTGRES_DB:-pi_planner}
         user=${POSTGRES_USER:-postgres} password=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
@@ -64,6 +66,7 @@ services:
     networks:
       - backend
       - frontend
+      - monitoring
 
   # Запускается перед каждым релизом: docker compose run --rm migrate.
   # Не добавлен в обычный `up`, чтобы локальный demo-старт не требовал
@@ -143,6 +146,7 @@ services:
     pids_limit: ${CADDY_PIDS_LIMIT:-100}
     environment:
       CADDY_DOMAIN: ${CADDY_DOMAIN:-localhost}
+      GRAFANA_DOMAIN: ${GRAFANA_DOMAIN:-grafana.localhost}
     ports:
       - "${HTTP_PORT:-80}:80"
       - "${HTTPS_PORT:-443}:443"
@@ -162,13 +166,99 @@ services:
         condition: service_healthy
     networks:
       - frontend
+      - observability_proxy
+
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    cpus: ${PROMETHEUS_CPU_LIMIT:-0.5}
+    mem_limit: ${PROMETHEUS_MEMORY_LIMIT:-512m}
+    pids_limit: ${PROMETHEUS_PIDS_LIMIT:-100}
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION_TIME:-15d}
+      - --storage.tsdb.retention.size=${PROMETHEUS_RETENTION_SIZE:-2GB}
+      - --web.enable-lifecycle
+    expose:
+      - "9090"
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./ops/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - monitoring
+
+  grafana:
+    image: grafana/grafana:13.2.2
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    cpus: ${GRAFANA_CPU_LIMIT:-1.0}
+    mem_limit: ${GRAFANA_MEMORY_LIMIT:-512m}
+    pids_limit: ${GRAFANA_PIDS_LIMIT:-200}
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-change-me-before-exposing}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_PLUGINS_CHECK_FOR_UPDATES: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_PLUGINS_PREINSTALL_AUTO_UPDATE: "false"
+      GF_SERVER_HTTP_PORT: 3000
+      GF_SERVER_DOMAIN: ${GRAFANA_DOMAIN:-grafana.localhost}
+      GF_SERVER_ROOT_URL: https://${GRAFANA_DOMAIN:-grafana.localhost}
+    expose:
+      - "3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./ops/grafana/provisioning/datasources/prometheus.yml:/etc/grafana/provisioning/datasources/prometheus.yml:ro
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    networks:
+      - monitoring
+      - observability_proxy
 
 volumes:
   postgres_data:
   caddy_data:
   caddy_config:
+  prometheus_data:
+  grafana_data:
 
 networks:
   frontend:
   backend:
+    internal: true
+  monitoring:
+    internal: true
+  observability_proxy:
     internal: true
