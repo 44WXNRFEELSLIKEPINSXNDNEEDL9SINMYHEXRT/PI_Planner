@@ -294,10 +294,11 @@ SOURCES: tuple[Source, ...] = (
         order="task_id,start_sprint",
         orderable=(
             "task_id", "start_sprint", "end_sprint", "forecast_end_date", "decision",
-            "decision_reason",
+            "decision_reason", "reason_code",
         ),
         note="Основа ганта. `start_sprint`/`end_sprint` пусты у переносов — это не ошибка: "
-        "смотреть `decision` и `decision_reason`.",
+        "смотреть `decision`. `reason_text` — готовое объяснение решения по-русски "
+        "(есть и у включённых задач), `reason_details` — разбивка для тултипа.",
         run_column="run_id",
     ),
     _source(
@@ -334,9 +335,10 @@ SOURCES: tuple[Source, ...] = (
         "kpi_snapshots",
         screen="KPI",
         order="sprint_no,kpi_code",
-        orderable=("sprint_no", "kpi_code", "value", "target_min", "target_max"),
+        orderable=("sprint_no", "kpi_code", "value", "target_min", "target_max", "kind"),
         note="Плашку красить по `target_min` / `target_max` из строки, пороги во фронте "
-        "не зашивать. Значение вне нормы — не ошибка данных.",
+        "не зашивать. `kind` = forecast (по плану) | actual (по загруженному факту) — "
+        "показывать раздельно, этого требует ТЗ.",
         run_column="run_id",
     ),
     _source(
@@ -348,6 +350,81 @@ SOURCES: tuple[Source, ...] = (
         "Сейчас 5–7 warning `PLANNED_END_OVERSAIL` — прогноз выходит за даты исходного плана "
         "(ADR-016: это история, а не обязательство).",
         run_column="run_id",
+    ),
+    # ------------------------------------- звёздная карта по ТЗ (ADR-024)
+    _source(
+        "v_bus_factor_skill",
+        screen="Звёздная карта",
+        order="bus_factor,skill_name",
+        orderable=("skill_id", "skill_name", "bus_factor", "roles_demand_hh", "in_demand",
+                   "sole_in_role", "risk"),
+        note="Bus Factor ПО КОМПЕТЕНЦИЯМ — то, что требует ТЗ. `risk` = «критично» у навыка, "
+        "чей единственный носитель ещё и единственный специалист своей роли. Покрытие ролей "
+        "(роли без людей в штате) — отдельная витрина v_bus_factor.",
+    ),
+    _source(
+        "v_engineer_absence_risk",
+        screen="Звёздная карта",
+        order="engineer_id",
+        orderable=("engineer_id", "role_name", "grade", "role_bus_factor", "planned_hours",
+                   "hours_without_backup", "risk"),
+        note="Профиль инженера и ответ на вопрос ТЗ «где отсутствие одного сотрудника создаёт "
+        "риск»: `tasks_without_backup` — задачи прогона, которые встанут, если он выпадет.",
+        run_column="run_id",
+    ),
+    _source(
+        "v_team_profile",
+        screen="Звёздная карта",
+        order="team_id",
+        orderable=("team_id", "members", "fte", "hours_per_sprint", "available_sp_per_sprint",
+                   "skills_n", "live_tasks", "live_sp", "live_hh"),
+        note="Профиль команды: состав, роли, `roles_missing` (нужны бэклогу, но в команде нет "
+        "никого), компетенции и ёмкость.",
+    ),
+    # ------------------------------------- пересчёт по факту (ADR-021)
+    _source(
+        "actual_uploads",
+        screen="Загрузка факта",
+        order="-sprint_no",
+        orderable=("upload_id", "sprint_no", "source_file", "uploaded_at"),
+        note="Журнал загрузок факта спринтов. Загрузка делается через POST /api/actuals?sprint=N, "
+        "шаблон — GET /api/actuals/template?sprint=N.",
+    ),
+    _source(
+        "v_plan_diff",
+        screen="Алерты",
+        order="task_id",
+        orderable=("task_id", "prodf_id", "team_id", "change_type", "cause", "prev_start",
+                   "new_start", "prev_end", "new_end"),
+        note="Что изменилось против предыдущего прогона и ПОЧЕМУ: own_slip (сама не закрылась), "
+        "carry_over (спринт закрыт, работа продолжается), dependency, capacity, completed. "
+        "Ответ на требование ТЗ «какие отклонения вызвали изменения».",
+        run_column="run_id",
+    ),
+    _source(
+        "v_sprint_deviation",
+        screen="Алерты",
+        order="sprint_no,task_id",
+        orderable=("upload_id", "sprint_no", "task_id", "team_id", "reported_status",
+                   "deviation", "planned_hours", "spent_hours"),
+        note="Факт спринта против плана, который в этом спринте действовал: «в срок», "
+        "«не закрыта в срок», «раньше плана». Витрина по загрузкам, а не по прогонам.",
+    ),
+    _source(
+        "plan_task_sp",
+        screen="План квартала",
+        order="task_id,sprint_no",
+        orderable=("task_id", "sprint_no", "sp"),
+        note="Доли Story Points задачи по спринтам (ADR-020): задача крупнее ёмкости спринта "
+        "растягивается, и её SP списываются частями.",
+        run_column="run_id",
+    ),
+    _source(
+        "ref_decision_reasons",
+        screen="План квартала",
+        order="ord",
+        orderable=("code", "ord", "decision", "label"),
+        note="Справочник причин решений планировщика: расшифровка `reason_code`.",
     ),
 )
 

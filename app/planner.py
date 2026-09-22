@@ -64,15 +64,15 @@ from __future__ import annotations
 
 import json
 import time
-from collections import defaultdict
-from dataclasses import dataclass
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field, replace
 from datetime import date
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from typing import Any
 
 from app import db
 
-ALGORITHM = "greedy-priority-topo@1"
+ALGORITHM = "greedy-priority-topo@2"
 ESTIMATE_SOURCE = "matrix_column_sum"
 SUBSTITUTION_MODE = "rejected"
 # Минимальное назначение: контракт требует hours > 0, а остаток может быть нулевым.
@@ -80,6 +80,18 @@ SYMBOLIC_HOURS = Decimal("0.01")
 DEFERRED_REASON = "M2"  # Отсутствие ресурсов
 DEFERRED_REASON_BLOCKED = "M3"  # Отсутствует готовность смежных команд
 DONE_STATUS = "Done"
+
+# Причины решений (ADR-022): код из ref_decision_reasons + старый код расхождений
+# (M2/M3/M4) для совместимости контракта. Текст для задачи собирается отдельно.
+REASON_PLANNED = "PLANNED"
+REASON_ROLE_NOT_IN_STAFF = "ROLE_NOT_IN_STAFF"
+REASON_ROLE_HOURS = "ROLE_HOURS_EXHAUSTED"
+REASON_TEAM_SP = "TEAM_SP_EXHAUSTED"
+REASON_BLOCKED = "BLOCKED_BY_DEFERRED"
+REASON_ATOMIC = "INITIATIVE_ATOMIC"
+REASON_PI_CLOSED = "PI_CLOSED"
+REASON_NOT_FEASIBLE = "NOT_FEASIBLE_NEXT_PI"
+CANCEL_REASON = "M4"  # «Превышение плана»: не помещается и в следующий квартал
 
 # Семантика зависимостей (ADR-013). `start_start` — значение по умолчанию:
 # именно её реализует предпосчитанный `task_sequence.earliest_start_sprint`.
@@ -109,7 +121,7 @@ EFFICIENCY_NOTE = (
 KPI_TARGETS: dict[str, tuple[Decimal | None, Decimal | None]] = {
     "pi_predictability": (Decimal("80"), Decimal("100")),
     "say_do_ratio": (Decimal("90"), Decimal("105")),
-    "bus_factor": (Decimal("1"), None),
+    "bus_factor": (Decimal("2"), None),  # онбординг: «Bus Factor > 1»
 }
 
 # ---------------------------------------------------------------------------
@@ -211,6 +223,44 @@ WHERE demand_hh > 0
 ORDER BY bus_factor, role_name
 """
 
+# Bus Factor по компетенциям (ТЗ, ADR-024): навык, носителей, роль нужна бэклогу,
+# единственный носитель и единственный по роли.
+SKILL_BUS_FACTOR_SQL = """
+SELECT skill_name, bus_factor, in_demand, sole_in_role
+FROM v_bus_factor_skill
+ORDER BY bus_factor, skill_name
+"""
+
+# Факт спринтов (ADR-021): последняя загрузка и какие задачи в каком спринте
+# ВПЕРВЫЕ отмечены выполненными — это числитель «Выполнения плана спринта».
+LAST_UPLOAD_SQL = """
+SELECT upload_id, sprint_no FROM actual_uploads
+WHERE pi_id = %s ORDER BY sprint_no DESC LIMIT 1
+"""
+DONE_IN_SPRINT_SQL = """
+SELECT u.sprint_no, a.task_id
+FROM task_actuals a
+JOIN actual_uploads u   ON u.upload_id = a.upload_id
+JOIN tasks_seed_state s ON s.task_id = a.task_id
+WHERE a.status = 'Done' AND s.status <> 'Done' AND u.pi_id = %s
+  AND NOT EXISTS (SELECT 1 FROM task_actuals a2
+                  JOIN actual_uploads u2 ON u2.upload_id = a2.upload_id
+                  WHERE a2.task_id = a.task_id AND a2.status = 'Done'
+                    AND u2.sprint_no < u.sprint_no)
+ORDER BY u.sprint_no, a.task_id
+"""
+TASK_PRODF_SQL = "SELECT task_id, prodf_id FROM tasks ORDER BY task_id"
+
+# Первоначальный план = канонический базовый прогон целиком: решение, старт и
+# конец каждой задачи Недели 0. Пересчёт базу сравнения не меняет (ТЗ).
+BASELINE_SCHEDULE_SQL = """
+SELECT b.task_id, s.decision, s.start_sprint, s.end_sprint
+FROM plan_baseline b
+JOIN plan_task_schedule s ON s.run_id = b.run_id AND s.task_id = b.task_id
+WHERE b.run_id = (SELECT MIN(run_id) FROM plan_runs WHERE as_of_sprint = 0 AND status = 'ok')
+ORDER BY b.task_id
+"""
+
 # Проверка ответа №4: три источника часов расходятся — сколько раз и насколько.
 ESTIMATE_CONFLICT_SQL = """
 SELECT COUNT(*)                                     AS issues,
@@ -300,6 +350,15 @@ class Inputs:
     estimate_conflicts: int
     estimate_conflict_warnings: int
     active_substitutions: int
+    # --- факт спринтов и первоначальный план (ADR-021, ADR-023) ---------
+    actuals_upload_id: int | None = None
+    last_reported_sprint: int = 0  # последний спринт, по которому загружен факт
+    done_in_sprint: dict[int, frozenset[str]] = field(default_factory=dict)
+    task_prodf: dict[str, str] = field(default_factory=dict)  # все задачи, и Done тоже
+    # task_id -> (decision, start, end) канонического базового прогона
+    baseline_schedule: dict[str, tuple[str, int | None, int | None]] = field(default_factory=dict)
+    # Bus Factor по компетенциям: (навык, носителей, in_demand, sole_in_role)
+    skill_bus_factor: tuple[tuple[str, int, bool, bool], ...] = ()
 
     @property
     def fund_hours_per_fte(self) -> Decimal:
@@ -379,6 +438,11 @@ def load_inputs() -> Inputs:
     conflicts = db.query_one(ESTIMATE_CONFLICT_SQL) or {}
     substitutions = db.query_one(SUBSTITUTION_ROWS_SQL) or {}
 
+    last_upload = db.query_one(LAST_UPLOAD_SQL, (pi["pi_id"],)) or {}
+    done_in_sprint: dict[int, set[str]] = defaultdict(set)
+    for row in db.query_dicts(DONE_IN_SPRINT_SQL, (pi["pi_id"],)):
+        done_in_sprint[int(row["sprint_no"])].add(row["task_id"])
+
     return Inputs(
         pi_id=pi["pi_id"],
         sprint_count=int(pi["sprint_count"]),
@@ -427,6 +491,19 @@ def load_inputs() -> Inputs:
         estimate_conflicts=int(conflicts.get("issues") or 0),
         estimate_conflict_warnings=int(conflicts.get("warnings") or 0),
         active_substitutions=int(substitutions.get("active") or 0),
+        actuals_upload_id=last_upload.get("upload_id"),
+        last_reported_sprint=int(last_upload.get("sprint_no") or 0),
+        done_in_sprint={no: frozenset(ids) for no, ids in done_in_sprint.items()},
+        task_prodf={row["task_id"]: row["prodf_id"] for row in db.query_dicts(TASK_PRODF_SQL)},
+        baseline_schedule={
+            row["task_id"]: (row["decision"], row["start_sprint"], row["end_sprint"])
+            for row in db.query_dicts(BASELINE_SCHEDULE_SQL)
+        },
+        skill_bus_factor=tuple(
+            (row["skill_name"], int(row["bus_factor"]), bool(row["in_demand"]),
+             bool(row["sole_in_role"]))
+            for row in db.query_dicts(SKILL_BUS_FACTOR_SQL)
+        ),
     )
 
 
@@ -448,6 +525,9 @@ class ScheduleRow:
     forecast_end_date: date | None
     decision: str
     decision_reason: str | None
+    reason_code: str | None = None
+    reason_text: str | None = None
+    reason_details: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -480,6 +560,7 @@ class KpiRow:
     target_min: Decimal | None
     target_max: Decimal | None
     details: dict[str, Any]
+    kind: str = "forecast"  # forecast | actual (ТЗ: прогноз отличать от факта)
 
 
 @dataclass(frozen=True)
@@ -512,6 +593,8 @@ class Plan:
     kpis: tuple[KpiRow, ...]
     baseline: tuple[BaselineRow, ...]
     states: tuple[StateRow, ...]
+    sp_shares: tuple[tuple[str, int, Decimal], ...] = ()  # (task_id, sprint_no, sp), ADR-020
+    actuals_upload_id: int | None = None
 
     @property
     def in_quarter(self) -> tuple[ScheduleRow, ...]:
@@ -739,6 +822,60 @@ def _allocate_task(
     return None
 
 
+def _sp_flow(
+    task: TaskInput, start_sprint: int, funds: _Funds, capacity: Decimal, sprint_count: int
+) -> dict[int, Decimal] | None:
+    """Story Points задачи как поток по спринтам (ADR-020).
+
+    Команда за спринт закрывает не больше `available_sp_per_sprint × factor`.
+    Задача, начатая в спринте `start_sprint`, списывает SP с ёмкости команды
+    начиная с него: сколько свободно в этом спринте, остаток — в следующих.
+    Так задача с SP больше ёмкости одного спринта растягивается, а не
+    переносится навсегда — ровно как требует пример онбординга с DB-202
+    («алгоритм должен растянуть эту задачу минимум на 2 спринта»).
+
+    В спринте старта у команды должна быть хоть какая-то свободная ёмкость:
+    задача не может «начаться» там, где команде взять её не из чего.
+    Возвращает {спринт: SP} или None, если SP не укладываются в квартал.
+    """
+    need = task.estimation_sp
+    if need <= 0:
+        return {}
+
+    def free(sprint_no: int) -> Decimal:
+        left = capacity * funds.sprint_factor(sprint_no) - funds.used_sp[(task.team_id, sprint_no)]
+        return left.quantize(Decimal("0.01"), rounding=ROUND_DOWN) if left > 0 else Decimal("0")
+
+    if free(start_sprint) <= 0:
+        return None
+    shares: dict[int, Decimal] = {}
+    for sprint_no in range(start_sprint, sprint_count + 1):
+        available = free(sprint_no)
+        if available <= 0:
+            continue
+        take = min(available, need)
+        shares[sprint_no] = take
+        need -= take
+        if need <= 0:
+            return shares
+    return None
+
+
+def _sprints_word(n: int) -> str:
+    """«2 спринта», «5 спринтов» — текст причин читает заказчик."""
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} спринт"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return f"{n} спринта"
+    return f"{n} спринтов"
+
+
+def _q(value: Decimal) -> str:
+    """Два знака без хвостовых нулей: 40.00 -> 40, 7.20 -> 7.2."""
+    text = f"{value.quantize(Decimal('0.01'))}"
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
 # ---------------------------------------------------------------------------
 #  ЧИСТАЯ ЛОГИКА: вход → план
 # ---------------------------------------------------------------------------
@@ -748,8 +885,14 @@ def build_plan(
     baseline_starts: dict[str, int] | None = None,
     dependency_mode: str = DEPENDENCY_MODE_START_START,
     initiative_mode: str = INITIATIVE_MODE_GREEDY,
+    simulate_next_pi: bool = True,
 ) -> Plan:
     """Строит план. Ни одного обращения к базе: всё, что нужно, уже во `Inputs`.
+
+    `simulate_next_pi` — проверка для рекомендации отмены (ADR-022): задачи,
+    перенесённые из-за нехватки часов или ёмкости, пробно раскладываются в
+    «следующий квартал» с тем же штатом; не влезли и туда — `cancelled`.
+    Внутренний вызов симуляции идёт с False, чтобы не уйти в рекурсию.
 
     `dependency_mode` и `initiative_mode` — решения ADR-013; оба уезжают
     в `plan_runs.params`, поэтому любой прогон сам объясняет, по каким правилам
@@ -790,14 +933,19 @@ def build_plan(
     starts: dict[str, int] = {}
     ends: dict[str, int] = {}
     placed: dict[str, list[Assignment]] = {}
+    sp_shares: dict[str, dict[int, Decimal]] = {}
     deferred: dict[str, str] = {}
+    atomic_deferred: set[str] = set()
+    # Итог квартала: факт загружен за последний спринт — планировать некуда (ADR-021).
+    pi_closed = replan_floor > inputs.sprint_count
 
     def release(task_id: str) -> None:
-        """Снять задачу с плана: вернуть в фонд её SP и часы."""
+        """Снять задачу с плана: вернуть в фонд её SP (по всем спринтам) и часы."""
         task = by_id[task_id]
         funds.free(placed.pop(task_id, []))
-        if task_id in starts:
-            funds.release_sp(task.team_id, starts.pop(task_id), task.estimation_sp)
+        for sprint_no, sp in sp_shares.pop(task_id, {}).items():
+            funds.release_sp(task.team_id, sprint_no, sp)
+        starts.pop(task_id, None)
         ends.pop(task_id, None)
 
     def release_initiative(prodf_id: str) -> list[str]:
@@ -808,6 +956,16 @@ def build_plan(
         for task_id in rolled:
             release(task_id)
         return rolled
+
+    def defer_initiative(prodf_id: str) -> None:
+        """Атомарный режим: откатанные задачи инициативы — тоже переносы.
+
+        Раньше откат снимал задачи с плана, но не помечал их перенесёнными,
+        и сборка расписания падала бы на `ends[task_id]`.
+        """
+        for rolled in release_initiative(prodf_id):
+            deferred[rolled] = blocked_reason(by_id[rolled])
+            atomic_deferred.add(rolled)
 
     def ready_from(blocking: str, gap: int) -> int:
         """С какого спринта блокируемая задача вправе стартовать (ADR-013).
@@ -836,14 +994,17 @@ def build_plan(
                 lower = max(lower, ready_from(blocking, gap))
         return lower
 
+    def missing_roles(task: TaskInput) -> list[int]:
+        """Роли задачи, на которые в штате нет НИ ОДНОГО инженера."""
+        return [role_id for role_id in sorted(task.needed) if not by_role.get(role_id)]
+
     def place(task: TaskInput, lower: int) -> bool:
         """Поставить задачу в минимальный подходящий спринт. False — не влезла.
 
-        Часы раскладываем первыми, SP проверяем по ФАКТИЧЕСКОМУ спринту старта:
-        инвариант `SP_OVERFLOW` группирует SP по `start_sprint`, поэтому если
-        задача начала работать в спринте 3, ёмкость нужна именно там. Ёмкость
-        спринта = `available_sp_per_sprint` × factor спринта: в коротком 7-м
-        спринте SP меньше (ADR-017).
+        Часы раскладываются первыми, затем SP текут по спринтам начиная со
+        спринта ФАКТИЧЕСКОГО старта (ADR-020): в каждом спринте команда берёт не
+        больше свободной ёмкости, остаток — в следующих. Окно задачи —
+        от первого спринта с часами до последнего спринта с часами или с SP.
         """
         capacity = inputs.team_sp_per_sprint.get(task.team_id, Decimal("0"))
         for candidate in range(max(replan_floor, lower), inputs.sprint_count + 1):
@@ -852,23 +1013,66 @@ def build_plan(
             )
             if result is None:
                 continue
-            rows, start_used, end_sprint = result
-            if (
-                funds.used_sp[(task.team_id, start_used)] + task.estimation_sp
-                > capacity * funds.sprint_factor(start_used)
-            ):
-                funds.free(rows)  # SP не влезли в спринт старта — откат и пробуем позже
+            rows, start_used, end_hours = result
+            shares = _sp_flow(task, start_used, funds, capacity, inputs.sprint_count)
+            if shares is None:
+                funds.free(rows)  # SP не укладываются от этого старта — пробуем позже
                 continue
-            funds.take_sp(task.team_id, start_used, task.estimation_sp)
+            for sprint_no, sp in shares.items():
+                funds.take_sp(task.team_id, sprint_no, sp)
             starts[task.task_id] = start_used
-            ends[task.task_id] = end_sprint
+            ends[task.task_id] = max([end_hours, *shares])
             placed[task.task_id] = rows
+            sp_shares[task.task_id] = shares
             deferred.pop(task.task_id, None)
+            atomic_deferred.discard(task.task_id)
             return True
         return False
 
+    def propagate_deferrals() -> None:
+        """Перенесённая блокирующая тянет за собой зависимые (инвариант
+        `DEPENDENCY_BLOCKER_DEFERRED`). Зовётся после КАЖДОГО прохода, который
+        может что-то перенести: раньше переносы третьего прохода не протягивались."""
+        changed = True
+        while changed:
+            changed = False
+            for task in ordered:
+                if task.task_id in deferred:
+                    continue
+                if any(b in deferred for b, _gap in deps_by_blocked.get(task.task_id, ())):
+                    release(task.task_id)
+                    deferred[task.task_id] = blocked_reason(task)
+                    if initiative_mode == INITIATIVE_MODE_ATOMIC:
+                        defer_initiative(task.prodf_id)
+                    changed = True
+
+    def fix_gaps() -> None:
+        """Догон зазоров, если блокирующая уехала позже, чем стояла зависимая."""
+        for _ in range(len(ordered) + 1):
+            violations = [
+                (blocking, blocked, gap)
+                for blocking, blocked, gap in inputs.deps
+                if blocking in starts
+                and blocked in starts
+                and starts[blocked] < ready_from(blocking, gap)
+            ]
+            if not violations:
+                return
+            for blocking, blocked, gap in violations:
+                if blocked not in starts:  # уже снята выше по этому же циклу
+                    continue
+                task = by_id[blocked]
+                release(blocked)
+                if not place(task, max(lower_bound(task), ready_from(blocking, gap))):
+                    deferred[blocked] = blocked_reason(task)
+                    if initiative_mode == INITIATIVE_MODE_ATOMIC:
+                        defer_initiative(task.prodf_id)
+
     # ---- проход 1: обход в порядке приоритетов ----------------------------
-    if initiative_mode == INITIATIVE_MODE_ATOMIC:
+    if pi_closed:
+        for task in ordered:
+            deferred[task.task_id] = DEFERRED_REASON
+    elif initiative_mode == INITIATIVE_MODE_ATOMIC:
         # Пробная упаковка инициативы целиком (ADR-013): не влезла хоть одна
         # задача — откат всех. Иначе дефицитный исполнитель занят инициативой,
         # которая всё равно не завершится, а KPI считает только завершённые.
@@ -884,62 +1088,280 @@ def build_plan(
             release_initiative(prodf_id)
             for task in members:
                 deferred[task.task_id] = blocked_reason(task)
+                atomic_deferred.add(task.task_id)
     else:
         for task in ordered:
             if not place(task, lower_bound(task)):
                 deferred[task.task_id] = DEFERRED_REASON
 
-    # ---- проход 2: перенесённая блокирующая тянет за собой ----------------
-    # Ставить зависимую задачу в квартал нельзя: блокирующая в него не попала.
-    # Инвариант `DEPENDENCY_BLOCKER_DEFERRED` проверяет это независимо от кода.
-    changed = True
-    while changed:
-        changed = False
-        for task in ordered:
-            if task.task_id in deferred:
-                continue
-            for blocking, _gap in deps_by_blocked.get(task.task_id, ()):
-                if blocking not in deferred:
-                    continue
-                release(task.task_id)
-                deferred[task.task_id] = blocked_reason(task)
-                if initiative_mode == INITIATIVE_MODE_ATOMIC:
-                    release_initiative(task.prodf_id)  # инициатива — целиком
-                changed = True
-                break
+    if not pi_closed:
+        # ---- проходы 2–3: перенос тянет зависимые, догон зазоров -----------
+        propagate_deferrals()
+        fix_gaps()
+        propagate_deferrals()
 
-    # ---- проход 3: догон зазоров, если блокирующая уехала позже ------------
-    for _ in range(len(ordered) + 1):
-        violations = [
-            (blocking, blocked, gap)
-            for blocking, blocked, gap in inputs.deps
-            if blocking in starts
-            and blocked in starts
-            and starts[blocked] < ready_from(blocking, gap)
-        ]
-        if not violations:
-            break
-        for _blocking, blocked, gap in violations:
-            task = by_id[blocked]
-            release(blocked)
-            if not place(task, max(lower_bound(task), ready_from(_blocking, gap))):
-                deferred[blocked] = blocked_reason(task)
-                if initiative_mode == INITIATIVE_MODE_ATOMIC:
-                    release_initiative(task.prodf_id)
+        # ---- проход 4: повторная упаковка (ADR-020) ------------------------
+        # Переносы проходов 2–3 возвращают часы и SP в фонд. Без этого прохода
+        # освободившийся ресурс пропадал, а причина «не хватило ресурсов» у
+        # перенесённой задачи была бы неправдой. Атомарный режим не трогаем:
+        # там упаковка — по инициативам целиком.
+        if initiative_mode == INITIATIVE_MODE_GREEDY:
+            for _ in range(len(ordered) + 1):
+                placed_now = False
+                for task in ordered:
+                    if task.task_id not in deferred or missing_roles(task):
+                        continue
+                    if any(b in deferred for b, _gap in deps_by_blocked.get(task.task_id, ())):
+                        continue
+                    if place(task, lower_bound(task)):
+                        placed_now = True
+                if not placed_now:
+                    break
+                fix_gaps()
+                propagate_deferrals()
+
+    # ---- причины решений (ADR-022) ---------------------------------------
+    rank = {task.task_id: index for index, task in enumerate(ordered, start=1)}
+
+    def taken_by(role_id: int, limit: int = 5) -> list[str]:
+        """Какие поставленные задачи больше всех заняли часы этой роли."""
+        hours: dict[str, Decimal] = defaultdict(Decimal)
+        for task_id, rows in placed.items():
+            for row in rows:
+                if row.role_id == role_id:
+                    hours[task_id] += row.hours
+        ranked = sorted(hours.items(), key=lambda item: (-item[1], item[0]))
+        return [task_id for task_id, _hours in ranked[:limit]]
+
+    def diagnose(task: TaskInput) -> tuple[str, str, dict[str, Any]]:
+        """Почему задача не в квартале — по фактическому состоянию фонда."""
+        task_id = task.task_id
+        if pi_closed:
+            return (
+                REASON_PI_CLOSED,
+                f"Перенесена: квартал завершён (факт загружен за спринт "
+                f"{inputs.last_reported_sprint}), остаток {_q(task.demand_hh)} ЧЧ уходит "
+                f"в следующий PI",
+                {"remaining_hh": str(task.demand_hh)},
+            )
+        missing = missing_roles(task)
+        if missing:
+            items = [
+                {"role": task.role_names.get(role_id, str(role_id)), "hours": str(task.needed[role_id])}
+                for role_id in missing
+            ]
+            listed = ", ".join(f"«{item['role']}» ({_q(Decimal(item['hours']))} ЧЧ)" for item in items)
+            return (
+                REASON_ROLE_NOT_IN_STAFF,
+                f"Перенесена: в штате нет роли {listed} — закрыть эту часть работы некому. "
+                f"Нужен наём или дообучение; замещения ролей запрещены организаторами",
+                {"missing_roles": items},
+            )
+        blockers = sorted(b for b, _gap in deps_by_blocked.get(task_id, ()) if b in deferred)
+        if blockers:
+            return (
+                REASON_BLOCKED,
+                f"Перенесена: ждёт {', '.join(blockers)} — блокирующая задача сама не попала "
+                f"в квартал, а начинать раньше неё нельзя",
+                {
+                    "blocked_by": blockers,
+                    "other_team": any(by_id[b].team_id != task.team_id for b in blockers),
+                },
+            )
+        lower = lower_bound(task)
+        trial = _allocate_task(task, lower, funds, by_role, inputs.sprint_count, inputs.coverage)
+        if trial is not None:
+            funds.free(trial[0])  # пробное распределение не должно залипнуть в фонде
+            if task_id in atomic_deferred:
+                return (
+                    REASON_ATOMIC,
+                    f"Перенесена вместе с инициативой {task.prodf_id}: сама задача помещается, "
+                    f"но другая задача инициативы — нет, а режим atomic частичных инициатив "
+                    f"не допускает",
+                    {"prodf_id": task.prodf_id},
+                )
+            capacity = inputs.team_sp_per_sprint.get(task.team_id, Decimal("0"))
+            free_sp = sum(
+                (
+                    max(capacity * funds.sprint_factor(n) - funds.used_sp[(task.team_id, n)], Decimal("0"))
+                    for n in range(lower, inputs.sprint_count + 1)
+                ),
+                Decimal("0"),
+            )
+            return (
+                REASON_TEAM_SP,
+                f"Перенесена: часов специалистов хватает, но у {task.team_id} не осталось "
+                f"ёмкости — нужно {_q(task.estimation_sp)} SP, свободно {_q(free_sp)} SP со "
+                f"спринта {lower} до конца квартала; ёмкость заняли задачи с более высоким "
+                f"приоритетом",
+                {
+                    "team_id": task.team_id,
+                    "need_sp": str(task.estimation_sp),
+                    "free_sp": str(free_sp.quantize(Decimal("0.01"))),
+                    "from_sprint": lower,
+                },
+            )
+        shortages = []
+        for role_id, need in sorted(task.needed.items()):
+            free = sum(
+                (
+                    max(funds.total_left(engineer_id, n), Decimal("0"))
+                    for engineer_id in by_role.get(role_id, ())
+                    for n in range(lower, inputs.sprint_count + 1)
+                ),
+                Decimal("0"),
+            )
+            if free < need:
+                shortages.append(
+                    {
+                        "role": task.role_names.get(role_id, str(role_id)),
+                        "need_hh": str(need),
+                        "free_hh": str(free.quantize(Decimal("0.01"))),
+                        "taken_by": taken_by(role_id),
+                    }
+                )
+        if shortages:
+            listed = "; ".join(
+                f"«{item['role']}»: нужно {_q(Decimal(item['need_hh']))} ЧЧ, свободно "
+                f"{_q(Decimal(item['free_hh']))} ЧЧ"
+                + (f" (часы заняты {', '.join(item['taken_by'])})" if item["taken_by"] else "")
+                for item in shortages
+            )
+            text = (
+                f"Перенесена: не хватает часов специалистов со спринта {lower} до конца квартала — "
+                f"{listed}. Часы отданы задачам с более высоким приоритетом"
+            )
+        else:
+            text = (
+                "Перенесена: часов по ролям в сумме хватает, но их не собрать в нужные спринты — "
+                "свободные часы у людей разнесены по разным командам и спринтам"
+            )
+        return (REASON_ROLE_HOURS, text, {"shortages": shortages, "from_sprint": lower})
+
+    reasons = {task.task_id: diagnose(task) for task in ordered if task.task_id in deferred}
+
+    # ---- рекомендация отмены: не влезает и в следующий квартал (ADR-022) ---
+    cancelled: dict[str, tuple[str, str, dict[str, Any]]] = {}
+    next_pi_check: dict[str, Any] = {"simulated": [], "fits_next_pi": []}
+    if simulate_next_pi and not pi_closed and initiative_mode == INITIATIVE_MODE_GREEDY:
+        pool = {
+            task_id for task_id, (code, _text, _details) in reasons.items()
+            if code in (REASON_ROLE_HOURS, REASON_TEAM_SP)
+        }
+        grew = True
+        while grew:  # зависимые едут в симуляцию, если их держат только такие задачи
+            grew = False
+            for task_id, (code, _text, details) in reasons.items():
+                if task_id in pool or code != REASON_BLOCKED:
+                    continue
+                if all(b in pool for b in details.get("blocked_by", [])):
+                    pool.add(task_id)
+                    grew = True
+        if pool:
+            simulated = replace(
+                inputs,
+                tasks=tuple(
+                    replace(task, earliest_start_sprint=1) for task in ordered if task.task_id in pool
+                ),
+                deps=tuple(dep for dep in inputs.deps if dep[0] in pool and dep[1] in pool),
+                baseline_schedule={},
+            )
+            trial_plan = build_plan(
+                simulated,
+                as_of_sprint=0,
+                dependency_mode=dependency_mode,
+                initiative_mode=initiative_mode,
+                simulate_next_pi=False,
+            )
+            fits_next = {row.task_id for row in trial_plan.schedule if row.decision == "in_quarter"}
+            next_pi_check = {"simulated": sorted(pool), "fits_next_pi": sorted(fits_next)}
+            for task_id in sorted(pool - fits_next):
+                code, text, details = reasons[task_id]
+                cancelled[task_id] = (
+                    REASON_NOT_FEASIBLE,
+                    "Рекомендуем отменить или пересогласовать: задача не помещается ни в этот "
+                    "квартал, ни в следующий при текущем штате. " + text,
+                    {**details, "cause_code": code},
+                )
+
+    def legacy_reason(code: str, details: dict[str, Any]) -> str:
+        """Старый код расхождений для колонки decision_reason (совместимость)."""
+        if code == REASON_BLOCKED and details.get("other_team"):
+            return DEFERRED_REASON_BLOCKED
+        if code == REASON_NOT_FEASIBLE:
+            return CANCEL_REASON
+        return DEFERRED_REASON
+
+    def explain_planned(task: TaskInput) -> tuple[str, dict[str, Any]]:
+        """Почему задача ВКЛЮЧЕНА — ТЗ требует объяснять и это."""
+        task_id = task.task_id
+        rows = placed.get(task_id, [])
+        roles: dict[str, set[str]] = defaultdict(set)
+        for row in rows:
+            roles[task.role_names.get(row.role_id, str(row.role_id))].add(row.engineer_id)
+        loan_hh = sum((row.hours for row in rows if row.home_team_id != row.serving_team_id), Decimal("0"))
+        shares = sp_shares.get(task_id, {})
+        window = (
+            f"спринт {starts[task_id]}"
+            if starts[task_id] == ends[task_id]
+            else f"спринты {starts[task_id]}–{ends[task_id]}"
+        )
+        if not task.needed:
+            text = (
+                f"Включена: работа по смете фактически выполнена (остаток 0 ЧЧ), "
+                f"задача закрывается в {window}"
+            )
+        else:
+            parts = [
+                f"Включена: приоритет инициативы {task.priority_rung} — {rank[task_id]}-я в очереди "
+                f"из {len(ordered)}, {window}",
+                "Роли закрыты: "
+                + "; ".join(f"{name} — {', '.join(sorted(people))}" for name, people in sorted(roles.items())),
+            ]
+            if loan_hh > 0:
+                parts.append(f"{_q(loan_hh)} ЧЧ взяты в заём у других команд")
+            if len(shares) > 1:
+                parts.append(
+                    f"{_q(task.estimation_sp)} SP растянуты на {_sprints_word(len(shares))}: "
+                    f"это больше свободной ёмкости команды за один спринт"
+                )
+            text = ". ".join(parts)
+        return text, {
+            "priority_rung": task.priority_rung,
+            "queue_rank": rank[task_id],
+            "queue_size": len(ordered),
+            "roles": {name: sorted(people) for name, people in sorted(roles.items())},
+            "loan_hh": str(loan_hh),
+            "sp_by_sprint": {str(n): str(sp) for n, sp in sorted(shares.items())},
+        }
 
     # ---- расписание -------------------------------------------------------
     schedule: list[ScheduleRow] = []
     for task in ordered:
-        if task.task_id in deferred:
+        task_id = task.task_id
+        if task_id in cancelled:
+            code, text, details = cancelled[task_id]
             schedule.append(
-                ScheduleRow(task.task_id, None, None, None, "deferred_next_pi", deferred[task.task_id])
+                ScheduleRow(task_id, None, None, None, "cancelled", CANCEL_REASON, code, text, details)
             )
-            continue
-        end_sprint = ends[task.task_id]
-        end_date = inputs.sprints.get(end_sprint, (None, None))[1]
-        schedule.append(
-            ScheduleRow(task.task_id, starts[task.task_id], end_sprint, end_date, "in_quarter", None)
-        )
+        elif task_id in deferred:
+            code, text, details = reasons[task_id]
+            schedule.append(
+                ScheduleRow(
+                    task_id, None, None, None, "deferred_next_pi",
+                    legacy_reason(code, details), code, text, details,
+                )
+            )
+        else:
+            end_sprint = ends[task_id]
+            end_date = inputs.sprints.get(end_sprint, (None, None))[1]
+            text, details = explain_planned(task)
+            schedule.append(
+                ScheduleRow(
+                    task_id, starts[task_id], end_sprint, end_date, "in_quarter", None,
+                    REASON_PLANNED, text, details,
+                )
+            )
 
     assignments = [_round_hours(row) for task in ordered for row in placed.get(task.task_id, [])]
     return _assemble(
@@ -952,7 +1374,20 @@ def build_plan(
             "dependency_mode": dependency_mode,
             "initiative_mode": initiative_mode,
             "replan_floor": replan_floor,
+            "sp_model": "flow",
+            "repack": initiative_mode == INITIATIVE_MODE_GREEDY,
+            "next_pi_check": next_pi_check,
+            "pi_closed": pi_closed,
         },
+        sp_shares=tuple(
+            (task.task_id, n, sp)
+            for task in ordered
+            for n, sp in sorted(sp_shares.get(task.task_id, {}).items())
+        ),
+        lower_bounds={
+            task.task_id: lower_bound(task) for task in ordered if task.task_id not in starts
+        },
+        pi_closed=pi_closed,
     )
 
 
@@ -976,6 +1411,10 @@ def _assemble(
     assignments: list[Assignment],
     baseline_starts: dict[str, int],
     modes: dict[str, Any] | None = None,
+    *,
+    sp_shares: tuple[tuple[str, int, Decimal], ...] = (),
+    lower_bounds: dict[str, int] | None = None,
+    pi_closed: bool = False,
 ) -> Plan:
     """Собирает `Plan`: алерты, KPI, базовая линия, слепок состояния, params.
 
@@ -986,8 +1425,11 @@ def _assemble(
     in_quarter = [row for row in schedule if row.decision == "in_quarter"]
     deferred = [row for row in schedule if row.decision != "in_quarter"]
 
-    alerts = _build_alerts(inputs, schedule, baseline_starts)
-    kpis = _build_kpis(inputs, schedule, baseline_starts)
+    alerts = _build_alerts(
+        inputs, schedule, baseline_starts,
+        assignments=assignments, lower_bounds=lower_bounds or {}, as_of_sprint=as_of_sprint,
+    )
+    kpis = _build_kpis(inputs, schedule, baseline_starts, as_of_sprint=as_of_sprint)
     states = _build_states(inputs, schedule, as_of_sprint)
     baseline = (
         [
@@ -1068,11 +1510,18 @@ def _assemble(
         "initiatives_planned": len(by_initiative),
         "initiatives_complete": len(complete_initiatives),
         "initiatives_partial": partial_initiatives,
+        "cancelled": sum(1 for row in schedule if row.decision == "cancelled"),
+        "reasons": dict(sorted(Counter(row.reason_code for row in schedule if row.reason_code).items())),
+        "actuals_upload_id": inputs.actuals_upload_id,
+        "last_reported_sprint": inputs.last_reported_sprint,
     }
     params.update(modes or {})
+    reason_summary = ", ".join(
+        f"{code} {count}" for code, count in params["reasons"].items() if code != "PLANNED"
+    )
     note = (
         f"{len(in_quarter)} из {len(inputs.tasks)} живых задач в квартале, "
-        f"{len(deferred)} перенесено (M2/M3); инициатив целиком "
+        f"{len(deferred)} не в квартале ({reason_summary or 'нет'}); инициатив целиком "
         f"{len(complete_initiatives)} из {len(by_initiative)}"
         f"{f', частично {len(partial_initiatives)}' if partial_initiatives else ''}; "
         f"алертов {len(alerts)}; займов {loan_hh} ЧЧ; замещения отклонены (ответ №2, ADR-010)"
@@ -1080,7 +1529,8 @@ def _assemble(
     return Plan(
         pi_id=inputs.pi_id,
         as_of_sprint=as_of_sprint,
-        status="ok" if in_quarter else "infeasible",
+        # Итог квартала (факт за последний спринт) — законный прогон, а не сбой.
+        status="ok" if in_quarter or pi_closed else "infeasible",
         note=note,
         params=params,
         schedule=tuple(schedule),
@@ -1089,82 +1539,138 @@ def _assemble(
         kpis=tuple(kpis),
         baseline=tuple(baseline),
         states=tuple(states),
+        sp_shares=sp_shares,
+        actuals_upload_id=inputs.actuals_upload_id,
     )
 
 
 def _build_alerts(
-    inputs: Inputs, schedule: list[ScheduleRow], baseline_starts: dict[str, int]
+    inputs: Inputs,
+    schedule: list[ScheduleRow],
+    baseline_starts: dict[str, int],
+    *,
+    assignments: list[Assignment] | tuple[Assignment, ...] = (),
+    lower_bounds: dict[str, int] | None = None,
+    as_of_sprint: int = 0,
 ) -> list[AlertRow]:
-    """Алерты трёх уровней из онбординга.
+    """Три типа рисков из ТЗ.
 
-    red — инициатива не укладывается в квартал; orange — по роли не хватает
-    людей; yellow — каскадный сдвиг на пересчёте (появляется, когда есть с чем
-    сравнивать: расписание базового прогона).
+    * orange — «дефицит специалистов на следующий спринт»: потребность роли на
+      спринт, который начинается сейчас (часы, уже поставленные на него, плюс
+      остаток задач, которые могли бы в нём стартовать, но не получили
+      специалиста), больше фонда этой роли в спринте;
+    * red — «выход прогнозной даты завершения за пределы квартала»: инициатива,
+      у которой есть задачи вне квартала; для целей первоначального плана это
+      «цель квартала под угрозой»;
+    * yellow — «сдвиг цепочки зависимых задач»: задача с зависимыми стартует
+      позже, чем в первоначальном плане; в payload — причина сдвига.
     """
     by_id = {task.task_id: task for task in inputs.tasks}
     fte = Decimal(inputs.fte_hours_per_sprint)
+    lower_bounds = lower_bounds or {}
+    staffed = {role_id for (_engineer_id, role_id) in inputs.coverage}
     alerts: list[AlertRow] = []
 
-    # --- orange: роли не хватает людей (замещений нет — строгий режим) -----
-    demand: dict[int, Decimal] = defaultdict(Decimal)
-    tasks_of_role: dict[int, list[str]] = defaultdict(list)
-    names: dict[int, str] = {}
-    first_sprint: dict[int, int] = {}
-    for task in inputs.tasks:
-        for role_id, hours in task.remaining.items():
-            if hours <= 0:
+    # --- orange: дефицит специалистов на следующий спринт -------------------
+    next_sprint = max(1, as_of_sprint)
+    if next_sprint <= inputs.sprint_count:
+        factor = inputs.sprint_factors.get(next_sprint, Decimal("1"))
+        supply: dict[int, Decimal] = defaultdict(Decimal)
+        for engineer in inputs.engineers:
+            supply[engineer.role_id] += engineer.total_capacity_rate * fte * factor
+        planned: dict[int, Decimal] = defaultdict(Decimal)
+        for row in assignments:
+            if row.sprint_no == next_sprint:
+                planned[row.role_id] += row.hours
+        unmet: dict[int, Decimal] = defaultdict(Decimal)
+        unmet_tasks: dict[int, list[str]] = defaultdict(list)
+        names: dict[int, str] = {}
+        for row in schedule:
+            task = by_id.get(row.task_id)
+            if task is None or row.decision == "in_quarter":
                 continue
-            demand[role_id] += hours
-            tasks_of_role[role_id].append(task.task_id)
-            names[role_id] = task.role_names.get(role_id, str(role_id))
-            first_sprint[role_id] = min(
-                first_sprint.get(role_id, task.earliest_start_sprint), task.earliest_start_sprint
+            if lower_bounds.get(row.task_id, next_sprint + 1) > next_sprint:
+                continue  # задача и так не могла стартовать в этом спринте
+            cause = row.reason_details.get("cause_code", row.reason_code)
+            if cause == REASON_ROLE_NOT_IN_STAFF:
+                roles = [role_id for role_id in task.needed if role_id not in staffed]
+            elif cause == REASON_ROLE_HOURS:
+                by_name = {name: role_id for role_id, name in task.role_names.items()}
+                roles = [
+                    by_name[item["role"]]
+                    for item in row.reason_details.get("shortages", [])
+                    if item["role"] in by_name
+                ]
+            else:
+                continue
+            for role_id in roles:
+                unmet[role_id] += task.needed.get(role_id, Decimal("0"))
+                unmet_tasks[role_id].append(task.task_id)
+                names[role_id] = task.role_names.get(role_id, str(role_id))
+        for role_id in sorted(unmet):
+            need = planned[role_id] + unmet[role_id]
+            have = supply.get(role_id, Decimal("0"))
+            if need <= have:
+                continue
+            tail = (
+                "в штате нет ни одного специалиста — нужен наём или дообучение"
+                if have == 0
+                else f"не хватает {_q(need - have)} ЧЧ"
+            )
+            alerts.append(
+                AlertRow(
+                    sprint_no=next_sprint,
+                    level="orange",
+                    alert_type="role_deficit",
+                    entity_type="role",
+                    entity_id=names[role_id],
+                    message=(
+                        f"спринт {next_sprint}: роли «{names[role_id]}» нужно {_q(need)} ЧЧ "
+                        f"({_q(planned[role_id])} уже в плане + {_q(unmet[role_id])} на задачах, "
+                        f"которые ждут этот ресурс), доступно {_q(have)} ЧЧ — {tail}"
+                    ),
+                    payload={
+                        "role_id": role_id,
+                        "role_name": names[role_id],
+                        "sprint_no": next_sprint,
+                        "demand_hh": str(need),
+                        "planned_hh": str(planned[role_id]),
+                        "unmet_hh": str(unmet[role_id]),
+                        "supply_hh": str(have),
+                        "tasks": sorted(unmet_tasks[role_id]),
+                        "verdict": "НАЙМ: закрыть некем" if have == 0 else "НАЙМ: не хватает часов",
+                        "reason": "замещения ролей отклонены организаторами (ответ №2, ADR-010)",
+                    },
+                )
             )
 
-    supply: dict[int, Decimal] = defaultdict(Decimal)
-    for engineer in inputs.engineers:
-        # Фонд за квартал — через fund_factor (92/14 = 6.5714), а не sprint_count:
-        # иначе короткий 7-й спринт приписал бы роли лишние 8 дней работы.
-        supply[engineer.role_id] += (
-            engineer.total_capacity_rate * fte * inputs.fund_factor
-        )
-
-    for role_id in sorted(demand):
-        need = demand[role_id]
-        have = supply.get(role_id, Decimal("0"))
-        if need <= have:
-            continue
-        alerts.append(
-            AlertRow(
-                sprint_no=max(1, first_sprint[role_id]),
-                level="orange",
-                alert_type="role_deficit",
-                entity_type="role",
-                entity_id=names[role_id],
-                message=(
-                    f"роль «{names[role_id]}»: {need} ЧЧ на {len(tasks_of_role[role_id])} задачах, "
-                    f"фонд {have} ЧЧ — нужен наём или дообучение"
-                ),
-                payload={
-                    "role_id": role_id,
-                    "role_name": names[role_id],
-                    "demand_hh": str(need),
-                    "supply_hh": str(have),
-                    "tasks": sorted(tasks_of_role[role_id]),
-                    "verdict": "НАЙМ: закрыть некем" if have == 0 else "НАЙМ: не хватает часов",
-                    "reason": "замещения ролей отклонены организаторами (ответ №2, ADR-010)",
-                },
-            )
-        )
-
-    # --- red: инициатива не укладывается в квартал -------------------------
-    deferred_of: dict[str, list[str]] = defaultdict(list)
+    # --- red: прогноз выходит за квартал, цель инициативы под угрозой -------
+    base = inputs.baseline_schedule
+    committed: set[str] = set()
+    if base:
+        tasks_of: dict[str, list[str]] = defaultdict(list)
+        for task_id in base:
+            tasks_of[inputs.task_prodf.get(task_id, by_id[task_id].prodf_id if task_id in by_id else "?")].append(task_id)
+        committed = {
+            prodf_id for prodf_id, ids in tasks_of.items()
+            if all(base[task_id][0] == "in_quarter" for task_id in ids)
+        }
+    outside: dict[str, list[ScheduleRow]] = defaultdict(list)
     for row in schedule:
-        if row.decision != "in_quarter":
-            deferred_of[by_id[row.task_id].prodf_id].append(row.task_id)
-    for prodf_id in sorted(deferred_of):
-        task_ids = sorted(deferred_of[prodf_id])
+        if row.decision != "in_quarter" and row.task_id in by_id:
+            outside[by_id[row.task_id].prodf_id].append(row)
+    for prodf_id in sorted(outside):
+        rows = sorted(outside[prodf_id], key=lambda item: item.task_id)
+        task_ids = [row.task_id for row in rows]
         hh = sum((by_id[task_id].demand_hh for task_id in task_ids), Decimal("0"))
+        threatened = prodf_id in committed and as_of_sprint > 0
+        message = (
+            f"{prodf_id}: цель квартала под угрозой — {len(task_ids)} задач из первоначального "
+            f"плана больше не укладываются в 12 недель ({_q(hh)} ЧЧ)"
+            if threatened
+            else f"{prodf_id}: {len(task_ids)} задач перенесено в следующий PI, {hh} ЧЧ "
+            f"не закрыто — инициатива не уложится в квартал"
+        )
         alerts.append(
             AlertRow(
                 sprint_no=inputs.sprint_count,
@@ -1172,24 +1678,48 @@ def _build_alerts(
                 alert_type="deadline_miss",
                 entity_type="initiative",
                 entity_id=prodf_id,
-                message=(
-                    f"{prodf_id}: {len(task_ids)} задач перенесено в следующий PI, "
-                    f"{hh} ЧЧ не закрыто — инициатива не уложится в квартал"
-                ),
-                payload={"deferred_tasks": task_ids, "deferred_hh": str(hh)},
+                message=message,
+                payload={
+                    "deferred_tasks": task_ids,
+                    "deferred_hh": str(hh),
+                    "baseline_committed": prodf_id in committed,
+                    "threatened_goal": threatened,
+                    "reasons": {row.task_id: row.reason_code for row in rows},
+                    "cancelled": [row.task_id for row in rows if row.decision == "cancelled"],
+                },
             )
         )
 
     # --- yellow: сдвиг задачи, у которой есть зависимые ---------------------
     dependents: dict[str, list[str]] = defaultdict(list)
+    blockers_of: dict[str, list[str]] = defaultdict(list)
     for blocking, blocked, _gap in inputs.deps:
         dependents[blocking].append(blocked)
+        blockers_of[blocked].append(blocking)
+    base_starts = dict(baseline_starts) or {
+        task_id: start for task_id, (_d, start, _e) in base.items() if start is not None
+    }
+    current = {row.task_id: row for row in schedule}
     for row in schedule:
-        base = baseline_starts.get(row.task_id)
-        if row.decision != "in_quarter" or base is None or row.start_sprint is None:
+        base_start = base_starts.get(row.task_id)
+        if row.decision != "in_quarter" or base_start is None or row.start_sprint is None:
             continue
-        if row.start_sprint <= base or not dependents.get(row.task_id):
+        if row.start_sprint <= base_start or not dependents.get(row.task_id):
             continue
+        base_end = base.get(row.task_id, (None, None, None))[2]
+        shifted_blockers = [
+            b for b in blockers_of.get(row.task_id, ())
+            if b in current and b in base_starts
+            and (current[b].start_sprint or 0) > base_starts[b]
+        ]
+        if inputs.last_reported_sprint and base_end is not None and base_end <= inputs.last_reported_sprint:
+            cause, cause_text = "own_slip", (
+                f"не закрыта к концу спринта {inputs.last_reported_sprint}, как было в плане"
+            )
+        elif shifted_blockers:
+            cause, cause_text = "dependency", f"сдвинулась блокирующая {', '.join(shifted_blockers)}"
+        else:
+            cause, cause_text = "capacity", "ресурс перераспределён после отклонений других задач"
         alerts.append(
             AlertRow(
                 sprint_no=row.start_sprint,
@@ -1198,13 +1728,16 @@ def _build_alerts(
                 entity_type="task",
                 entity_id=row.task_id,
                 message=(
-                    f"{row.task_id} сдвинулась со спринта {base} на {row.start_sprint} "
-                    f"и тянет {len(dependents[row.task_id])} зависимых задач"
+                    f"{row.task_id} сдвинулась со спринта {base_start} на {row.start_sprint} "
+                    f"и тянет {len(dependents[row.task_id])} зависимых задач — {cause_text}"
                 ),
                 payload={
-                    "baseline_start_sprint": base,
+                    "baseline_start_sprint": base_start,
                     "new_start_sprint": row.start_sprint,
                     "dependents": sorted(dependents[row.task_id]),
+                    "cause": cause,
+                    "cause_text": cause_text,
+                    "reported_sprint": inputs.last_reported_sprint,
                 },
             )
         )
@@ -1212,117 +1745,176 @@ def _build_alerts(
 
 
 def _build_kpis(
-    inputs: Inputs, schedule: list[ScheduleRow], baseline_starts: dict[str, int]
+    inputs: Inputs,
+    schedule: list[ScheduleRow],
+    baseline_starts: dict[str, int],
+    *,
+    as_of_sprint: int = 0,
 ) -> list[KpiRow]:
-    """Три KPI с нормами из онбординга.
+    """KPI по формулам ТЗ (ADR-023). Прогноз и факт — разные строки (`kind`).
 
-    `pi_predictability` — доля инициатив, которые попадут в квартал целиком:
-    знаменатель — инициативы с живыми задачами (все они были в плане Недели 0),
-    числитель — те, где ВСЕ живые задачи получили `in_quarter`.
+    * «Процент выполнения квартального плана» = инициативы, завершённые в
+      течение 12 недель / инициативы, включённые в первоначальный план × 100%.
+      Включена в план = ВСЕ её живые задачи Недели 0 стоят в квартале: только
+      такую инициативу план обещал завершить. Прогноз — по текущему прогону,
+      факт — по загруженным результатам спринтов.
+    * «Выполнение плана спринта» = фактически выполненные SP / первоначально
+      запланированные SP × 100%. Запланировано на спринт = SP задач, которые
+      первоначальный план закрывает в этом спринте. Для спринтов с загруженным
+      фактом — факт, для остальных — прогноз текущего прогона.
+    * Bus Factor — по компетенциям (ТЗ): минимум носителей по навыкам,
+      чья роль нужна бэклогу. Это состояние, а не прогноз: kind = actual.
 
-    `say_do_ratio` — по каждому спринту: сколько SP из обещанного на этот спринт
-    в нём действительно стартует. Обещание — расписание базового прогона
-    (`plan_baseline`, ADR-004). На первом прогоне обещание и есть план, поэтому
-    100%; на пересчёте задача, уехавшая из своего спринта, роняет показатель
-    именно того спринта, который был обещан.
+    Первоначальный план — канонический базовый прогон; пересчёт его не меняет.
     """
-    by_id = {task.task_id: task for task in inputs.tasks}
-    in_quarter = {row.task_id: row.start_sprint for row in schedule if row.decision == "in_quarter"}
+    current = {row.task_id: row for row in schedule}
+    sp_of: dict[str, Decimal] = {task_id: sp for task_id, _st, sp, _rem in inputs.all_tasks}
+    sp_of.update({task.task_id: task.estimation_sp for task in inputs.tasks})
+    status_of = {task_id: status for task_id, status, _sp, _rem in inputs.all_tasks}
+    prodf_of = dict(inputs.task_prodf)
+    prodf_of.update({task.task_id: task.prodf_id for task in inputs.tasks})
 
-    by_initiative: dict[str, list[str]] = defaultdict(list)
-    for task in inputs.tasks:
-        by_initiative[task.prodf_id].append(task.task_id)
-    completed = {
-        prodf_id
-        for prodf_id, task_ids in by_initiative.items()
-        if all(task_id in in_quarter for task_id in task_ids)
-    }
-    predictability = (
-        (Decimal(len(completed)) / Decimal(len(by_initiative)) * 100).quantize(Decimal("0.01"))
-        if by_initiative
-        else Decimal("0")
+    if inputs.baseline_schedule:
+        base = dict(inputs.baseline_schedule)
+        base_source = "канонический базовый прогон"
+    else:
+        base = {row.task_id: (row.decision, row.start_sprint, row.end_sprint) for row in schedule}
+        base_source = "этот прогон" if as_of_sprint == 0 else "этот прогон (базового ещё нет)"
+
+    def pct(numerator: Decimal | int, denominator: Decimal | int) -> Decimal:
+        if not denominator:
+            return Decimal("0.00")
+        return (Decimal(numerator) / Decimal(denominator) * 100).quantize(Decimal("0.01"))
+
+    # --- процент выполнения квартального плана ----------------------------
+    tasks_of: dict[str, list[str]] = defaultdict(list)
+    for task_id in base:
+        tasks_of[prodf_of.get(task_id, "?")].append(task_id)
+    committed = sorted(
+        prodf_id for prodf_id, ids in tasks_of.items() if all(base[t][0] == "in_quarter" for t in ids)
+    )
+    partial = sorted(
+        prodf_id for prodf_id, ids in tasks_of.items()
+        if prodf_id not in committed and any(base[t][0] == "in_quarter" for t in ids)
     )
 
+    def done(task_id: str) -> bool:
+        return status_of.get(task_id) == DONE_STATUS
+
+    on_track = sorted(
+        prodf_id for prodf_id in committed
+        if all(done(t) or (t in current and current[t].decision == "in_quarter") for t in tasks_of[prodf_id])
+    )
+    completed = sorted(prodf_id for prodf_id in committed if all(done(t) for t in tasks_of[prodf_id]))
+    low, high = KPI_TARGETS["pi_predictability"]
+    common = {
+        "formula": "инициативы, завершённые в течение 12 недель / инициативы, включённые в "
+        "первоначальный план × 100%",
+        "committed_initiatives": committed,
+        "committed_n": len(committed),
+        "partial_initiatives": partial,
+        "baseline_source": base_source,
+    }
     kpis: list[KpiRow] = [
         KpiRow(
             sprint_no=inputs.sprint_count,
             kpi_code="pi_predictability",
-            value=predictability,
-            target_min=KPI_TARGETS["pi_predictability"][0],
-            target_max=KPI_TARGETS["pi_predictability"][1],
+            value=pct(len(on_track), len(committed)),
+            target_min=low,
+            target_max=high,
             details={
-                "planned_initiatives": sorted(by_initiative),
-                "completed_initiatives": sorted(completed),
-                "planned_n": len(by_initiative),
-                "completed_n": len(completed),
-                "deferred_tasks_n": len(schedule) - len(in_quarter),
-                "note": "инициатива выполнена, только если ВСЕ её живые задачи попали в квартал",
+                **common,
+                "on_track_initiatives": on_track,
+                "note": "прогноз: все задачи инициативы выполнены или стоят в квартале в этом "
+                "прогоне. Частично включённые в план инициативы в знаменатель не входят — "
+                "план не обещал их завершить",
             },
+            kind="forecast",
         )
     ]
-
-    current = {
-        row.task_id: row.start_sprint
-        for row in schedule
-        if row.decision == "in_quarter" and row.start_sprint is not None
-    }
-    # Обещание: расписание базового прогона; задачи, которых там не было
-    # (добавились в квартал позже), считаем обещанными на их текущий спринт.
-    promise = {**current, **baseline_starts}
-    promised: dict[int, Decimal] = defaultdict(Decimal)
-    for task_id, start_sprint in promise.items():
-        if task_id in by_id:
-            promised[start_sprint] += by_id[task_id].estimation_sp
-
-    for sprint_no in range(1, inputs.sprint_count + 1):
-        need = promised.get(sprint_no, Decimal("0"))
-        done = sum(
-            (
-                by_id[task_id].estimation_sp
-                for task_id, start_sprint in promise.items()
-                if start_sprint == sprint_no
-                and task_id in by_id
-                and current.get(task_id) == sprint_no
-            ),
-            Decimal("0"),
+    if inputs.last_reported_sprint > 0:
+        kpis.append(
+            KpiRow(
+                sprint_no=inputs.sprint_count,
+                kpi_code="pi_predictability",
+                value=pct(len(completed), len(committed)),
+                target_min=low,
+                target_max=high,
+                details={
+                    **common,
+                    "completed_initiatives": completed,
+                    "reported_through_sprint": inputs.last_reported_sprint,
+                    "note": f"факт по загруженным спринтам 1–{inputs.last_reported_sprint}: "
+                    f"выполнены все задачи инициативы. До конца квартала значение промежуточное",
+                },
+                kind="actual",
+            )
         )
+
+    # --- выполнение плана спринта ----------------------------------------
+    planned_sp: dict[int, Decimal] = defaultdict(Decimal)
+    planned_ids: dict[int, list[str]] = defaultdict(list)
+    for task_id, (decision, _start, end) in base.items():
+        if decision == "in_quarter" and end is not None:
+            planned_sp[end] += sp_of.get(task_id, Decimal("0"))
+            planned_ids[end].append(task_id)
+    low, high = KPI_TARGETS["say_do_ratio"]
+    for sprint_no in range(1, inputs.sprint_count + 1):
+        need = planned_sp.get(sprint_no, Decimal("0"))
+        if sprint_no <= inputs.last_reported_sprint:
+            ids = sorted(inputs.done_in_sprint.get(sprint_no, frozenset()))
+            kind, note = "actual", "факт: SP задач, отмеченных выполненными в загрузке за этот спринт"
+        else:
+            ids = sorted(
+                task_id for task_id, row in current.items()
+                if row.decision == "in_quarter" and row.end_sprint == sprint_no
+            )
+            kind, note = "forecast", "прогноз: SP задач, которые этот прогон закрывает в этом спринте"
+        got = sum((sp_of.get(task_id, Decimal("0")) for task_id in ids), Decimal("0"))
+        if need <= 0:
+            note += "; на спринт первоначально ничего не планировали — показатель 100%"
         kpis.append(
             KpiRow(
                 sprint_no=sprint_no,
                 kpi_code="say_do_ratio",
-                value=(
-                    (done / need * 100).quantize(Decimal("0.01"))
-                    if need > 0
-                    else Decimal("100.00")  # нечего было обещать — нечего и проваливать
-                ),
-                target_min=KPI_TARGETS["say_do_ratio"][0],
-                target_max=KPI_TARGETS["say_do_ratio"][1],
+                value=pct(got, need) if need > 0 else Decimal("100.00"),
+                target_min=low,
+                target_max=high,
                 details={
-                    "promised_sp": str(need),
-                    "delivered_sp": str(done),
-                    "note": (
-                        "сравниваем с обещанием Недели 0 (plan_baseline): задача, "
-                        "уехавшая из своего спринта, роняет показатель этого спринта"
-                    ),
+                    "formula": "фактически выполненные SP / первоначально запланированные SP × 100%",
+                    "planned_sp": str(need),
+                    "done_sp": str(got),
+                    "planned_tasks": sorted(planned_ids.get(sprint_no, [])),
+                    "done_tasks": ids,
+                    "note": note,
                 },
+                kind=kind,
             )
         )
 
+    # --- Bus Factor по компетенциям ---------------------------------------
+    in_demand = [(name, bf) for name, bf, used, _sole in inputs.skill_bus_factor if used]
+    low, high = KPI_TARGETS["bus_factor"]
     kpis.append(
         KpiRow(
             sprint_no=inputs.sprint_count,
             kpi_code="bus_factor",
-            value=Decimal(min((bf for _name, bf, _demand in inputs.bus_factor), default=0)),
-            target_min=KPI_TARGETS["bus_factor"][0],
-            target_max=KPI_TARGETS["bus_factor"][1],
+            value=Decimal(min((bf for _name, bf in in_demand), default=0)),
+            target_min=low,
+            target_max=high,
             details={
-                "roles": [
-                    {"role_name": name, "bus_factor": bf, "demand_hh": str(demand)}
-                    for name, bf, demand in inputs.bus_factor
-                ],
-                "critical": [name for name, bf, _demand in inputs.bus_factor if bf <= 1],
-                "note": "значение — минимум по ролям со спросом, разбивка рядом",
+                "method": "по компетенциям: для каждого заявленного навыка — число инженеров, "
+                "которые им владеют; значение — минимум по навыкам, чья роль нужна бэклогу",
+                "competencies_n": len(inputs.skill_bus_factor),
+                "single_holder_n": sum(1 for _n, bf, _u, _s in inputs.skill_bus_factor if bf == 1),
+                "critical_n": sum(1 for _n, _bf, _u, sole in inputs.skill_bus_factor if sole),
+                "critical": sorted(name for name, _bf, _u, sole in inputs.skill_bus_factor if sole),
+                "roles_without_staff": [name for name, bf, _demand in inputs.bus_factor if bf == 0],
+                "note": "«критично» — единственный носитель навыка и единственный специалист "
+                "своей роли: выпал — работу не подхватит никто. Роли без людей в штате — "
+                "отдельная проблема найма",
             },
+            kind="actual",
         )
     )
     return kpis
@@ -1345,6 +1937,8 @@ def _build_states(
             states.append(StateRow(task_id, as_of_sprint, status, remaining, sp, None))
         elif row.decision == "in_quarter":
             states.append(StateRow(task_id, as_of_sprint, status, remaining, sp, row.end_sprint))
+        elif row.decision == "cancelled":
+            states.append(StateRow(task_id, as_of_sprint, "Cancelled", remaining, sp, None))
         else:
             states.append(StateRow(task_id, as_of_sprint, "Deferred", remaining, sp, None))
     return states
@@ -1363,8 +1957,9 @@ def write_plan(plan: Plan) -> int:
     with db.transaction(operation="planner_write") as cur:
         cur.execute(
             """
-            INSERT INTO plan_runs (pi_id, as_of_sprint, algorithm, params, status, note)
-            VALUES (%s, %s, %s, %s::jsonb, %s, %s)
+            INSERT INTO plan_runs (pi_id, as_of_sprint, algorithm, params, status, note,
+                                   actuals_upload_id)
+            VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s)
             RETURNING run_id
             """,
             (
@@ -1374,6 +1969,7 @@ def write_plan(plan: Plan) -> int:
                 json.dumps(plan.params, ensure_ascii=False),
                 plan.status,
                 plan.note,
+                plan.actuals_upload_id,
             ),
         )
         row = cur.fetchone()
@@ -1394,8 +1990,8 @@ def write_plan(plan: Plan) -> int:
             """
             INSERT INTO plan_task_schedule
                 (run_id, task_id, start_sprint, end_sprint, forecast_end_date,
-                 decision, decision_reason)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                 decision, decision_reason, reason_code, reason_text, reason_details)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
             """,
             [
                 (
@@ -1406,10 +2002,19 @@ def write_plan(plan: Plan) -> int:
                     row.forecast_end_date,
                     row.decision,
                     row.decision_reason,
+                    row.reason_code,
+                    row.reason_text,
+                    json.dumps(row.reason_details, ensure_ascii=False),
                 )
                 for row in plan.schedule
             ],
         )
+
+        if plan.sp_shares:
+            cur.executemany(
+                "INSERT INTO plan_task_sp (run_id, task_id, sprint_no, sp) VALUES (%s, %s, %s, %s)",
+                [(run_id, task_id, sprint_no, sp) for task_id, sprint_no, sp in plan.sp_shares],
+            )
 
         if plan.assignments:
             cur.executemany(
@@ -1481,8 +2086,8 @@ def write_plan(plan: Plan) -> int:
         cur.executemany(
             """
             INSERT INTO kpi_snapshots
-                (run_id, sprint_no, kpi_code, value, target_min, target_max, details)
-            VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+                (run_id, sprint_no, kpi_code, value, target_min, target_max, details, kind)
+            VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
             """,
             [
                 (
@@ -1493,6 +2098,7 @@ def write_plan(plan: Plan) -> int:
                     row.target_min,
                     row.target_max,
                     json.dumps(row.details, ensure_ascii=False),
+                    row.kind,
                 )
                 for row in plan.kpis
             ],

@@ -1,0 +1,98 @@
+/**
+ * Дизайн-токены «Маршрутного листа» (docs/UI_DESIGN.md, §2–3).
+ * Светлая тема — весь продукт; тёмная — только звёздная карта,
+ * включается классом .starmap-scope на контейнере экрана.
+ */
+
+:root {
+  /* --- светлая палитра ------------------------------------------------ */
+  --ink: #14213d;
+  --paper: #edf0f3;
+  --surface: #ffffff;
+  --line: #d5dbe2;
+  --muted: #5a6472;
+  --stamp: #c1121f;
+  --wax: #e3b23c;
+  --wax-text: #8a6212;
+  --route: #2a9d8f;
+  --route-text: #1e7268;
+
+  /* --- тёмная палитра (только звёздная карта) -------------------------- */
+  --void: #0b1020;
+  --field: #141b2e;
+  --star: #e8ecf5;
+  --orbit: #7fa6d9;
+  --flare: #ff6b5a;
+  --ember: #ffc857;
+  --bloom: #6ccfa6;
+
+  /* --- шрифты ------------------------------------------------------ */
+  --font-text: 'Golos Text', system-ui, -apple-system, sans-serif;
+  --font-mono: 'PT Mono', ui-monospace, 'SFMono-Regular', monospace;
+
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+/* Весь интерфейс крупнее на 12.5%: размеры Mantine заданы в rem и растут
+   вместе с корнем. Процент, а не px — чтобы уважать настройку браузера. */
+html {
+  font-size: 112.5%;
+}
+
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-text);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Числа в таблицах и планках выравниваются по ширине цифр. */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Видимый фокус клавиатуры — везде, без исключений. */
+:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+/* --- область звёздной карты: тёмная палитра, свой шрифтовой контраст --- */
+.starmap-scope {
+  --scope-bg: var(--void);
+  --scope-panel: var(--field);
+  --scope-fg: var(--star);
+  background: var(--void);
+  color: var(--star);
+  color-scheme: dark;
+  border-radius: 2px;
+}
+
+.starmap-scope .muted {
+  color: #97a3c4;
+}

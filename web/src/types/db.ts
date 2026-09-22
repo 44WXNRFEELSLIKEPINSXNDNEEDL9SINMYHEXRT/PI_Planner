@@ -8,6 +8,17 @@
 export type Json = string | number | boolean | null | Json[] | { [key: string]: Json }
 
 
+/** таблица public.actual_uploads — 7 кол. · Одна загрузка = факт одного спринта. Повторная загрузка за тот же спринт заменяет прежнюю и все более поздние (иначе факт спринта 3 висел бы на старом факте спринта 2). */
+export interface actual_uploads {
+  upload_id: number;
+  pi_id: string;
+  sprint_no: number;
+  source_file: string;
+  source_sha256: string;
+  uploaded_at: string;
+  summary: Json;
+}
+
 /** таблица public.alerts — 9 кол. · red/deadline_miss  — прогноз вылетает за 12-ю неделю, срыв инициативы PRODF; yellow/cascade_shift — сдвиг по цепочке зависимостей, дедлайн пока цел; orange/role_deficit  — потребность по роли на спринт > фонда доступных часов. */
 export interface alerts {
   alert_id: number;
@@ -61,7 +72,7 @@ export interface initiatives {
   priority_rung: number | null;
 }
 
-/** таблица public.kpi_snapshots — 7 кол. · Нормы: pi_predictability 80–100%, say_do_ratio 90–105%, bus_factor > 1. Для bus_factor значение = минимум по критическим технологиям, разбивка в details. */
+/** таблица public.kpi_snapshots — 8 кол. · Нормы: pi_predictability 80–100%, say_do_ratio 90–105%, bus_factor > 1. ТЗ: «прогноз выполнения необходимо отличать от фактического результата» — kind = forecast (по плану) | actual (по загруженному факту). Формулы — ADR-023. */
 export interface kpi_snapshots {
   run_id: number;
   sprint_no: number;
@@ -70,6 +81,7 @@ export interface kpi_snapshots {
   target_min: number | null;
   target_max: number | null;
   details: Json;
+  kind: 'forecast' | 'actual';
 }
 
 /** таблица public.load_batches — 7 кол. · Один прогон ETL. sha256 исходного xlsx — чтобы видеть, на какой версии датасета считали. */
@@ -114,7 +126,7 @@ export interface plan_baseline {
   committed: boolean;
 }
 
-/** таблица public.plan_runs — 8 кол. */
+/** таблица public.plan_runs — 9 кол. */
 export interface plan_runs {
   run_id: number;
   pi_id: string;
@@ -123,10 +135,11 @@ export interface plan_runs {
   params: Json;
   status: 'ok' | 'infeasible' | 'failed';
   note: string | null;
+  actuals_upload_id: number | null;
   created_at: string;
 }
 
-/** таблица public.plan_task_schedule — 7 кол. */
+/** таблица public.plan_task_schedule — 10 кол. */
 export interface plan_task_schedule {
   run_id: number;
   task_id: string;
@@ -135,6 +148,17 @@ export interface plan_task_schedule {
   forecast_end_date: string | null;
   decision: 'in_quarter' | 'deferred_next_pi' | 'cancelled';
   decision_reason: string | null;
+  reason_code: string | null;
+  reason_text: string | null;
+  reason_details: Json;
+}
+
+/** таблица public.plan_task_sp — 4 кол. · Сумма долей по задаче = её estimation_sp. Инвариант SP_OVERFLOW суммирует доли по команде и спринту. */
+export interface plan_task_sp {
+  run_id: number;
+  task_id: string;
+  sprint_no: number;
+  sp: number;
 }
 
 /** таблица public.ref_closure_results — 3 кол. */
@@ -142,6 +166,15 @@ export interface ref_closure_results {
   code: string;
   ord: number;
   label: string;
+}
+
+/** таблица public.ref_decision_reasons — 5 кол. · Почему задача включена, перенесена или отменена. Текст для конкретной задачи — plan_task_schedule.reason_text, разбивка — reason_details. legacy_reason — старый код из справочника расхождений (M2/M3/M4), оставлен для совместимости контракта. */
+export interface ref_decision_reasons {
+  code: string;
+  ord: number;
+  decision: 'in_quarter' | 'deferred_next_pi' | 'cancelled';
+  label: string;
+  legacy_reason: string | null;
 }
 
 /** таблица public.ref_mismatch_reasons — 3 кол. · Причины расхождения планов заказчика и исполнителя. В датасете v1 не используется (заказчик=исполнитель везде) — задел под UI согласования. */
@@ -197,6 +230,24 @@ export interface sprints {
   length_days: number | null;
 }
 
+/** таблица public.task_actual_spent — 4 кол. · Часы, потраченные ЗА ЭТОТ спринт (не накопительно). Складываются по загрузкам. */
+export interface task_actual_spent {
+  upload_id: number;
+  task_id: string;
+  role_id: number;
+  hours: number;
+}
+
+/** таблица public.task_actuals — 6 кол. */
+export interface task_actuals {
+  upload_id: number;
+  task_id: string;
+  status: 'ToDo' | 'InProgress' | 'Done';
+  actual_start: string | null;
+  actual_end: string | null;
+  comment: string | null;
+}
+
 /** таблица public.task_dependencies — 4 кол. · Канонизировано как «A блокирует B» по заголовкам колонок листа. Все 3 типа (has to be done before / is required for / depends on) семантически одинаковы — проверено по смыслу задач, A везде предшествует B (ADR-003). */
 export interface task_dependencies {
   blocking_task_id: string;
@@ -219,6 +270,13 @@ export interface task_role_spent {
   hours: number;
 }
 
+/** таблица public.task_role_spent_seed — 3 кол. */
+export interface task_role_spent_seed {
+  task_id: string;
+  role_id: number;
+  hours: number;
+}
+
 /** таблица public.task_sequence — 5 кол. · Топологический порядок живого графа (Done отброшены), считается один раз при загрузке. Планировщик читает earliest_start_sprint как нижнюю границу и не пересчитывает граф на каждой итерации. ВАЖНО: живых рёбер всего 10 из 19, 27 из 37 задач свободны, глубина ≤2 — зависимости здесь НЕ узкое место. */
 export interface task_sequence {
   task_id: string;
@@ -228,7 +286,7 @@ export interface task_sequence {
   on_critical_path: boolean;
 }
 
-/** таблица public.task_state — 7 кол. · Структурный саттелит — engineer_orbits (кто вокруг кого). Этот — временно́й (что когда было). Ядро tasks остаётся неизменяемым и описательным, вся динамика живёт здесь. */
+/** таблица public.task_state — 7 кол. · Временно́й саттелит: состояние задачи на момент прогона. tasks — ТЕКУЩЕЕ состояние (воспроизводится из датасета и загрузок факта), а здесь — каким его видел каждый прогон. Инварианты сверяют прогон именно с этим слепком, а не с сегодняшним tasks. */
 export interface task_state {
   run_id: number;
   task_id: string;
@@ -264,6 +322,14 @@ export interface tasks {
   committed_week0: boolean;
 }
 
+/** таблица public.tasks_seed_state — 4 кол. · Состояние задач ровно как в загруженном датасете. Точка отсчёта для воспроизведения факта. */
+export interface tasks_seed_state {
+  task_id: string;
+  status: string;
+  actual_start: string | null;
+  actual_end: string | null;
+}
+
 /** таблица public.team_history — 4 кол. · По 2 снимка на команду. Выборка мала — среднее velocity статистически шаткое, оговорить на защите. */
 export interface team_history {
   team_id: string;
@@ -287,7 +353,7 @@ export interface v_backlog_demand {
   demand_hh: number | null;
 }
 
-/** вьюха public.v_bus_factor — 6 кол. */
+/** вьюха public.v_bus_factor — 6 кол. · ПОКРЫТИЕ РОЛЕЙ: сколько инженеров на роль, включая роли без людей в штате (найм). Bus Factor по компетенциям, которого требует ТЗ, — v_bus_factor_skill (ADR-024). */
 export interface v_bus_factor {
   role_id: number | null;
   role_name: string | null;
@@ -297,12 +363,44 @@ export interface v_bus_factor {
   risk: string | null;
 }
 
+/** вьюха public.v_bus_factor_skill — 10 кол. · Bus Factor по компетенциям (ТЗ): число инженеров, заявивших навык. Градация риска: «критично» — единственный носитель, который ещё и единственный специалист своей роли (выпал — работу не подхватит никто, замещения ролей запрещены); «единственный носитель» — навык у одного, но роль есть у других. in_demand — роль носителя нужна живому бэклогу. Покрытие ролей (роли без людей в штате) — отдельно: v_bus_factor, v_role_coverage_org. */
+export interface v_bus_factor_skill {
+  skill_id: number | null;
+  skill_name: string | null;
+  bus_factor: number | null;
+  engineers: string[] | null;
+  teams: string[] | null;
+  roles: string[] | null;
+  roles_demand_hh: number | null;
+  in_demand: boolean | null;
+  sole_in_role: boolean | null;
+  risk: string | null;
+}
+
 /** вьюха public.v_dq_summary — 4 кол. */
 export interface v_dq_summary {
   rule_code: string | null;
   severity: string | null;
   n: number | null;
   example: string | null;
+}
+
+/** вьюха public.v_engineer_absence_risk — 14 кол. · Профиль инженера + «что будет, если он выпадет» в данном прогоне. Замещения ролей запрещены организаторами (ADR-010), поэтому замена = другой инженер той же роли. */
+export interface v_engineer_absence_risk {
+  run_id: number | null;
+  engineer_id: string | null;
+  role_name: string | null;
+  grade: string | null;
+  total_capacity_rate: number | null;
+  teams: string[] | null;
+  role_bus_factor: number | null;
+  unique_skills: string[] | null;
+  unique_critical_skills: string[] | null;
+  planned_hours: number | null;
+  planned_tasks: string[] | null;
+  tasks_without_backup: string[] | null;
+  hours_without_backup: number | null;
+  risk: string | null;
 }
 
 /** вьюха public.v_engineer_role_coverage — 7 кол. · Кто какую роль может закрывать. is_native=false — замещение, показывать в UI явно. efficiency — множитель часов (сейчас везде 1.00). Планировщик ВПРАВЕ игнорировать неродные строки. */
@@ -352,6 +450,26 @@ export interface v_plan_assignment_detail {
   native_role: string | null;
   is_substitution: boolean | null;
   grade: string | null;
+}
+
+/** вьюха public.v_plan_diff — 16 кол. · Сравнение прогона с предыдущим: что изменилось (change_type) и почему (cause, explanation). Ответ на требование ТЗ «какие отклонения вызвали изменения». */
+export interface v_plan_diff {
+  run_id: number | null;
+  prev_run_id: number | null;
+  reported_sprint: number | null;
+  task_id: string | null;
+  prodf_id: string | null;
+  team_id: string | null;
+  prev_decision: string | null;
+  prev_start: number | null;
+  prev_end: number | null;
+  new_decision: string | null;
+  new_start: number | null;
+  new_end: number | null;
+  status_at_run: string | null;
+  change_type: string | null;
+  cause: string | null;
+  explanation: string | null;
 }
 
 /** вьюха public.v_plan_violations — 5 кол. · Приёмка плана: нет строк с severity = error. Строки severity = warning план не отменяют, но требуют отображения в UI. Правила — docs/PLANNER_SPEC.md, раздел 7; разбор ревью M2 — docs/REVIEW_RESPONSE.md. */
@@ -421,6 +539,22 @@ export interface v_satellite_capacity {
   hours_own: number | null;
 }
 
+/** вьюха public.v_sprint_deviation — 12 кол. · По каждой загрузке факта: задачи, которые план держал в этом спринте, и что с ними на деле. «не закрыта в срок» — источник жёлтых и красных алертов следующего пересчёта. */
+export interface v_sprint_deviation {
+  upload_id: number | null;
+  sprint_no: number | null;
+  plan_run_id: number | null;
+  task_id: string | null;
+  team_id: string | null;
+  estimation_sp: number | null;
+  planned_start: number | null;
+  planned_end: number | null;
+  reported_status: string | null;
+  planned_hours: number | null;
+  spent_hours: number | null;
+  deviation: string | null;
+}
+
 /** вьюха public.v_sprint_fund_factor — 6 кол. · Фонд спринта = rate × fte_hours_per_sprint × factor. Короткий спринт даёт МЕНЬШЕ часов, а не «те же 80»: иначе фонд квартала вылез бы за 92 дня календаря. Проверки ENGINEER_OVERLOAD и ORBIT_OVERLOAD берут фонд именно отсюда. */
 export interface v_sprint_fund_factor {
   pi_id: string | null;
@@ -478,8 +612,28 @@ export interface v_team_capacity_sp {
   available_sp_per_pi: number | null;
 }
 
+/** вьюха public.v_team_profile — 15 кол. · Профиль команды для звёздной карты. roles_missing — роли, которые нужны бэклогу команды, но в ней нет ни одного инженера (закрываются займом или наймом). */
+export interface v_team_profile {
+  team_id: string | null;
+  members: number | null;
+  part_time_members: number | null;
+  fte: number | null;
+  hours_per_sprint: number | null;
+  avg_velocity: number | null;
+  available_sp_per_sprint: number | null;
+  available_sp_per_pi: number | null;
+  roles_present: string[] | null;
+  roles_missing: string[] | null;
+  skills_n: number | null;
+  unique_skills: string[] | null;
+  live_tasks: number | null;
+  live_sp: number | null;
+  live_hh: number | null;
+}
+
 /** Все отношения схемы public — таблицы и вьюхи. */
 export type RelationName =
+  | 'actual_uploads'
   | 'alerts'
   | 'dq_issues'
   | 'engineer_orbits'
@@ -493,7 +647,9 @@ export type RelationName =
   | 'plan_baseline'
   | 'plan_runs'
   | 'plan_task_schedule'
+  | 'plan_task_sp'
   | 'ref_closure_results'
+  | 'ref_decision_reasons'
   | 'ref_mismatch_reasons'
   | 'ref_result_options'
   | 'role_aliases'
@@ -501,28 +657,37 @@ export type RelationName =
   | 'roles'
   | 'skills'
   | 'sprints'
+  | 'task_actual_spent'
+  | 'task_actuals'
   | 'task_dependencies'
   | 'task_role_estimates'
   | 'task_role_spent'
+  | 'task_role_spent_seed'
   | 'task_sequence'
   | 'task_state'
   | 'tasks'
+  | 'tasks_seed_state'
   | 'team_history'
   | 'teams'
   | 'v_backlog_demand'
   | 'v_bus_factor'
+  | 'v_bus_factor_skill'
   | 'v_dq_summary'
+  | 'v_engineer_absence_risk'
   | 'v_engineer_role_coverage'
   | 'v_orbit_map'
   | 'v_pi_fund_factor'
   | 'v_plan_assignment_detail'
+  | 'v_plan_diff'
   | 'v_plan_violations'
   | 'v_role_coverage_org'
   | 'v_role_deficit'
   | 'v_role_deficit_effective'
   | 'v_role_supply_hh'
   | 'v_satellite_capacity'
+  | 'v_sprint_deviation'
   | 'v_sprint_fund_factor'
   | 'v_task_board'
   | 'v_task_remaining_hh'
   | 'v_team_capacity_sp'
+  | 'v_team_profile'
