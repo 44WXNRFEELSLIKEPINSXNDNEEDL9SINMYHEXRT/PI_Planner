@@ -6,7 +6,22 @@
  * здесь только короткие подписи-теги.
  */
 import type { RiskLevel } from '../../components/common/RiskRail'
-import type { AlertLevel, AlertType, DiffCause, DiffChangeType } from '../../types/views'
+import type {
+  AlertLevel,
+  AlertType,
+  DiffCause,
+  DiffChangeType,
+  TaskStateStatus,
+} from '../../types/views'
+
+/** Статусы задачи приходят из базы английскими — показываем по-русски. */
+export const STATUS_WORD: Record<TaskStateStatus, string> = {
+  ToDo: 'не начата',
+  InProgress: 'в работе',
+  Done: 'выполнена',
+  Deferred: 'отложена',
+  Cancelled: 'отменена',
+}
 
 export const ALERT_WORD: Record<AlertType, string> = {
   deadline_miss: 'срыв квартала',

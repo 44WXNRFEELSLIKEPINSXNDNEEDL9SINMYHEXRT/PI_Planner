@@ -16,6 +16,13 @@ export type Json = string | number | boolean | null | Json[] | { [key: string]: 
 export type NumericString = string
 
 export type TaskStatus = 'ToDo' | 'InProgress' | 'Done'
+/**
+ * Состояние задачи в разрезе прогона — домен ШИРЕ, чем у `tasks.status`:
+ * `task_state.status` допускает ещё `Deferred` и `Cancelled`
+ * (db/02_contract.sql, CHECK на `task_state`). В `v_plan_diff.status_at_run`
+ * приходит именно он, и `Deferred` там — самое частое значение.
+ */
+export type TaskStateStatus = TaskStatus | 'Deferred' | 'Cancelled'
 export type Grade = 'Junior' | 'Middle' | 'Senior'
 export type Decision = 'in_quarter' | 'deferred_next_pi' | 'cancelled'
 export type AlertLevel = 'red' | 'yellow' | 'orange'
@@ -465,7 +472,7 @@ export interface PlanDiffRow {
   new_decision: Decision | null
   new_start: number | null
   new_end: number | null
-  status_at_run: TaskStatus | null
+  status_at_run: TaskStateStatus | null
   change_type: DiffChangeType
   cause: DiffCause
   explanation: string | null

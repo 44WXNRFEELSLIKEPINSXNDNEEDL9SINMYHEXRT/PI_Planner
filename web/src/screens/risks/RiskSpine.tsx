@@ -59,74 +59,81 @@ export function RiskSpine({
 
   return (
     <div>
-      <div
-        style={{
-          display: 'grid',
-          gridTemplateColumns: sprintGridTemplate(sprints.length, '150px', '46px'),
-          minWidth: 620,
-          borderTop: '1px solid var(--line)',
-          borderLeft: '1px solid var(--line)',
-        }}
-      >
-        <div style={{ display: 'contents' }}>
-          <HeadCell>Спринт</HeadCell>
-          {sprints.map((s) => (
-            <HeadCell key={s.sprint_no} center>
-              <div>{s.sprint_no}</div>
-              <Text size="10px" c="dimmed">
-                {fmtDateShort(s.start_date)}–{fmtDateShort(s.end_date)}
+      {/* Узкий экран: спина квартала прокручивается горизонтально, а не
+          растягивает страницу (docs/UI_DESIGN.md §9 — работает от 360 px). */}
+      <div style={{ overflowX: 'auto' }}>
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: sprintGridTemplate(sprints.length, '150px', '46px'),
+            minWidth: 620,
+            borderTop: '1px solid var(--line)',
+            borderLeft: '1px solid var(--line)',
+          }}
+        >
+          <div style={{ display: 'contents' }}>
+            <HeadCell>Спринт</HeadCell>
+            {sprints.map((s) => (
+              <HeadCell key={s.sprint_no} center>
+                <div>{s.sprint_no}</div>
+                <Text size="10px" c="dimmed">
+                  {fmtDateShort(s.start_date)}–{fmtDateShort(s.end_date)}
+                </Text>
+              </HeadCell>
+            ))}
+            <HeadCell center>всего</HeadCell>
+          </div>
+
+          <div style={{ display: 'contents' }}>
+            <BodyCell>
+              <Text size="xs" c="dimmed">
+                {selected === null
+                  ? 'нажмите на спринт, чтобы отобрать ленту'
+                  : 'нажмите ещё раз, чтобы снять отбор'}
               </Text>
-            </HeadCell>
-          ))}
-          <HeadCell center>всего</HeadCell>
-        </div>
+            </BodyCell>
 
-        <div style={{ display: 'contents' }}>
-          <BodyCell>
-            <Text size="xs" c="dimmed">
-              {selected === null ? 'нажмите на спринт, чтобы отобрать ленту' : 'нажмите ещё раз, чтобы снять отбор'}
-            </Text>
-          </BodyCell>
+            {sprints.map((s) => {
+              const rows = bySprint.get(s.sprint_no) ?? []
+              const tally = tallyOf(rows)
+              const active = selected === s.sprint_no
+              return (
+                <SprintCell
+                  key={s.sprint_no}
+                  active={active}
+                  count={rows.length}
+                  onClick={() => onSelect(active ? null : s.sprint_no)}
+                  label={
+                    rows.length === 0
+                      ? `спринт ${s.sprint_no}: рисков нет`
+                      : `спринт ${s.sprint_no}: ` +
+                        tally.map((t) => `${t.n} ${ALERT_WORD[t.alert_type]}`).join(', ')
+                  }
+                >
+                  {tally.length === 0 ? (
+                    <Text size="xs" c="dimmed">
+                      нет
+                    </Text>
+                  ) : (
+                    tally.map((t) => (
+                      <Group key={t.alert_type} gap={4} wrap="nowrap" justify="center">
+                        <Dot color={LEVEL_COLOR[t.level]} />
+                        <Text size="xs" className="mono tabular">
+                          {t.n}
+                        </Text>
+                      </Group>
+                    ))
+                  )}
+                </SprintCell>
+              )
+            })}
 
-          {sprints.map((s) => {
-            const rows = bySprint.get(s.sprint_no) ?? []
-            const tally = tallyOf(rows)
-            const active = selected === s.sprint_no
-            return (
-              <SprintCell
-                key={s.sprint_no}
-                active={active}
-                count={rows.length}
-                onClick={() => onSelect(active ? null : s.sprint_no)}
-                label={
-                  rows.length === 0
-                    ? `спринт ${s.sprint_no}: рисков нет`
-                    : `спринт ${s.sprint_no}: ` + tally.map((t) => `${t.n} ${ALERT_WORD[t.alert_type]}`).join(', ')
-                }
-              >
-                {tally.length === 0 ? (
-                  <Text size="xs" c="dimmed">
-                    нет
-                  </Text>
-                ) : (
-                  tally.map((t) => (
-                    <Group key={t.alert_type} gap={4} wrap="nowrap" justify="center">
-                      <Dot color={LEVEL_COLOR[t.level]} />
-                      <Text size="xs" className="mono tabular">
-                        {t.n}
-                      </Text>
-                    </Group>
-                  ))
-                )}
-              </SprintCell>
-            )
-          })}
-
-          <BodyCell center>
-            <Text size="sm" className="mono tabular">
-              {alerts.length}
-            </Text>
-          </BodyCell>
+            <BodyCell center>
+              <Text size="sm" className="mono tabular">
+                {alerts.length}
+              </Text>
+            </BodyCell>
+          </div>
         </div>
       </div>
 

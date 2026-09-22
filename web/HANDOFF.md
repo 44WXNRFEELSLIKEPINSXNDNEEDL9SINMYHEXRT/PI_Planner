@@ -58,6 +58,22 @@
    переиспользует `SprintDeviation`, понадобится и на ролях/профилях.
 4. Добавлен `components/common/QueryError.tsx` — экран, читающий 4–6 витрин,
    не должен дублировать проверку 503 руками.
+5. **Исправлен тип в `src/types/views.ts`**: `PlanDiffRow.status_at_run` был
+   объявлен как `TaskStatus` (`ToDo`/`InProgress`/`Done`), а реально приходит
+   из `task_state.status`, где домен шире — добавлены `Deferred` и
+   `Cancelled` (CHECK в `db/02_contract.sql:119`). В живых данных `Deferred` —
+   самое частое значение (28 из 35 строк `v_plan_diff`). Заведён отдельный тип
+   `TaskStateStatus`; `SprintDeviationRow.reported_status` оставлен как
+   `TaskStatus` — он из `task_actuals`, там действительно три значения.
+   Не «упрощать» обратно к одному типу: exhaust-`switch` по `TaskStatus`
+   молча потеряет `Deferred`.
+6. В `web/index.html` добавлена инлайн-иконка (`data:image/svg+xml`, без
+   отдельного файла). Раньше каждый экран ловил `404 /favicon.ico` и две
+   ошибки в консоли — это ломало сигнал проверки из §6 («problems=0»).
+7. Экран «Риски» **проверен в браузере**, не только собран: 0 ошибок консоли
+   на 1440 px и на 390 px, числа совпадают с сервером (13 «срыв квартала» +
+   6 «нехватка роли» + 1 «сдвиг цепочки» = 20 алертов прогона 4; 13 строк
+   отклонений; 5 предупреждений приёмки; 8 изменившихся задач из 35).
 
 ---
 
@@ -294,6 +310,17 @@ src/screens/profiles/ProfilesScreen.tsx — см. §4.3
 - **Дизайн** — «Маршрутный лист», светлая тема везде, тёмная **только** на
   звёздной карте: решение пользователя, зафиксировано в `docs/UI_DESIGN.md`,
   альтернативы не предлагать.
+- **Mantine `Text` рендерит `<p>`** — это главный источник невалидной
+  вложенности. `<Text>` внутри `<Text>` даёт `<p>` в `<p>`: React печатает
+  `In HTML, %s cannot be a descendant of <%s>`, браузер молча ломает разметку.
+  Если внутри значения может оказаться другой `Text`/список — ставь
+  `component="div"` (так сделано в `Row` внутри `risks/AlertCard.tsx`).
+  Проверять скриптом `/tmp/nesting.js` (§6), на глаз это не видно.
+- **`Badge` по умолчанию капсом** (`text-transform: uppercase`), а капс
+  запрещён `docs/UI_DESIGN.md` §6. Ставь
+  `styles={{ label: { textTransform: 'none' } }}` — образец в
+  `risks/PlanChanges.tsx`. Заодно: §6 запрещает «дефолтный вид Mantine»,
+  так что голый `Badge` без правки — уже расхождение с дизайном.
 - **Запреты `docs/UI_SPEC.md` §3** (это список запретов, а не пожеланий):
   не считать фонд квартала арифметикой, не зашивать число спринтов и нормы KPI,
   не пересчитывать `is_loan`/`is_substitution`/`is_native`, не суммировать
@@ -333,30 +360,50 @@ cd web && npx tsc --noEmit && npm run build   # должно быть 0 ошиб
 ```
 
 **Каждый новый экран проверить в headless Chrome** — не на глаз по коду.
-Готовый скрипт: `/tmp/shot_screen.js` (puppeteer-core установлен в
-`/tmp/node_modules`, браузер `/usr/bin/google-chrome`). Он делает
-полностраничный скриншот в `/tmp/shots/<экран>-<ширина>.png`, печатает
-`pageerror`, `console.error`/`warning`, ответы `/api/*` с кодом ≥ 400 и
-дамп `innerText` экрана, и завершается с кодом 1, если нашлась хоть одна
-проблема:
+puppeteer-core установлен в `/tmp/node_modules`, браузер `/usr/bin/google-chrome`.
+Три готовых скрипта:
 
 ```bash
-node /tmp/shot_screen.js starmap 1440 1000
-node /tmp/shot_screen.js kpi     1440 1000
-node /tmp/shot_screen.js roles   1440 1000
-node /tmp/shot_screen.js profiles 1440 1000
-node /tmp/shot_screen.js risks    390 900    # узкий экран: §9 требует работу от 360 px
+# 1. скриншот + консоль. Печатает pageerror, console.error/warning (с
+#    раскрытыми аргументами), ЛЮБОЙ ответ ≥ 400 и дамп innerText экрана.
+#    Код возврата 1, если нашлась хоть одна проблема.
+node /tmp/shot_screen.js starmap  1440 1100
+node /tmp/shot_screen.js kpi      1440 1100
+node /tmp/shot_screen.js roles    1440 1100
+node /tmp/shot_screen.js profiles 1440 1100
+node /tmp/shot_screen.js risks     390 1000   # §9 требует работу от 360 px
+
+# 2. невалидная вложенность HTML (p в p, div в p, button в button…) —
+#    на глаз не видно, а React валит разметку
+node /tmp/nesting.js starmap
+
+# 3. структура и раскладка: заголовки, колонки гридов, линейки риска
+#    (цвет + слово), таблицы, вылезание за вьюпорт, блоки нулевой высоты
+node /tmp/structure.js starmap 1440
+node /tmp/structure.js starmap  390
 ```
+
+Скриншоты падают в `/tmp/shots/<экран>-<ширина>.png`. **Важно: модель в этой
+сессии картинки не видит** — содержимое проверялось дампом `innerText` и
+скриптом структуры, а не взглядом на PNG. Если у следующего разработчика зрение
+есть — посмотреть PNG глазами всё равно стоит: раскладку и контраст скрипт не
+ловит.
+
+Ложное срабатывание, которое можно увидеть: `index.html` грузит Golos Text и
+PT Mono с Google Fonts, поэтому при медленной сети иногда прилетает пара
+`console.error` на шрифты. Это не баг экрана — перезапусти проверку, прежде чем
+что-то чинить (проверено: пять прогонов подряд дали `problems=0`).
 
 Если `/tmp` вычищен: `npm install --no-save puppeteer-core` в `/tmp`
 (НЕ в проекте — в `web/package.json` его быть не должно), паттерн скрипта —
 `page.on('pageerror')`, `page.on('console')`, `page.on('response')`,
-`page.screenshot({ fullPage: true })`.
+`page.screenshot({ fullPage: true })`, `page.evaluate()` для разбора DOM.
 
 Тесты бэкенда в этой итерации **не запускались**: в `.venv` нет pytest, а
 `uv run` отказывается — проект требует `uv >= 0.12`, установлен 0.11.19
 (`uv self update` без согласия пользователя не выполнялся). Если будешь
-трогать бэкенд — сначала реши, как их запускать.
+трогать бэкенд — сначала реши, как их запускать. Фронтенд при этом проверен:
+`npx tsc --noEmit` и `npm run build` — 0 ошибок.
 
 ---
 

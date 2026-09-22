@@ -6,7 +6,7 @@
  */
 import { Table, Text } from '@mantine/core'
 import { RISK_COLOR } from '../../components/common/RiskRail'
-import { deviationTone } from './labels'
+import { STATUS_WORD, deviationTone } from './labels'
 import { fmtHours, fmtSp } from '../../api/wire'
 import type { SprintDeviationRow } from '../../types/views'
 
@@ -48,7 +48,9 @@ export function SprintDeviation({ rows }: { rows: SprintDeviationRow[] }) {
                   ? `${row.planned_start}–${row.planned_end}`
                   : '—'}
               </Table.Td>
-              <Table.Td>{row.reported_status ?? '—'}</Table.Td>
+              <Table.Td>
+                {row.reported_status ? STATUS_WORD[row.reported_status] : '—'}
+              </Table.Td>
               <Table.Td className="tabular">{fmtHours(row.planned_hours)}</Table.Td>
               <Table.Td className="tabular">{fmtHours(row.spent_hours)}</Table.Td>
               <Table.Td>

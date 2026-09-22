@@ -7,7 +7,7 @@
  */
 import { useState } from 'react'
 import { Badge, Group, Stack, Switch, Text } from '@mantine/core'
-import { CAUSE_WORD, CHANGE_WORD } from './labels'
+import { CAUSE_WORD, CHANGE_WORD, STATUS_WORD } from './labels'
 import type { Decision, PlanDiffRow } from '../../types/views'
 
 const DECISION_WORD: Record<Decision, string> = {
@@ -70,7 +70,9 @@ export function PlanChanges({ rows }: { rows: PlanDiffRow[] }) {
               <Text size="xs" c="dimmed" className="mono">
                 {row.prodf_id} · {row.team_id}
               </Text>
-              <Badge variant="outline" size="sm">
+              {/* `textTransform: none` — дефолтный капс Mantine здесь запрещён
+                  (docs/UI_DESIGN.md §6). */}
+              <Badge variant="outline" size="sm" styles={{ label: { textTransform: 'none' } }}>
                 {CHANGE_WORD[row.change_type]}
               </Badge>
               {row.cause && (
@@ -80,7 +82,7 @@ export function PlanChanges({ rows }: { rows: PlanDiffRow[] }) {
               )}
               {row.status_at_run && (
                 <Text size="xs" c="dimmed">
-                  статус {row.status_at_run}
+                  {STATUS_WORD[row.status_at_run]}
                 </Text>
               )}
             </Group>

@@ -71,7 +71,9 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
       <Text size="xs" c="dimmed" style={{ flexShrink: 0, minWidth: 132 }}>
         {label}
       </Text>
-      <Text size="xs" style={{ minWidth: 0 }}>
+      {/* `component="div"`: значение строки бывает списком задач, а Mantine Text
+          рендерит <p> — вложенный <p> недопустим в HTML. */}
+      <Text size="xs" component="div" style={{ minWidth: 0 }}>
         {children}
       </Text>
     </Group>
