@@ -227,6 +227,156 @@ Compose его перезапускает. Каталог, срок хранен
 реплицируемое хранилище, а восстановление из последнего архива следует
 проверять отдельно перед релизом.
 
+### 5.2. Подготовка production-хоста
+
+Минимальные требования: Linux x86_64, Docker Engine с Compose v2, DNS-записи
+для `CADDY_DOMAIN` и `GRAFANA_DOMAIN`, открытые входящие TCP 80/443 и достаточно
+места для Docker volumes и архивов. PostgreSQL, приложение, Prometheus и
+Grafana не публикуют host-порты; наружу смотрит только Caddy.
+
+Создайте `.env` из примера и замените как минимум следующие значения:
+
+```bash
+cp .env.example .env
+chmod 600 .env
+openssl rand -hex 32       # отдельное значение для POSTGRES_PASSWORD
+openssl rand -hex 32       # отдельное значение для GRAFANA_ADMIN_PASSWORD
+```
+
+В `.env` задайте реальные `CADDY_DOMAIN`, `GRAFANA_DOMAIN`, оба пароля и
+абсолютный `BACKUP_DIR` на отдельном диске. Значения `change-me-*`, localhost и
+относительный каталог backups являются блокером production-релиза. Сам `.env`
+не коммитится и не прикладывается к тикету; в CI его должен создавать secret
+manager с правами только у deploy job.
+
+До первого старта проверьте итоговую конфигурацию без вывода секретов в лог:
+
+```bash
+docker compose config --quiet
+docker compose build app migrate
+docker compose pull db backup caddy prometheus grafana
+```
+
+Версии Prometheus и Grafana закреплены точно, но `postgres:17-bookworm`,
+`python:3.14-slim`, `node:22-bookworm-slim` и `caddy:2-alpine` остаются
+плавающими тегами. Для строго воспроизводимого production-релиза registry/CI
+должен публиковать собранный `app` по immutable digest, а базовые образы —
+фиксироваться digest-политикой платформы.
+
+### 5.3. Релиз без потери данных
+
+Перед каждым релизом запишите текущий git SHA и снимите проверенный backup:
+
+```bash
+git rev-parse HEAD
+docker compose up -d db backup
+docker compose restart backup
+docker compose logs --since=10m backup
+```
+
+Дождитесь строки `[backup] completed ...`; имя архива сохраните в release
+ticket. Затем примените миграции ровно одним job и обновите сервисы:
+
+```bash
+docker compose run --rm migrate
+docker compose up -d --build app
+docker compose up -d caddy prometheus grafana backup
+docker compose ps
+```
+
+Текущий `docker-compose.yaml` не передаёт `PI_PLANNER_GIT_SHA` внутрь `app`,
+поэтому `git_sha` в `/api/version` будет `null`. До добавления этой переменной
+в deploy-манифест SHA фиксируется в release ticket вместе с digest образа; это
+известное ограничение, а не повод считать локальный SHA внутри контейнера.
+
+Текущий Compose рассчитан на один экземпляр приложения и допускает короткий
+перерыв при пересоздании `app`. Настоящий zero-downtime требует оркестратора,
+двух реплик, внешней балансировки и readiness-gate; простой `--scale app=2`
+здесь не является готовым решением.
+
+### 5.4. Smoke-тест после релиза
+
+Замените домен и запускайте проверки с машины, которая обращается к сервису
+тем же путём, что пользователь:
+
+```bash
+curl -fsS "https://planner.example.ru/api/livez"
+curl -fsS "https://planner.example.ru/api/health"
+curl -fsS "https://planner.example.ru/api/version"
+test "$(curl -sS -o /dev/null -w '%{http_code}' \
+  "https://planner.example.ru/metrics")" = 404
+curl -fsS "https://grafana.example.ru/api/health"
+docker compose exec -T prometheus promtool check config \
+  /etc/prometheus/prometheus.yml
+docker compose exec -T prometheus wget -qO- \
+  'http://127.0.0.1:9090/api/v1/query?query=up%7Bjob%3D%22pi-planner%22%7D'
+```
+
+Дополнительно откройте один разрешённый `/api/views/{view}`, сверьте версию из
+`/api/version` с release ticket, а также убедитесь, что запрос Prometheus
+возвращает значение 1. Релиз считается принятым только при нуле
+`pi_planner_plan_violations{severity="error"}` и отсутствии firing critical
+rules.
+
+### 5.5. Откат приложения и миграций
+
+Откат приложения — повторный запуск предыдущего immutable image/commit. Перед
+переключением убедитесь, что старая версия совместима с уже применённой схемой.
+SQL-миграции намеренно не имеют автоматического down: откатывать схему вслепую
+опаснее, чем оставить обратно совместимое расширение.
+
+Если миграция разрушительна или старая версия несовместима со схемой:
+
+1. остановите запись/планировщик и приложение;
+2. сохраните аварийный dump текущей базы отдельно;
+3. восстановите последний проверенный дорелизный dump по разделу 5.6;
+4. запустите предыдущую версию приложения;
+5. повторите smoke-тест раздела 5.4.
+
+Любое удаление/переименование колонки выполняется только двухфазно: сначала
+релиз, умеющий читать обе схемы, затем миграция и лишь в следующем релизе
+удаление старого контракта.
+
+### 5.6. Восстановление PostgreSQL из dump
+
+Восстановление перезаписывает данные, поэтому сначала остановите сервисы,
+которые читают или меняют БД, и сохраните аварийную копию. Пример рассчитан на
+архив custom format из `BACKUP_DIR`:
+
+Команды ниже предполагают, что `POSTGRES_USER` и `POSTGRES_DB` уже экспортированы
+из защищённого окружения и указывают на точные значения:
+
+```bash
+docker compose stop app backup
+docker compose exec -T db pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  -Fc --no-owner --no-privileges > pre-restore-emergency.dump
+docker compose exec -T db dropdb -U "$POSTGRES_USER" --if-exists "$POSTGRES_DB"
+docker compose exec -T db createdb -U "$POSTGRES_USER" "$POSTGRES_DB"
+docker compose exec -T db pg_restore -U "$POSTGRES_USER" \
+  -d "$POSTGRES_DB" --exit-on-error --no-owner --no-privileges \
+  < /absolute/path/to/pi_planner-YYYYMMDDTHHMMSSZ.dump
+docker compose run --rm migrate
+docker compose up -d app backup
+```
+
+Не используйте неразрешённые переменные или glob вместо конкретного имени dump.
+После восстановления повторите smoke-тест и SQL-приёмку; аварийный dump
+удаляйте только после подтверждения владельца данных.
+
+### 5.7. Эксплуатационный чек-лист
+
+| Периодичность | Проверка | Критерий |
+|---|---|---|
+| каждый релиз | миграции, health, версия, Prometheus rules | все команды завершились с кодом 0 |
+| ежедневно | возраст и restore-проверка backup | последний успех моложе 26 часов |
+| еженедельно | место на дисках/volumes, firing alerts | запас диска не меньше 30%, critical отсутствуют |
+| ежемесячно | ручное восстановление в изолированную БД | схема и ключевые таблицы читаются |
+| перед обновлением образов | release notes и backup | есть проверенный dump и план отката |
+
+RPO текущей схемы backup — до 24 часов, RTO заранее не гарантирован и должен
+быть измерен учебным восстановлением. Уменьшение `BACKUP_INTERVAL_SECONDS`
+снижает RPO, но не заменяет вынос архивов с хоста и контроль свободного места.
+
 ## 6. Что легко сломать (проверено на живых данных ДС)
 
 | Симптом | Причина | Что делать |

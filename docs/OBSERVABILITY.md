@@ -333,3 +333,60 @@ Prometheus хранит не более 15 дней и 2 GB по умолчан�
 Текущие alert rules отображаются в Prometheus, но уведомления пока никуда не
 отправляются: для маршрутизации в Telegram, email или Slack потребуется
 Alertmanager.
+
+## 10. Что автоматизировано, а что ещё нет
+
+Текущий стек честно разделяется на работающую основу и следующие этапы:
+
+| Возможность | Статус | Последствие |
+|---|---|---|
+| scrape метрик приложения | работает | Prometheus видит process, HTTP, DB и бизнес-метрики |
+| rules `ops/prometheus/rules/pi-planner.yml` | работают | firing виден в UI/API Prometheus |
+| datasource Grafana | provisioned | запросы можно строить сразу после старта |
+| dashboard Grafana | не provisioned | панели из раздела 7 нужно создать и экспортировать в репозиторий |
+| Alertmanager | не подключён | firing alert не отправляет уведомление дежурному |
+| `backup.prom` | файл создаётся, но не scrape-ится | backup контролируется по логам и файлу до подключения textfile collector |
+| PostgreSQL/container/TLS exporters | не подключены | нет метрик locks, disk, restart count и срока сертификата |
+| централизованные логи | не подключены | JSON доступен через `docker compose logs`, но не хранится в Loki |
+
+Поэтому выражения backup из раздела 6 являются будущим контрактом, а не
+активными rules: добавлять их в `pi-planner.yml` можно только одновременно со
+сборщиком `backup.prom`. Иначе Prometheus получит отсутствующий ряд и создаст
+ложное чувство контроля. До этого ежедневная проверка выполняется так:
+
+```bash
+docker compose logs --since=26h backup
+find "${BACKUP_DIR:-./backups}" -maxdepth 1 -name '*.dump' -type f -mtime -2 -ls
+sed -n '1,120p' "${BACKUP_DIR:-./backups}/backup.prom"
+```
+
+## 11. Реакция на алерты
+
+| Alert | Первый шаг | Основная диагностика | Безопасное действие |
+|---|---|---|---|
+| `PiPlannerDown` | проверить `docker compose ps app` | `docker compose logs --since=15m app` и scrape target | перезапустить только `app`, если БД здорова |
+| `PiPlannerDatabaseDown` | проверить health контейнера `db` | логи БД, диск, connections | освободить ресурс/восстановить БД; не лечить рестартами app |
+| `PiPlannerMetricsStale` | открыть `/metrics` из контейнера Prometheus | `pi_planner_db_metrics_error`, latency DB | устранить DB-запрос; не публиковать `/metrics` наружу |
+| `PiPlannerHighHttpErrorRate` | разбить rate по `route,status` | JSON-логи за тот же интервал | откатить последний релиз при корреляции с deploy |
+| `PiPlannerHighApiLatency` | разбить histogram по route | ресурсы app/DB, медленные views | снизить нагрузку; затем профилировать конкретную витрину |
+| `PiPlannerContractViolation` | остановить публикацию нового плана | запросить `v_plan_violations` по `run_id` | исправить вход/алгоритм и создать новый прогон, старый не править |
+| `PiPlannerMigrationsPending` | сравнить image и БД | логи `docker compose run --rm migrate` | применить миграции до обновления app |
+
+При инциденте фиксируются UTC-время, версия из `/api/version`, git SHA, firing
+rules и последние 15 минут логов. Пароли, DSN, полный SQL и персональные данные
+в тикет не копируются.
+
+## 12. Начальные SLI/SLO
+
+До появления реального профиля нагрузки используются стартовые ориентиры:
+
+- доступность API: доля ответов без 5xx/`status="0"`, цель 99.5% за 30 дней;
+- задержка API: p95 меньше 1 секунды на 5-минутном окне;
+- свежесть бизнес-метрик: снимок не старше 120 секунд;
+- целостность плана: ноль нарушений `severity="error"`;
+- резервирование: успешный проверенный dump не старше 26 часов.
+
+Это не обещанный SLA: цели нужно пересмотреть после 2–4 недель наблюдений.
+Плановые окна работ следует учитывать отдельно, а отсутствие трафика не считать
+успехом latency. Для availability-запроса используйте отношение успешных
+запросов к общим, а не среднее значений `up` разных служебных targets.

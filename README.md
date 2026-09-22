@@ -37,6 +37,13 @@ Grafana откроется через Caddy на `https://grafana.localhost`. Pr
 публикует host-порт, а datasource создаётся автоматически. Настройка, проверки
 и контракт метрик описаны в `docs/OBSERVABILITY.md`.
 
+Для production запуск одним `docker compose up` недостаточен: сначала задайте
+боевые домены и секреты, вынесите `BACKUP_DIR` на отдельный диск, выполните
+миграции и smoke-тесты. Пошаговый чек-лист релиза, отката и восстановления — в
+`docs/RUNBOOK.md`, разделы 5.2–5.7. Текущие ограничения мониторинга (нет
+Alertmanager, готовых dashboard и сборщика `backup.prom`) перечислены в
+`docs/OBSERVABILITY.md`, раздел 10.
+
 Перезалив идемпотентен: `seed.sql` начинается с `TRUNCATE … RESTART IDENTITY`,
 гонять можно сколько угодно. Когда организаторы пришлют версию датасета —
 просто положить новый файл и перезапустить ETL.
@@ -194,3 +201,22 @@ SELECT * FROM v_bus_factor WHERE demand_hh > 0 ORDER BY bus_factor, demand_hh DE
 SELECT * FROM v_role_coverage_org WHERE verdict LIKE 'НАЙМ%';   -- 665 ЧЧ, 6 ролей (замещения отклонены)
 SELECT row_counts FROM load_batches ORDER BY batch_id DESC LIMIT 1;
 ```
+
+## Минимальный production-гейт
+
+Перед переключением трафика должны одновременно выполняться условия:
+
+- `docker compose ps` показывает `healthy` для `db`, `app`, `prometheus` и
+  `grafana`, остальные сервисы находятся в состоянии `running`;
+- `docker compose run --rm migrate` завершился с кодом 0;
+- `/api/livez`, `/api/health` и `/api/version` через Caddy отвечают 200, а
+  публичный `/metrics` — 404;
+- Prometheus видит `up{job="pi-planner"} == 1`, а
+  `pi_planner_plan_violations{severity="error"} == 0`;
+- создан свежий dump, и в логе `backup` есть успешная restore-проверка;
+- записаны версия образа/commit SHA и имя последнего проверенного dump — без
+  этого воспроизводимый откат невозможен.
+
+Секреты не передаются в git, Docker image или командной строке CI. `.env`
+содержит только локальные значения и уже исключён через `.gitignore`; в боевом
+окружении его формирует secret-хранилище или защищённый deploy job.
