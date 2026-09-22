@@ -38,6 +38,28 @@ def norm_text(v) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+def split_skills(v) -> list[str]:
+    """Режет skills_declared по запятым ВЕРХНЕГО уровня.
+
+    Запятая внутри скобок — часть навыка: «CI/CD (GitLab, Jenkins)» у ENG-419
+    это один навык, а не «CI/CD (GitLab» и «Jenkins)». Наивный split(",")
+    ломал подсчёт Bus Factor по компетенциям (ADR-006, ADR-024).
+    """
+    out, depth, cur = [], 0, []
+    for ch in str(v or ""):
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth = max(0, depth - 1)
+        if ch == "," and depth == 0:
+            out.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    out.append("".join(cur))
+    return out
+
+
 def num(v) -> float:
     if v is None or v == "":
         return 0.0
@@ -420,7 +442,7 @@ def parse(path: Path):
             engineers[eid] = {"role": canon, "grade": grade, "total": rate}
         orbits.append((eid, team, rate))
 
-        for raw_skill in str(sh.cell(r, ec["skills_declared"]) or "").split(","):
+        for raw_skill in split_skills(sh.cell(r, ec["skills_declared"])):
             s = norm_text(raw_skill)
             if not s:
                 continue
@@ -604,7 +626,9 @@ def emit(D, src_path: Path) -> str:
     w(f"-- sha256:   {sha}")
     w(f"-- ETL:      v{C.ETL_VERSION}   PI_START={C.PI_START}   оценка={C.ESTIMATE_SOURCE}")
     w("BEGIN;")
-    w("TRUNCATE kpi_snapshots, alerts, task_state, plan_assignments, plan_task_schedule,")
+    w("TRUNCATE plan_task_sp, task_actual_spent, task_actuals, actual_uploads,")
+    w("         task_role_spent_seed, tasks_seed_state,")
+    w("         kpi_snapshots, alerts, task_state, plan_assignments, plan_task_schedule,")
     w("         plan_baseline, plan_runs, dq_issues, task_sequence, sprints, pi_periods,")
     w("         team_history, task_dependencies, task_role_spent, task_role_estimates,")
     w("         tasks, initiatives, engineer_skills, engineer_orbits, engineers, teams,")
@@ -666,6 +690,14 @@ def emit(D, src_path: Path) -> str:
           ["batch_id", "entity", "entity_id", "rule_code", "severity", "detail"],
           [(1, *r) for r in dq.rows])
 
+    # Снимок состояния ровно как в датасете: точка отсчёта для факта спринтов
+    # (apply_actuals пересобирает текущее состояние из снимка + загрузок, ADR-021).
+    w("\n-- снимок исходного состояния для воспроизведения факта")
+    w("INSERT INTO tasks_seed_state (task_id, status, actual_start, actual_end)")
+    w("SELECT task_id, status, actual_start, actual_end FROM tasks;")
+    w("INSERT INTO task_role_spent_seed (task_id, role_id, hours)")
+    w("SELECT task_id, role_id, hours FROM task_role_spent;")
+
     w("\n-- синхронизация счётчиков")
     for tbl, col in (("roles", "role_id"), ("skills", "skill_id"),
                      ("load_batches", "batch_id"), ("dq_issues", "issue_id")):
@@ -673,6 +705,22 @@ def emit(D, src_path: Path) -> str:
           f"COALESCE((SELECT MAX({col}) FROM {tbl}), 1), true);")
     w("COMMIT;")
     return "\n".join(o) + "\n", counts
+
+
+def build_seed_sql(src_path: Path) -> tuple[str, dict, dict]:
+    """ETL целиком в памяти: xlsx -> текст seed.sql. Для сервера (загрузка датасета).
+
+    Журнал качества — глобальный объект модуля; в долгоживущем процессе его
+    обязательно обнулять, иначе находки прошлых загрузок уедут в новую.
+    Ошибки структуры листа ETL сообщает через SystemExit — вызывающий код
+    превращает их в ответ 400, а не в падение сервера.
+    """
+    dq.rows = []
+    D = parse(src_path)
+    text, counts = emit(D, src_path)
+    return text, counts, {
+        "error": dq.count("error"), "warning": dq.count("warning"), "info": dq.count("info"),
+    }
 
 
 # ===================================================================== #

@@ -82,6 +82,10 @@ def inputs(
     conflicts: int = 0,
     coverage: dict[tuple[str, int], Decimal] | None = None,
     sprint_lengths: dict[int, int] | None = None,
+    baseline_schedule: dict[str, tuple[str, int | None, int | None]] | None = None,
+    done_in_sprint: dict[int, frozenset[str]] | None = None,
+    last_reported_sprint: int = 0,
+    skill_bus_factor: tuple[tuple[str, int, bool, bool], ...] = (),
 ) -> planner.Inputs:
     """Вход планировщика. Календарь — как в БД: спринты подряд, длина по умолчанию 14.
 
@@ -130,6 +134,13 @@ def inputs(
         estimate_conflicts=conflicts,
         estimate_conflict_warnings=conflicts,
         active_substitutions=0,
+        # Факт спринтов и первоначальный план: без них KPI считаются как прогноз
+        # по этому же прогону (ADR-023).
+        last_reported_sprint=last_reported_sprint,
+        done_in_sprint=done_in_sprint or {},
+        baseline_schedule=baseline_schedule or {},
+        task_prodf={row.task_id: row.prodf_id for row in tasks},
+        skill_bus_factor=skill_bus_factor,
     )
 
 
@@ -232,6 +243,9 @@ def test_pi_fund_is_proportional_to_calendar_length() -> None:
     assert sum(a.hours for a in plan.assignments) == Decimal("525")
     assert plan.schedule[0].end_sprint == 7
 
+    # 526 ЧЧ не помещаются ни в этот квартал, ни в следующий с тем же штатом,
+    # поэтому планировщик не переносит задачу, а рекомендует пересогласовать
+    # её объём (ADR-022): перенос означал бы «в следующий раз получится».
     too_much = planner.build_plan(
         inputs(
             [task("T-1", roles={1: 526})],
@@ -240,7 +254,9 @@ def test_pi_fund_is_proportional_to_calendar_length() -> None:
             sprint_lengths={7: 8},
         )
     )
-    assert too_much.schedule[0].decision == "deferred_next_pi"
+    assert too_much.schedule[0].decision == "cancelled"
+    assert too_much.schedule[0].reason_code == planner.REASON_NOT_FEASIBLE
+    assert "ни в следующий" in too_much.schedule[0].reason_text
     assert too_much.assignments == ()
 
 
@@ -394,6 +410,7 @@ def test_baseline_and_kpis_on_the_first_run() -> None:
             tasks,
             [engineer("ENG-1")],
             bus_factor=(("Роль 1", 1, Decimal("40")),),
+            skill_bus_factor=(("Python", 1, True, True), ("SQL", 3, True, False)),
             all_tasks=(
                 ("A", "ToDo", Decimal("5"), Decimal("40")),
                 ("B", "ToDo", Decimal("5"), Decimal("40")),
@@ -410,16 +427,30 @@ def test_baseline_and_kpis_on_the_first_run() -> None:
 
     by_code = {row.kpi_code: row for row in plan.kpis if row.kpi_code != "say_do_ratio"}
     assert set(by_code) == {"pi_predictability", "bus_factor"}
-    # Инициатива выполнена, только если ВСЕ её задачи в квартале: PRODF-1 да, PRODF-2 нет.
-    assert by_code["pi_predictability"].value == Decimal("50.00")
-    assert by_code["pi_predictability"].target_min == Decimal("80")
-    assert by_code["pi_predictability"].details["completed_initiatives"] == ["PRODF-1"]
+
+    # ТЗ: знаменатель — инициативы, ВКЛЮЧЁННЫЕ В ПЕРВОНАЧАЛЬНЫЙ ПЛАН, а не весь
+    # бэклог. План обещал завершить только PRODF-1 (все её задачи в квартале),
+    # PRODF-2 он завершить не обещал — значит и спроса с него нет.
+    predictability = by_code["pi_predictability"]
+    assert predictability.kind == "forecast"
+    assert predictability.value == Decimal("100.00")
+    assert predictability.target_min == Decimal("80")
+    assert predictability.details["committed_initiatives"] == ["PRODF-1"]
+    assert predictability.details["on_track_initiatives"] == ["PRODF-1"]
+    # Факта ещё не загружали — строки kind = actual быть не должно.
+    assert [row.kind for row in plan.kpis if row.kpi_code == "pi_predictability"] == ["forecast"]
+
+    # Bus Factor считается ПО КОМПЕТЕНЦИЯМ (ТЗ), а не по ролям.
     assert by_code["bus_factor"].value == Decimal("1")
-    assert by_code["bus_factor"].details["critical"] == ["Роль 1"]
+    assert by_code["bus_factor"].kind == "actual"
+    assert by_code["bus_factor"].details["critical"] == ["Python"]
+    assert by_code["bus_factor"].details["single_holder_n"] == 1
+    assert by_code["bus_factor"].target_min == Decimal("2")  # онбординг: Bus Factor > 1
 
     say_do = [row for row in plan.kpis if row.kpi_code == "say_do_ratio"]
     assert [row.sprint_no for row in say_do] == [1, 2, 3, 4, 5, 6]
     assert all(row.value == Decimal("100.00") for row in say_do)
+    assert all(row.kind == "forecast" for row in say_do)
     assert say_do[0].target_min == Decimal("90") and say_do[0].target_max == Decimal("105")
 
     states = {row.task_id: row for row in plan.states}
@@ -466,17 +497,33 @@ def test_yellow_alert_when_a_task_with_dependents_shifts() -> None:
     assert not [alert for alert in first.alerts if alert.level == "yellow"]
 
 
-def test_say_do_ratio_drops_for_the_sprint_that_was_promised() -> None:
-    """Обещали B в спринт 1, а он уехал в 2 — провален именно спринт 1."""
+def test_say_do_ratio_compares_fact_with_the_original_promise() -> None:
+    """ТЗ: фактически выполненные SP / первоначально запланированные SP.
+
+    План Недели 0 обещал закрыть A и B (по 5 SP) в спринте 1. По факту спринта 1
+    выполнена только A — показатель именно первого спринта 50%, и это ФАКТ
+    (kind = actual), а не прогноз.
+    """
     tasks = [task("A", roles={1: 80}, topo=1), task("B", roles={1: 80}, topo=2)]
-    source = inputs(tasks, [engineer("ENG-1")])
+    source = inputs(
+        tasks,
+        [engineer("ENG-1")],
+        baseline_schedule={"A": ("in_quarter", 1, 1), "B": ("in_quarter", 1, 1)},
+        done_in_sprint={1: frozenset({"A"})},
+        last_reported_sprint=1,
+    )
 
-    plan = planner.build_plan(source, as_of_sprint=1, baseline_starts={"A": 1, "B": 1})
+    plan = planner.build_plan(source, as_of_sprint=2, baseline_starts={"A": 1, "B": 1})
 
-    say_do = {row.sprint_no: row.value for row in plan.kpis if row.kpi_code == "say_do_ratio"}
-    assert say_do[1] == Decimal("50.00")  # обещали 10 SP, стартовало 5
-    assert say_do[2] == Decimal("100.00")  # на спринт 2 ничего не обещали
-    assert say_do[3] == Decimal("100.00")
+    say_do = {row.sprint_no: row for row in plan.kpis if row.kpi_code == "say_do_ratio"}
+    assert say_do[1].value == Decimal("50.00")
+    assert say_do[1].kind == "actual"
+    assert say_do[1].details["planned_sp"] == "10" and say_do[1].details["done_sp"] == "5"
+    assert say_do[2].kind == "forecast"  # спринт ещё не отчитан — прогноз
+
+    # Процент выполнения квартала тоже раздваивается: прогноз и факт.
+    kinds = {row.kind for row in plan.kpis if row.kpi_code == "pi_predictability"}
+    assert kinds == {"forecast", "actual"}
 
 
 def test_plan_is_deterministic() -> None:
@@ -636,3 +683,92 @@ def test_objective_and_modes_are_recorded_in_params() -> None:
     assert plan.params["initiatives_planned"] == 1
     assert plan.params["initiatives_complete"] == 1
     assert plan.params["initiatives_partial"] == []
+
+def test_big_task_spreads_its_sp_over_several_sprints() -> None:
+    """Задача крупнее ёмкости спринта растягивается, а не переносится навсегда.
+
+    Пример из онбординга: DB-202 «алгоритм должен растянуть эту задачу минимум
+    на 2 спринта». При прежней модели (все SP в спринт старта) такая задача не
+    попадала в план НИКОГДА, при любых ресурсах (ADR-020).
+    """
+    plan = planner.build_plan(
+        inputs([task("DB-202", sp=8, roles={1: 40})], [engineer("ENG-1")], team_sp={T1: 7})
+    )
+
+    row = plan.schedule[0]
+    assert row.decision == "in_quarter"
+    assert (row.start_sprint, row.end_sprint) == (1, 2)
+    assert dict((sprint, sp) for _task, sprint, sp in plan.sp_shares) == {
+        1: Decimal("7"),
+        2: Decimal("1"),
+    }
+    assert "растянуты" in row.reason_text
+
+
+def test_task_waits_for_a_sprint_where_the_team_has_free_capacity() -> None:
+    """Ёмкость спринта исчерпана — задача начинается позже (поведение сохранено)."""
+    plan = planner.build_plan(
+        inputs(
+            [task("A", sp=5, topo=1), task("B", sp=5, topo=2)],
+            [engineer("ENG-1"), engineer("ENG-2")],
+            team_sp={T1: 5},
+        )
+    )
+
+    assert starts_of(plan) == {"A": 1, "B": 2}
+
+
+def test_repack_uses_capacity_freed_by_deferrals() -> None:
+    """Проход 4: часы, освобождённые переносом, достаются следующей задаче.
+
+    A перенесена (роли нет в штате) и тянет за собой B; освободившиеся 80 ЧЧ
+    получает C, у которой приоритет ниже. Без повторной упаковки C осталась бы
+    перенесённой с причиной «не хватило ресурсов», что было бы неправдой.
+    """
+    tasks = [
+        task("A", rung=90, topo=1, roles={99: 40}),
+        task("B", rung=90, topo=2, roles={1: 80}),
+        task("C", rung=50, topo=3, roles={1: 80}),
+    ]
+    plan = planner.build_plan(
+        inputs(tasks, [engineer("ENG-1")], deps=(("A", "B", 1),), sprint_count=1)
+    )
+
+    decisions = {row.task_id: row.decision for row in plan.schedule}
+    assert decisions == {
+        "A": "deferred_next_pi",
+        "B": "deferred_next_pi",
+        "C": "in_quarter",
+    }
+
+
+def test_every_decision_carries_a_human_explanation() -> None:
+    """ТЗ: объяснять причины включения, переноса и отмены."""
+    tasks = [task("A", topo=1, roles={1: 40}), task("B", topo=2, roles={99: 40})]
+    plan = planner.build_plan(inputs(tasks, [engineer("ENG-1")]))
+
+    rows = {row.task_id: row for row in plan.schedule}
+    assert all(row.reason_code and row.reason_text for row in rows.values())
+
+    assert rows["A"].reason_code == planner.REASON_PLANNED
+    assert "Включена" in rows["A"].reason_text
+    assert rows["A"].reason_details["roles"] == {"Роль 1": ["ENG-1"]}
+
+    assert rows["B"].reason_code == planner.REASON_ROLE_NOT_IN_STAFF
+    assert "в штате нет роли «Роль 99»" in rows["B"].reason_text
+    assert rows["B"].reason_details["missing_roles"] == [{"role": "Роль 99", "hours": "40"}]
+    assert rows["B"].decision_reason == planner.DEFERRED_REASON  # совместимость контракта
+
+
+def test_quarter_end_run_moves_the_rest_to_the_next_pi() -> None:
+    """Факт за последний спринт: планировать больше некуда, но прогон валиден."""
+    plan = planner.build_plan(
+        inputs([task("A", roles={1: 40})], [engineer("ENG-1")], sprint_count=6),
+        as_of_sprint=7,
+    )
+
+    row = plan.schedule[0]
+    assert plan.status == "ok"  # не infeasible: квартал просто закончился
+    assert row.decision == "deferred_next_pi"
+    assert row.reason_code == planner.REASON_PI_CLOSED
+    assert plan.assignments == ()

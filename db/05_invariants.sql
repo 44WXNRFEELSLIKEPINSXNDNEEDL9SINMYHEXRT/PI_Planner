@@ -22,20 +22,34 @@ CREATE VIEW v_plan_violations AS
 -- A. Ёмкость команды в SP (SP засчитываются в start_sprint) ------------
 -- Ёмкость = available_sp_per_sprint × factor СВОЕГО спринта: 7-й спринт
 -- короче (8 дней), значит и SP в нём меньше (ADR-017).
-SELECT s.run_id, 'SP_OVERFLOW'::text AS check_code, 'error'::text AS severity,
-       (t.team_id || ' / спринт ' || s.start_sprint)::text AS entity,
-       ('запланировано ' || SUM(t.estimation_sp) || ' SP при ёмкости '
+SELECT x.run_id, 'SP_OVERFLOW'::text AS check_code, 'error'::text AS severity,
+       (t.team_id || ' / спринт ' || x.sprint_no)::text AS entity,
+       ('запланировано ' || SUM(x.sp) || ' SP при ёмкости '
         || MAX(ROUND(c.available_sp_per_sprint * f.factor, 2))
         || ' SP (полный спринт ' || MAX(c.available_sp_per_sprint)
         || ' × ' || MAX(f.factor) || ')')::text AS detail
+FROM plan_task_sp x
+JOIN tasks t               ON t.task_id = x.task_id
+JOIN plan_runs r           ON r.run_id = x.run_id
+JOIN v_team_capacity_sp c  ON c.team_id = t.team_id
+JOIN v_sprint_fund_factor f ON f.pi_id = r.pi_id AND f.sprint_no = x.sprint_no
+GROUP BY x.run_id, t.team_id, x.sprint_no
+HAVING SUM(x.sp) > MAX(c.available_sp_per_sprint * f.factor)
+
+-- A2. Доли SP задачи не сходятся с её SP (ADR-020) ------------------------
+UNION ALL
+SELECT s.run_id, 'SP_SHARES_MISMATCH', 'error', s.task_id::text,
+       ('сумма долей ' || COALESCE(sh.sp, 0) || ' SP, у задачи ' || t.estimation_sp
+        || ' SP' || CASE WHEN sh.outside > 0 THEN ', доли вне окна задачи: ' || sh.outside ELSE '' END)::text
 FROM plan_task_schedule s
-JOIN tasks t             ON t.task_id = s.task_id
-JOIN plan_runs r         ON r.run_id = s.run_id
-JOIN v_team_capacity_sp c ON c.team_id = t.team_id
-JOIN v_sprint_fund_factor f ON f.pi_id = r.pi_id AND f.sprint_no = s.start_sprint
-WHERE s.decision = 'in_quarter' AND s.start_sprint IS NOT NULL
-GROUP BY s.run_id, t.team_id, s.start_sprint
-HAVING SUM(t.estimation_sp) > MAX(c.available_sp_per_sprint * f.factor)
+JOIN tasks t ON t.task_id = s.task_id
+LEFT JOIN LATERAL (
+    SELECT SUM(x.sp) AS sp,
+           COUNT(*) FILTER (WHERE x.sprint_no NOT BETWEEN s.start_sprint AND s.end_sprint) AS outside
+    FROM plan_task_sp x WHERE x.run_id = s.run_id AND x.task_id = s.task_id
+) sh ON TRUE
+WHERE s.decision = 'in_quarter'
+  AND (COALESCE(sh.sp, 0) <> COALESCE(t.estimation_sp, 0) OR sh.outside > 0)
 
 -- B. Перегрузка инженера: считать по СУММЕ ВСЕХ ОРБИТ ------------------
 -- Фонд спринта — ставка × 80 ЧЧ × factor спринта (короткий 7-й = ×0.5714).
@@ -146,8 +160,10 @@ UNION ALL
 SELECT s.run_id, 'DONE_TASK_SCHEDULED', 'error', s.task_id::text,
        'задача уже Done, планировать её не нужно'::text
 FROM plan_task_schedule s
-JOIN tasks t ON t.task_id = s.task_id
-WHERE t.status = 'Done'
+-- статус НА МОМЕНТ ПРОГОНА: после загрузки факта задача может стать Done,
+-- и старый прогон, где она стояла в плане, не становится от этого ошибочным
+JOIN task_state ts ON ts.run_id = s.run_id AND ts.task_id = s.task_id
+WHERE ts.status = 'Done'
 
 -- L. Спринт за пределами квартала --------------------------------------
 UNION ALL
@@ -163,8 +179,8 @@ UNION ALL
 SELECT r.run_id, 'TASK_MISSING_FROM_PLAN', 'error', t.task_id::text,
        ('статус ' || t.status || ', но решения по задаче нет')::text
 FROM plan_runs r
-CROSS JOIN tasks t
-WHERE t.status IN ('ToDo', 'InProgress')
+JOIN task_state t ON t.run_id = r.run_id           -- живая НА МОМЕНТ ПРОГОНА
+WHERE t.status <> 'Done'
   AND NOT EXISTS (SELECT 1 FROM plan_task_schedule s
                   WHERE s.run_id = r.run_id AND s.task_id = t.task_id)
 
@@ -235,6 +251,13 @@ SELECT s.run_id, 'DEFERRED_WITHOUT_REASON', 'error', s.task_id::text,
 FROM plan_task_schedule s
 WHERE s.decision <> 'in_quarter' AND s.decision_reason IS NULL
 
+-- S2. У решения нет объяснения (ТЗ: причины включения, переноса и отмены) --
+UNION ALL
+SELECT s.run_id, 'DECISION_WITHOUT_EXPLANATION', 'error', s.task_id::text,
+       ('решение ' || s.decision || ' без reason_code/reason_text: UI не объяснит его')::text
+FROM plan_task_schedule s
+WHERE s.reason_code IS NULL OR COALESCE(btrim(s.reason_text), '') = ''
+
 -- T. Базовая линия неполна -----------------------------------------------
 -- Раньше проверялось лишь «есть хотя бы одна строка» (проверка N).
 UNION ALL
@@ -242,7 +265,8 @@ SELECT r.run_id, 'BASELINE_INCOMPLETE', 'error', ('прогон ' || r.run_id)::
        ('живых задач ' || live.n || ', строк baseline ' || b.n
         || ', нулевых SP ' || b.zero_sp)::text
 FROM plan_runs r
-CROSS JOIN LATERAL (SELECT COUNT(*) AS n FROM tasks WHERE status IN ('ToDo','InProgress')) live
+CROSS JOIN LATERAL (SELECT COUNT(*) AS n FROM task_state
+                    WHERE run_id = r.run_id AND status <> 'Done') live
 CROSS JOIN LATERAL (
     SELECT COUNT(*) AS n, COUNT(*) FILTER (WHERE planned_sp <= 0) AS zero_sp
     FROM plan_baseline WHERE run_id = r.run_id
@@ -279,7 +303,7 @@ SELECT r.run_id, 'KPI_INCOMPLETE', 'error', ('прогон ' || r.run_id)::text,
 FROM plan_runs r
 CROSS JOIN pi_periods p
 CROSS JOIN LATERAL (
-    SELECT COUNT(*) FILTER (WHERE kpi_code = 'pi_predictability') AS pred,
+    SELECT COUNT(*) FILTER (WHERE kpi_code = 'pi_predictability' AND kind = 'forecast') AS pred,
            COUNT(*) FILTER (WHERE kpi_code = 'say_do_ratio')      AS say_do,
            COUNT(*) FILTER (WHERE kpi_code = 'bus_factor')        AS bf,
            COUNT(*) FILTER (WHERE value IS NULL)                  AS nulls
@@ -368,7 +392,10 @@ WHERE s.decision = 'in_quarter'
               FROM generate_series(s.start_sprint::int, s.end_sprint::int) g
               WHERE NOT EXISTS (SELECT 1 FROM plan_assignments a
                                 WHERE a.run_id = s.run_id AND a.task_id = s.task_id
-                                  AND a.sprint_no = g));
+                                  AND a.sprint_no = g)
+                AND NOT EXISTS (SELECT 1 FROM plan_task_sp x   -- спринт, где идут только SP, — не дыра
+                                WHERE x.run_id = s.run_id AND x.task_id = s.task_id
+                                  AND x.sprint_no = g));
 
 COMMENT ON VIEW v_plan_violations IS
  'Приёмка плана: нет строк с severity = error. Строки severity = warning план не '

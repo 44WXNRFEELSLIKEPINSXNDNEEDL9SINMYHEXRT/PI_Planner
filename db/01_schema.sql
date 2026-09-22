@@ -8,8 +8,11 @@
 BEGIN;
 
 -- ---------- полный сброс (ETL идемпотентен, датасет ожидается v2) ----
-DROP TABLE IF EXISTS kpi_snapshots, alerts, task_state, plan_assignments,
+DROP FUNCTION IF EXISTS apply_actuals() CASCADE;
+DROP TABLE IF EXISTS plan_task_sp, kpi_snapshots, alerts, task_state, plan_assignments,
     plan_task_schedule, plan_baseline, plan_runs,
+    task_actual_spent, task_actuals, actual_uploads, task_role_spent_seed, tasks_seed_state,
+    ref_decision_reasons,
     dq_issues, task_sequence, sprints, pi_periods, team_history,
     task_dependencies, task_role_spent, task_role_estimates, tasks, initiatives,
     engineer_skills, engineer_orbits, engineers, teams,
@@ -276,4 +279,120 @@ CREATE TABLE dq_issues (
 COMMENT ON TABLE dq_issues IS 'Журнал находок ETL. Не блокирует загрузку — материал для слайда «что не так с исходными данными».';
 CREATE INDEX ix_dq_rule ON dq_issues(rule_code);
 
+-- =====================================================================
+--  7. ПРИЧИНЫ РЕШЕНИЙ ПЛАНИРОВЩИКА (ADR-022)
+--  ТЗ: «объяснять причины включения, переноса и отмены задач».
+--  Статичный справочник: живёт в схеме, ETL его не трогает.
+-- =====================================================================
+CREATE TABLE ref_decision_reasons (
+    code          TEXT PRIMARY KEY,
+    ord           SMALLINT NOT NULL,
+    decision      TEXT     NOT NULL CHECK (decision IN ('in_quarter','deferred_next_pi','cancelled')),
+    label         TEXT     NOT NULL,
+    legacy_reason TEXT  -- без FK: seed.sql делает TRUNCATE ref_mismatch_reasons CASCADE и снёс бы справочник
+);
+COMMENT ON TABLE ref_decision_reasons IS
+ 'Почему задача включена, перенесена или отменена. Текст для конкретной задачи — '
+ 'plan_task_schedule.reason_text, разбивка — reason_details. legacy_reason — старый код '
+ 'из справочника расхождений (M2/M3/M4), оставлен для совместимости контракта.';
+
+-- =====================================================================
+--  8. ФАКТ СПРИНТОВ (ADR-021)
+--  ТЗ: «раз в две недели пользователь загружает фактические результаты
+--  очередного спринта». Загрузки — неизменяемый журнал; текущее состояние
+--  tasks / task_role_spent ВОСПРОИЗВОДИТСЯ из снимка исходного датасета
+--  плюс все загрузки по порядку (apply_actuals). Поэтому перезагрузка
+--  факта за спринт безопасна: состояние пересобирается с нуля.
+-- =====================================================================
+CREATE TABLE tasks_seed_state (
+    task_id      TEXT PRIMARY KEY REFERENCES tasks(task_id) ON DELETE CASCADE,
+    status       TEXT NOT NULL,
+    actual_start DATE,
+    actual_end   DATE
+);
+CREATE TABLE task_role_spent_seed (
+    task_id TEXT         NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+    role_id SMALLINT     NOT NULL REFERENCES roles(role_id),
+    hours   NUMERIC(8,2) NOT NULL CHECK (hours >= 0),
+    PRIMARY KEY (task_id, role_id)
+);
+COMMENT ON TABLE tasks_seed_state IS
+ 'Состояние задач ровно как в загруженном датасете. Точка отсчёта для воспроизведения факта.';
+
+CREATE TABLE actual_uploads (
+    upload_id     SERIAL PRIMARY KEY,
+    pi_id         TEXT        NOT NULL REFERENCES pi_periods(pi_id) ON DELETE CASCADE,
+    sprint_no     SMALLINT    NOT NULL CHECK (sprint_no BETWEEN 1 AND 12),
+    source_file   TEXT        NOT NULL,
+    source_sha256 TEXT        NOT NULL,
+    uploaded_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    summary       JSONB       NOT NULL DEFAULT '{}'::jsonb,
+    UNIQUE (pi_id, sprint_no)
+);
+COMMENT ON TABLE actual_uploads IS
+ 'Одна загрузка = факт одного спринта. Повторная загрузка за тот же спринт заменяет прежнюю '
+ 'и все более поздние (иначе факт спринта 3 висел бы на старом факте спринта 2).';
+
+CREATE TABLE task_actuals (
+    upload_id    INT  NOT NULL REFERENCES actual_uploads(upload_id) ON DELETE CASCADE,
+    task_id      TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+    status       TEXT NOT NULL CHECK (status IN ('ToDo','InProgress','Done')),
+    actual_start DATE,
+    actual_end   DATE,
+    comment      TEXT,
+    PRIMARY KEY (upload_id, task_id)
+);
+CREATE TABLE task_actual_spent (
+    upload_id INT          NOT NULL REFERENCES actual_uploads(upload_id) ON DELETE CASCADE,
+    task_id   TEXT         NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+    role_id   SMALLINT     NOT NULL REFERENCES roles(role_id),
+    hours     NUMERIC(8,2) NOT NULL CHECK (hours >= 0),
+    PRIMARY KEY (upload_id, task_id, role_id)
+);
+COMMENT ON TABLE task_actual_spent IS 'Часы, потраченные ЗА ЭТОТ спринт (не накопительно). Складываются по загрузкам.';
+
+CREATE FUNCTION apply_actuals() RETURNS void LANGUAGE plpgsql AS $fn$
+BEGIN
+    -- 1. назад к датасету
+    UPDATE tasks t
+       SET status = s.status, actual_start = s.actual_start, actual_end = s.actual_end
+      FROM tasks_seed_state s
+     WHERE s.task_id = t.task_id;
+    DELETE FROM task_role_spent;
+    INSERT INTO task_role_spent (task_id, role_id, hours)
+    SELECT task_id, role_id, hours FROM task_role_spent_seed;
+
+    -- 2. статусы и даты: последнее слово — у самой поздней загрузки
+    UPDATE tasks t
+       SET status       = a.status,
+           actual_start = COALESCE(a.actual_start, t.actual_start),
+           actual_end   = CASE WHEN a.status = 'Done'
+                               THEN COALESCE(a.actual_end, t.actual_end) END
+      FROM (SELECT DISTINCT ON (ta.task_id) ta.*
+              FROM task_actuals ta JOIN actual_uploads u ON u.upload_id = ta.upload_id
+             ORDER BY ta.task_id, u.sprint_no DESC) a
+     WHERE a.task_id = t.task_id;
+
+    -- 3. часы копятся по всем загрузкам
+    INSERT INTO task_role_spent (task_id, role_id, hours)
+    SELECT task_id, role_id, SUM(hours) FROM task_actual_spent GROUP BY task_id, role_id
+    ON CONFLICT (task_id, role_id) DO UPDATE SET hours = task_role_spent.hours + EXCLUDED.hours;
+END
+$fn$;
+COMMENT ON FUNCTION apply_actuals() IS
+ 'Пересобирает текущее состояние задач: снимок датасета + все загрузки факта по порядку. '
+ 'Идемпотентна. Зовётся после каждой загрузки факта (app/actuals.py).';
+
 COMMIT;
+
+-- справочник причин — статичный, вне основной транзакции не нужен, но и
+-- ETL его не перезаписывает: TRUNCATE в seed.sql его не касается.
+INSERT INTO ref_decision_reasons (code, ord, decision, label, legacy_reason) VALUES
+  ('PLANNED',              1, 'in_quarter',       'Включена в квартал: хватает ролей, часов и ёмкости команды', NULL),
+  ('ROLE_NOT_IN_STAFF',    2, 'deferred_next_pi', 'В штате нет требуемой роли — нужен наём или дообучение',     'M2'),
+  ('ROLE_HOURS_EXHAUSTED', 3, 'deferred_next_pi', 'Не хватает часов специалистов роли до конца квартала',      'M2'),
+  ('TEAM_SP_EXHAUSTED',    4, 'deferred_next_pi', 'Не хватает ёмкости команды в Story Points',                 'M2'),
+  ('BLOCKED_BY_DEFERRED',  5, 'deferred_next_pi', 'Ждёт задачу, которая сама перенесена',                      'M3'),
+  ('INITIATIVE_ATOMIC',    6, 'deferred_next_pi', 'Перенесена вместе со своей инициативой',                    'M2'),
+  ('PI_CLOSED',            7, 'deferred_next_pi', 'Квартал завершён — остаток уходит в следующий PI',          'M2'),
+  ('NOT_FEASIBLE_NEXT_PI', 8, 'cancelled',        'Не помещается и в следующий квартал — рекомендуем отменить или пересогласовать', 'M4');

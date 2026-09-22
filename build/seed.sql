@@ -3,7 +3,9 @@
 -- sha256:   a618cb80279e9931e7706166082d8322fafd41aefefea722e44d9116a1f2f22e
 -- ETL:      v1.1.0   PI_START=2026-07-01   оценка=matrix_column_sum
 BEGIN;
-TRUNCATE kpi_snapshots, alerts, task_state, plan_assignments, plan_task_schedule,
+TRUNCATE plan_task_sp, task_actual_spent, task_actuals, actual_uploads,
+         task_role_spent_seed, tasks_seed_state,
+         kpi_snapshots, alerts, task_state, plan_assignments, plan_task_schedule,
          plan_baseline, plan_runs, dq_issues, task_sequence, sprints, pi_periods,
          team_history, task_dependencies, task_role_spent, task_role_estimates,
          tasks, initiatives, engineer_skills, engineer_orbits, engineers, teams,
@@ -12,7 +14,7 @@ TRUNCATE kpi_snapshots, alerts, task_state, plan_assignments, plan_task_schedule
 
 -- прогон ETL: 1
 INSERT INTO load_batches (batch_id, source_file, source_sha256, etl_version, pi_start, row_counts) VALUES
-  (1, 'Хакатон_датасетс_правками_по_списку_вопросов_1.xlsx', 'a618cb80279e9931e7706166082d8322fafd41aefefea722e44d9116a1f2f22e', '1.1.0', '2026-07-01', '{"roles": 21, "skills": 117, "teams": 6, "engineers": 30, "engineer_orbits": 34, "engineer_skills": 183, "initiatives": 15, "tasks": 45, "task_role_estimates": 258, "task_role_spent": 24, "task_dependencies": 19, "team_history": 12, "sprints": 7, "dq_issues": 38}');
+  (1, 'Хакатон_датасетс_правками_по_списку_вопросов_1.xlsx', 'a618cb80279e9931e7706166082d8322fafd41aefefea722e44d9116a1f2f22e', '1.1.0', '2026-07-01', '{"roles": 21, "skills": 116, "teams": 6, "engineers": 30, "engineer_orbits": 34, "engineer_skills": 182, "initiatives": 15, "tasks": 45, "task_role_estimates": 258, "task_role_spent": 24, "task_dependencies": 19, "team_history": 12, "sprints": 6, "dq_issues": 38}');
 
 -- роли: 21
 INSERT INTO roles (role_id, canonical_name, role_group) VALUES
@@ -44,7 +46,7 @@ INSERT INTO role_aliases (alias, role_id) VALUES
   ('Разработчик IOS', 12),
   ('Разработчик BigData', 11);
 
--- навыки: 117
+-- навыки: 116
 INSERT INTO skills (skill_id, name, normalized_name) VALUES
   (1, 'Java', 'java'),
   (2, 'Spring Boot', 'spring boot'),
@@ -122,47 +124,46 @@ INSERT INTO skills (skill_id, name, normalized_name) VALUES
   (74, 'REST/gRPC', 'rest/grpc'),
   (75, 'Linux', 'linux'),
   (76, 'Kubernetes', 'kubernetes'),
-  (77, 'CI/CD (GitLab', 'ci/cd (gitlab'),
-  (78, 'Jenkins)', 'jenkins)'),
-  (79, 'Ansible', 'ansible'),
-  (80, 'Terraform', 'terraform'),
-  (81, 'Prometheus', 'prometheus'),
-  (82, 'C#', 'c#'),
-  (83, '.NET Core', '.net core'),
-  (84, 'ASP.NET', 'asp.net'),
-  (85, 'Entity Framework', 'entity framework'),
-  (86, 'MS SQL', 'ms sql'),
-  (87, 'LINQ', 'linq'),
-  (88, 'Microservices', 'microservices'),
-  (89, 'Python', 'python'),
-  (90, 'Hadoop', 'hadoop'),
-  (91, 'Spark', 'spark'),
-  (92, 'Математическая статистика', 'математическая статистика'),
-  (93, 'BI инструменты', 'bi инструменты'),
-  (94, 'PySpark', 'pyspark'),
-  (95, 'Scala', 'scala'),
-  (96, 'Hive', 'hive'),
-  (97, 'Airflow', 'airflow'),
-  (98, 'Оптимизация ETL', 'оптимизация etl'),
-  (99, 'Управление Data-командами', 'управление data-командами'),
-  (100, 'Agile/Scrum', 'agile/scrum'),
-  (101, 'Продуктовые метрики ИИ', 'продуктовые метрики ии'),
-  (102, 'Роадмапы', 'роадмапы'),
-  (103, 'Kafka', 'kafka'),
-  (104, 'Системный анализ', 'системный анализ'),
-  (105, 'Tableau', 'tableau'),
-  (106, 'Математический анализ', 'математический анализ'),
-  (107, 'Pandas', 'pandas'),
-  (108, 'Core', 'core'),
-  (109, 'Spring Core', 'spring core'),
-  (110, 'Бизнес-анализ', 'бизнес-анализ'),
-  (111, 'Сбор требований', 'сбор требований'),
-  (112, 'ТЗ', 'тз'),
-  (113, 'REST/SOAP интеграции', 'rest/soap интеграции'),
-  (114, 'Архитектура ИТ-систем', 'архитектура ит-систем'),
-  (115, 'Функциональное тестирование', 'функциональное тестирование'),
-  (116, 'Регресс', 'регресс'),
-  (117, 'Jira', 'jira');
+  (77, 'CI/CD (GitLab, Jenkins)', 'ci/cd (gitlab, jenkins)'),
+  (78, 'Ansible', 'ansible'),
+  (79, 'Terraform', 'terraform'),
+  (80, 'Prometheus', 'prometheus'),
+  (81, 'C#', 'c#'),
+  (82, '.NET Core', '.net core'),
+  (83, 'ASP.NET', 'asp.net'),
+  (84, 'Entity Framework', 'entity framework'),
+  (85, 'MS SQL', 'ms sql'),
+  (86, 'LINQ', 'linq'),
+  (87, 'Microservices', 'microservices'),
+  (88, 'Python', 'python'),
+  (89, 'Hadoop', 'hadoop'),
+  (90, 'Spark', 'spark'),
+  (91, 'Математическая статистика', 'математическая статистика'),
+  (92, 'BI инструменты', 'bi инструменты'),
+  (93, 'PySpark', 'pyspark'),
+  (94, 'Scala', 'scala'),
+  (95, 'Hive', 'hive'),
+  (96, 'Airflow', 'airflow'),
+  (97, 'Оптимизация ETL', 'оптимизация etl'),
+  (98, 'Управление Data-командами', 'управление data-командами'),
+  (99, 'Agile/Scrum', 'agile/scrum'),
+  (100, 'Продуктовые метрики ИИ', 'продуктовые метрики ии'),
+  (101, 'Роадмапы', 'роадмапы'),
+  (102, 'Kafka', 'kafka'),
+  (103, 'Системный анализ', 'системный анализ'),
+  (104, 'Tableau', 'tableau'),
+  (105, 'Математический анализ', 'математический анализ'),
+  (106, 'Pandas', 'pandas'),
+  (107, 'Core', 'core'),
+  (108, 'Spring Core', 'spring core'),
+  (109, 'Бизнес-анализ', 'бизнес-анализ'),
+  (110, 'Сбор требований', 'сбор требований'),
+  (111, 'ТЗ', 'тз'),
+  (112, 'REST/SOAP интеграции', 'rest/soap интеграции'),
+  (113, 'Архитектура ИТ-систем', 'архитектура ит-систем'),
+  (114, 'Функциональное тестирование', 'функциональное тестирование'),
+  (115, 'Регресс', 'регресс'),
+  (116, 'Jira', 'jira');
 
 -- справочник результатов: 8
 INSERT INTO ref_result_options (code, ord, label) VALUES
@@ -268,7 +269,7 @@ INSERT INTO engineer_orbits (engineer_id, team_id, capacity_rate) VALUES
   ('ENG-429', 'Team-Delta', 1.0),
   ('ENG-430', 'Team-Delta', 1.0);
 
--- стек инженеров: 183
+-- стек инженеров: 182
 INSERT INTO engineer_skills (engineer_id, skill_id) VALUES
   ('ENG-401', 1),
   ('ENG-401', 2),
@@ -389,70 +390,69 @@ INSERT INTO engineer_skills (engineer_id, skill_id) VALUES
   ('ENG-419', 78),
   ('ENG-419', 79),
   ('ENG-419', 80),
-  ('ENG-419', 81),
+  ('ENG-420', 81),
   ('ENG-420', 82),
   ('ENG-420', 83),
   ('ENG-420', 84),
   ('ENG-420', 85),
   ('ENG-420', 86),
   ('ENG-420', 87),
-  ('ENG-420', 88),
   ('ENG-421', 12),
+  ('ENG-421', 88),
   ('ENG-421', 89),
   ('ENG-421', 90),
   ('ENG-421', 91),
   ('ENG-421', 92),
-  ('ENG-421', 93),
+  ('ENG-422', 88),
   ('ENG-422', 89),
-  ('ENG-422', 90),
+  ('ENG-422', 93),
   ('ENG-422', 94),
   ('ENG-422', 95),
   ('ENG-422', 96),
   ('ENG-422', 97),
-  ('ENG-422', 98),
+  ('ENG-423', 98),
   ('ENG-423', 99),
   ('ENG-423', 100),
   ('ENG-423', 101),
-  ('ENG-423', 102),
   ('ENG-424', 1),
   ('ENG-424', 2),
   ('ENG-424', 3),
   ('ENG-424', 45),
   ('ENG-424', 72),
-  ('ENG-424', 103),
+  ('ENG-424', 102),
   ('ENG-425', 12),
   ('ENG-425', 15),
   ('ENG-425', 18),
   ('ENG-425', 19),
   ('ENG-425', 20),
-  ('ENG-425', 104),
+  ('ENG-425', 103),
   ('ENG-426', 12),
-  ('ENG-426', 89),
+  ('ENG-426', 88),
+  ('ENG-426', 104),
   ('ENG-426', 105),
   ('ENG-426', 106),
-  ('ENG-426', 107),
   ('ENG-427', 1),
   ('ENG-427', 4),
   ('ENG-427', 30),
-  ('ENG-427', 86),
+  ('ENG-427', 85),
+  ('ENG-427', 107),
   ('ENG-427', 108),
-  ('ENG-427', 109),
   ('ENG-428', 20),
+  ('ENG-428', 109),
   ('ENG-428', 110),
   ('ENG-428', 111),
   ('ENG-428', 112),
-  ('ENG-428', 113),
   ('ENG-429', 1),
   ('ENG-429', 2),
   ('ENG-429', 7),
   ('ENG-429', 50),
   ('ENG-429', 76),
-  ('ENG-429', 114),
+  ('ENG-429', 113),
   ('ENG-430', 12),
   ('ENG-430', 38),
+  ('ENG-430', 114),
   ('ENG-430', 115),
-  ('ENG-430', 116),
-  ('ENG-430', 117);
+  ('ENG-430', 116);
 
 -- инициативы: 15
 INSERT INTO initiatives (prodf_id, br_id, title, priority_rung) VALUES
@@ -847,17 +847,16 @@ INSERT INTO team_history (team_id, snapshot_date, velocity_achieved, planned_sp)
 
 -- период PI: 1
 INSERT INTO pi_periods (pi_id, start_date, end_date, sprint_count, sprint_length_days, fte_hours_per_sprint) VALUES
-  ('PI-2026-Q3', '2026-07-01', '2026-09-30', 7, 14, 80);
+  ('PI-2026-Q3', '2026-07-01', '2026-09-22', 6, 14, 80);
 
--- спринты: 7
+-- спринты: 6
 INSERT INTO sprints (pi_id, sprint_no, start_date, end_date) VALUES
   ('PI-2026-Q3', 1, '2026-07-01', '2026-07-14'),
   ('PI-2026-Q3', 2, '2026-07-15', '2026-07-28'),
   ('PI-2026-Q3', 3, '2026-07-29', '2026-08-11'),
   ('PI-2026-Q3', 4, '2026-08-12', '2026-08-25'),
   ('PI-2026-Q3', 5, '2026-08-26', '2026-09-08'),
-  ('PI-2026-Q3', 6, '2026-09-09', '2026-09-22'),
-  ('PI-2026-Q3', 7, '2026-09-23', '2026-09-30');
+  ('PI-2026-Q3', 6, '2026-09-09', '2026-09-22');
 
 -- порядок задач: 45
 INSERT INTO task_sequence (task_id, topo_order, depth, earliest_start_sprint, on_critical_path) VALUES
@@ -947,6 +946,12 @@ INSERT INTO dq_issues (batch_id, entity, entity_id, rule_code, severity, detail)
   (1, 'initiatives', 'PRODF-7129', 'RUNG_NOT_UNIFORM', 'warning', 'rung внутри инициативы неоднороден: [75, 83]. Свёрнут через ''max'' -> 83.'),
   (1, 'initiatives', 'PRODF-7131', 'RUNG_NOT_UNIFORM', 'warning', 'rung внутри инициативы неоднороден: [80, 89]. Свёрнут через ''max'' -> 89.'),
   (1, 'initiatives', 'PRODF-7134', 'RUNG_NOT_UNIFORM', 'warning', 'rung внутри инициативы неоднороден: [80, 86]. Свёрнут через ''max'' -> 86.');
+
+-- снимок исходного состояния для воспроизведения факта
+INSERT INTO tasks_seed_state (task_id, status, actual_start, actual_end)
+SELECT task_id, status, actual_start, actual_end FROM tasks;
+INSERT INTO task_role_spent_seed (task_id, role_id, hours)
+SELECT task_id, role_id, hours FROM task_role_spent;
 
 -- синхронизация счётчиков
 SELECT setval(pg_get_serial_sequence('roles','role_id'), COALESCE((SELECT MAX(role_id) FROM roles), 1), true);

@@ -1,5 +1,16 @@
 """HTTP-сервер демо: `/api/*`, `/metrics`, статика из `web/dist`.
 
+Читает сервер только витрины из белого списка. Пишут три маршрута, и только
+они (ТЗ: пользователь загружает датасет и факт спринтов):
+
+* `POST /api/dataset` — xlsx датасета: ETL, заливка, базовый план;
+* `GET  /api/actuals/template?sprint=N` — CSV-шаблон факта спринта;
+* `POST /api/actuals?sprint=N` — факт спринта, пересборка состояния и пересчёт.
+
+Тело загрузки — сам файл (`Content-Type` неважен, имя — в `?filename=`):
+multipart в stdlib Python 3.13 разбирать нечем, а сырое тело отправляется
+из браузера одной строкой `fetch(url, {method: "POST", body: file})`.
+
 Запускается ровно так, как его зовёт `run.bat`:
 
     uv run python -m app.server --port 8000
@@ -49,7 +60,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from app import __version__ as APP_VERSION
-from app import db, views
+from app import db, ingest, views
 from app.metrics import NO_RESPONSE_STATUS, PROMETHEUS_CONTENT_TYPE, Metrics
 
 try:  # версия ETL и PI живут в одном месте — etl/config.py, а не здесь
@@ -85,7 +96,10 @@ MIME_OVERRIDES = {
 # серверу, но наружу его закрывает Caddy (`respond 404`) — см. RUNBOOK.
 # `/api/views` — справочник витрин; сами витрины живут под ним же, но лейблом
 # `route` становится `/api/views/{view}` (см. app/metrics.py).
-KNOWN_API = ("/api/health", "/api/livez", "/api/version", "/api/views", "/metrics")
+KNOWN_API = (
+    "/api/health", "/api/livez", "/api/version", "/api/views",
+    "/api/dataset", "/api/actuals", "/api/actuals/template", "/metrics",
+)
 
 # Реестр метрик один на процесс: Handler создаётся на каждый запрос.
 METRICS = Metrics(
@@ -221,6 +235,78 @@ class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:  # noqa: N802
         self.do_GET()
 
+    # ------------------------------------------------------------------ POST
+    def do_POST(self) -> None:  # noqa: N802
+        """Загрузки. Обвязка метрик и логов — та же, что у GET."""
+        path = urlparse(self.path).path
+        self._route = METRICS.route_label(path)
+        self._status: Any = None
+        self._bytes = 0
+        started = time.perf_counter()
+        METRICS.enter()
+        try:
+            self._upload(path)
+        finally:
+            METRICS.leave()
+            seconds = time.perf_counter() - started
+            status = self._status if self._status is not None else NO_RESPONSE_STATUS
+            METRICS.observe(self.command, self._route, status, seconds)
+            log_event(
+                "http_request",
+                method=self.command,
+                path=path,
+                route=self._route,
+                status=status,
+                duration_ms=round(seconds * 1000, 3),
+                bytes=self._bytes,
+                client=self.address_string(),
+            )
+
+    def _read_body(self) -> bytes:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            raise ingest.UploadError("пустое тело запроса: файл отправляется телом POST")
+        if length > ingest.MAX_UPLOAD_BYTES:
+            raise ingest.UploadError(
+                f"файл больше {ingest.MAX_UPLOAD_BYTES // (1024 * 1024)} МБ"
+            )
+        return self.rfile.read(length)
+
+    def _upload(self, path: str) -> None:
+        query = parse_qs(urlparse(self.path).query)
+        try:
+            if path == "/api/dataset":
+                body = self._read_body()
+                result = ingest.load_dataset(body, self._query_param(query, "filename"))
+            elif path == "/api/actuals":
+                raw_sprint = self._query_param(query, "sprint")
+                if raw_sprint is None or not raw_sprint.isdigit():
+                    raise ingest.UploadError("укажите номер спринта: POST /api/actuals?sprint=N")
+                body = self._read_body()
+                result = ingest.load_actuals(
+                    body, self._query_param(query, "filename"), int(raw_sprint)
+                )
+            else:
+                self._send_json(
+                    HTTPStatus.NOT_FOUND,
+                    {
+                        "error": "not_found",
+                        "message": path,
+                        "known": ["/api/dataset", "/api/actuals?sprint=N"],
+                    },
+                )
+                return
+        except ingest.UploadError as exc:
+            log_event("upload_rejected", level="warning", path=path, message=exc.message)
+            self._send_json(HTTPStatus.BAD_REQUEST, exc.payload())
+            return
+        except Exception as exc:  # noqa: BLE001 — база могла уйти, а фронту нужен ответ
+            log_event("upload_failed", level="error", path=path, error=repr(exc))
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, unavailable_payload(exc))
+            return
+        log_event("upload_ok", path=path, run_id=result.get("plan", {}).get("run_id"))
+        self._send_json(HTTPStatus.OK, result)
+
     # ------------------------------------------------------------------- API
     def _api(self, path: str) -> None:
         if path == "/api/health":
@@ -250,6 +336,27 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/version":
             self._send_json(HTTPStatus.OK, version_payload())
+            return
+
+        if path == "/api/actuals/template":
+            # Шаблон факта спринта: живые задачи и колонки ролей — чтобы
+            # пользователю не пришлось угадывать формат.
+            query = parse_qs(urlparse(self.path).query)
+            raw_sprint = self._query_param(query, "sprint")
+            try:
+                name, body = ingest.actuals_template(
+                    int(raw_sprint) if raw_sprint and raw_sprint.isdigit() else None
+                )
+            except ingest.UploadError as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, exc.payload())
+                return
+            except Exception as exc:  # noqa: BLE001
+                self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, unavailable_payload(exc))
+                return
+            self._respond(
+                HTTPStatus.OK, "text/csv; charset=utf-8", body,
+                extra_headers={"Content-Disposition": f'attachment; filename="{name}"'},
+            )
             return
 
         if path == "/api/views":
@@ -354,7 +461,10 @@ class Handler(BaseHTTPRequestHandler):
         ctype = MIME_OVERRIDES.get(path.suffix.lower()) or "application/octet-stream"
         self._respond(HTTPStatus.OK, ctype, body)
 
-    def _respond(self, status: HTTPStatus, ctype: str, body: bytes) -> None:
+    def _respond(
+        self, status: HTTPStatus, ctype: str, body: bytes,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
         # Факт ответа запоминаем для метрик и лога: `do_GET` смотрит сюда,
         # чтобы отличить «ответили 404» от «ответ не отправился вовсе».
         self._status = int(status)
@@ -365,6 +475,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             # Демо живёт на локальной машине, кэш браузера только мешает правкам.
             self.send_header("Cache-Control", "no-store")
+            for name, value in (extra_headers or {}).items():
+                self.send_header(name, value)
             self.end_headers()
             if self.command != "HEAD":
                 self.wfile.write(body)

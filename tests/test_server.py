@@ -104,6 +104,16 @@ def get(url: str) -> tuple[int, dict[str, str], bytes]:
         return exc.code, dict(exc.headers), exc.read()
 
 
+def post(url: str, body: bytes = b"") -> tuple[int, dict[str, str], bytes]:
+    """POST без исключений на 4xx/5xx: статус — такое же значение, как тело."""
+    request = urllib.request.Request(url, data=body, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=5) as resp:
+            return resp.status, dict(resp.headers), resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, dict(exc.headers), exc.read()
+
+
 def test_health_returns_db_facts(base_url: str) -> None:
     status, headers, body = get(f"{base_url}/api/health")
 
@@ -469,3 +479,34 @@ def test_all_views_share_one_route_label(base_url: str, fake_db) -> None:
         == 3.0
     )
     assert not [key for key in parsed if "v_task_board" in key or "v_orbit_map" in key]
+
+
+# ---------------------------------------------------------------- загрузки
+# ТЗ: датасет и факт спринтов загружает пользователь. Проверки ниже до базы
+# не доходят — они о контракте маршрутов, а не о самом приёме данных
+# (полный цикл проверяется на живой базе: tools/demo_cycle.py).
+def test_unknown_post_route_is_json_404(base_url: str) -> None:
+    status, headers, body = post(f"{base_url}/api/nope", b"x")
+
+    assert status == 404
+    assert headers["Content-Type"].startswith("application/json")
+    payload = json.loads(body.decode("utf-8"))
+    assert payload["error"] == "not_found"
+    assert payload["known"] == ["/api/dataset", "/api/actuals?sprint=N"]
+
+
+def test_actuals_without_sprint_is_rejected(base_url: str) -> None:
+    """Номер спринта обязателен: иначе непонятно, к какому периоду факт."""
+    status, _headers, body = post(f"{base_url}/api/actuals", b"task_id,status\n")
+
+    assert status == 400
+    payload = json.loads(body.decode("utf-8"))
+    assert payload["error"] == "bad_upload"
+    assert "sprint" in payload["message"]
+
+
+def test_empty_upload_is_rejected(base_url: str) -> None:
+    status, _headers, body = post(f"{base_url}/api/dataset")
+
+    assert status == 400
+    assert json.loads(body.decode("utf-8"))["error"] == "bad_upload"
