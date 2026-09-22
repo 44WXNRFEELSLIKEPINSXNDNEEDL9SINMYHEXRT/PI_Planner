@@ -243,16 +243,16 @@ and pi_planner_backup_restore_verified != 1
 time() - pi_planner_backup_last_success_timestamp_seconds > 93600
 ```
 
-## 7. План dashboard Grafana
+## 7. Dashboard Grafana
 
-1. **Service overview:** `up`, RPS, 4xx/5xx, p50/p95/p99, in-flight, CPU, RSS,
-   threads и версия релиза.
-2. **Database:** client latency/errors, connections; после установки
-   postgres_exporter — locks, deadlocks, cache hit, transactions и размер БД.
-3. **Planning quality:** статус и возраст плана, decisions/reasons, violations,
-   alerts, KPI, loan hours, DQ и ETL freshness.
-4. **Operations:** backup age/size/duration/restore, миграции, container restart,
-   CPU/RAM/disk и срок действия TLS.
+Dashboard **PI-Planner / Overview** provisioned из
+`ops/grafana/dashboards/pi-planner-overview.json`. Он показывает доступность
+приложения и БД, текущий прогон, возраст плана, ошибки контракта, RPS, p95,
+решения планировщика, KPI, алерты, DQ, DB latency, CPU и RSS. Источник данных
+зафиксирован UID `prometheus`, поэтому ручная привязка после старта не нужна.
+
+Метрики самого PostgreSQL (locks, deadlocks, cache hit), контейнеров, backup и
+TLS появятся после подключения соответствующих exporters, перечисленных в §10.
 
 ## 8. Проверка контракта
 
@@ -316,7 +316,8 @@ docker compose exec -T prometheus wget -qO- \
 Prometheus опрашивает `app:8000/metrics` каждые 15 секунд. Правила из
 `ops/prometheus/rules/pi-planner.yml` загружаются автоматически. В Grafana
 источник данных `Prometheus` создаётся автоматически с UID `prometheus` и URL
-`http://prometheus:9090`; ручная настройка datasource не нужна.
+`http://prometheus:9090`, а dashboard **PI-Planner / Overview** — из JSON в
+репозитории; ручная настройка не нужна.
 
 Данные сохраняются в named volumes `prometheus_data` и `grafana_data`.
 Prometheus хранит не более 15 дней и 2 GB по умолчанию; лимиты меняются через
@@ -343,7 +344,7 @@ Alertmanager.
 | scrape метрик приложения | работает | Prometheus видит process, HTTP, DB и бизнес-метрики |
 | rules `ops/prometheus/rules/pi-planner.yml` | работают | firing виден в UI/API Prometheus |
 | datasource Grafana | provisioned | запросы можно строить сразу после старта |
-| dashboard Grafana | не provisioned | панели из раздела 7 нужно создать и экспортировать в репозиторий |
+| dashboard Grafana | provisioned | **PI-Planner / Overview** доступен сразу после старта |
 | Alertmanager | не подключён | firing alert не отправляет уведомление дежурному |
 | `backup.prom` | файл создаётся, но не scrape-ится | backup контролируется по логам и файлу до подключения textfile collector |
 | PostgreSQL/container/TLS exporters | не подключены | нет метрик locks, disk, restart count и срока сертификата |

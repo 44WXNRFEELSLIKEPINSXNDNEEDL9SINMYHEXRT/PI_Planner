@@ -39,14 +39,15 @@ docker compose up -d --build prometheus grafana
 `plan_runs` уже есть успешный базовый прогон, шаг ничего не меняет.
 
 Grafana откроется через Caddy на `https://grafana.localhost`. Prometheus не
-публикует host-порт, а datasource создаётся автоматически. Настройка, проверки
-и контракт метрик описаны в `docs/OBSERVABILITY.md`.
+публикует host-порт, а datasource и dashboard **PI-Planner / Overview**
+создаются автоматически. Настройка, проверки и контракт метрик описаны в
+`docs/OBSERVABILITY.md`.
 
 Для production запуск одним `docker compose up` недостаточен: сначала задайте
 боевые домены и секреты, вынесите `BACKUP_DIR` на отдельный диск, выполните
 миграции и smoke-тесты. Пошаговый чек-лист релиза, отката и восстановления — в
 `docs/RUNBOOK.md`, разделы 5.2–5.7. Текущие ограничения мониторинга (нет
-Alertmanager, готовых dashboard и сборщика `backup.prom`) перечислены в
+Alertmanager и сборщика `backup.prom`) перечислены в
 `docs/OBSERVABILITY.md`, раздел 10.
 
 Перезалив идемпотентен: `seed.sql` начинается с `TRUNCATE … RESTART IDENTITY`,
