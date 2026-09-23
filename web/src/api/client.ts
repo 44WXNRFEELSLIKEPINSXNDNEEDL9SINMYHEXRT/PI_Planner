@@ -99,28 +99,6 @@ export function fetchView<T>(name: string, params: ViewParams = {}): Promise<Vie
   return request<ViewEnvelope<T>>(`/views/${name}${buildQuery(params)}`)
 }
 
-export interface ViewSource {
-  name: string
-  kind: 'view' | 'table'
-  screen: string
-  run_column: string | null
-  order: string[]
-  orderable: string[]
-  note: string
-}
-
-export interface ViewCatalog {
-  count: number
-  limit_default: number
-  limit_max: number
-  items: ViewSource[]
-}
-
-/** `GET /api/views` — справочник витрин (контракт из живого сервера). */
-export function fetchCatalog(): Promise<ViewCatalog> {
-  return request<ViewCatalog>('/views')
-}
-
 export interface HealthResponse {
   dsn: string
   server_version: string

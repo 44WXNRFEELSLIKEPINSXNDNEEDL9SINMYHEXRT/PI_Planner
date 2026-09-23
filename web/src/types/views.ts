@@ -91,14 +91,6 @@ export interface TaskRow {
   committed_week0: boolean
 }
 
-export interface TaskRemainingHhRow {
-  task_id: string
-  role_id: number
-  estimated_hours: NumericString
-  spent_hours: NumericString
-  remaining_hours: NumericString
-}
-
 // --------------------------------------------------------------- звёздная карта
 export interface OrbitMapRow {
   engineer_id: string
@@ -177,16 +169,6 @@ export interface TeamProfileRow {
 }
 
 // -------------------------------------------------------------- роли и ёмкость
-export interface EngineerRoleCoverageRow {
-  engineer_id: string
-  role_id: number
-  role_name: string
-  is_native: boolean
-  efficiency: NumericString
-  basis: string
-  status: string
-}
-
 export interface TeamCapacitySpRow {
   team_id: string
   history_points: number
@@ -239,15 +221,6 @@ export interface BusFactorRow {
 }
 
 // -------------------------------------------------------------------- календарь
-export interface SprintFundFactorRow {
-  pi_id: string
-  sprint_no: number
-  start_date: string
-  end_date: string
-  length_days: number
-  factor: NumericString
-}
-
 export interface PiFundFactorRow {
   pi_id: string
   sprint_length_days: number
@@ -269,12 +242,6 @@ export interface InitiativeRow {
   br_id: string
   title: string | null
   priority_rung: number | null
-}
-
-export interface RefResultOptionRow {
-  code: string
-  ord: number
-  label: string
 }
 
 export interface RefDecisionReasonRow {
@@ -331,13 +298,6 @@ export interface PlanAssignmentDetailRow {
   native_role: string
   is_substitution: boolean
   grade: Grade
-}
-
-export interface PlanBaselineRow {
-  run_id: number
-  task_id: string
-  planned_sp: NumericString
-  committed: boolean
 }
 
 export interface PlanTaskSpRow {

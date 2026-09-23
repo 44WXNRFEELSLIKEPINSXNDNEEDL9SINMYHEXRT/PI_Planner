@@ -137,8 +137,8 @@ ORDER BY p.pi_id
 LIMIT 1
 """
 
-# factor спринта — из вьюхи, а не «из головы»: короткий 7-й спринт даёт
-# 0.5714 фонда, и планировщик обязан считать так же, как инварианты.
+# factor спринта — из вьюхи, а не «из головы»: короткий спринт даёт
+# меньше фонда, и планировщик обязан считать так же, как инварианты.
 SPRINTS_SQL = """
 SELECT s.sprint_no, s.start_date, s.end_date, s.length_days, f.factor
 FROM sprints s
@@ -332,10 +332,10 @@ class Inputs:
     pi_id: str
     sprint_count: int
     fte_hours_per_sprint: int
-    # Календарь: PI — это КАЛЕНДАРНЫЙ квартал, а не «N × 14 дней» (ADR-017).
-    # `fund_factor` — сколько полных спринтов в квартале (92/14 = 6.5714),
-    # `sprint_factors` — множитель фонда по каждому спринту (7-й = 0.5714).
-    # Фонд ставки за PI = fte_hours_per_sprint × fund_factor = 525.71 ЧЧ.
+    # Календарь (ADR-017, ADR-025): PI = старт календарного квартала + 6 × 14 дней.
+    # `fund_factor` — сколько полных спринтов в квартале (84/14 = 6.0000),
+    # `sprint_factors` — множитель фонда по каждому спринту (1.0000 у полного).
+    # Фонд ставки за PI = fte_hours_per_sprint × fund_factor = 480 ЧЧ.
     fund_factor: Decimal
     pi_days: int
     sprint_factors: dict[int, Decimal]
@@ -362,7 +362,7 @@ class Inputs:
 
     @property
     def fund_hours_per_fte(self) -> Decimal:
-        """Фонд одной ставки за весь PI в ЧЧ: 80 × 6.5714 = 525.71."""
+        """Фонд одной ставки за весь PI в ЧЧ: 80 × 6.0000 = 480."""
         return (self.fund_factor * Decimal(self.fte_hours_per_sprint)).quantize(
             Decimal("0.01")
         )
@@ -621,8 +621,8 @@ class _Funds:
 
     def __init__(self, inputs: Inputs) -> None:
         self.fte = Decimal(inputs.fte_hours_per_sprint)
-        # Множитель фонда по спринтам. Короткий 7-й спринт даёт 0.5714 от
-        # обычного (ADR-017). Нет ключа — считаем спринт полным: безопасный
+        # Множитель фонда по спринтам. Короткий спринт даёт length_days / 14
+        # от обычного (ADR-017). Нет ключа — считаем спринт полным: безопасный
         # дефолт для тестов и для календарей без коротких спринтов.
         self.factors: dict[int, Decimal] = dict(inputs.sprint_factors)
         self.engineers: dict[str, EngineerInput] = {e.engineer_id: e for e in inputs.engineers}
@@ -1467,8 +1467,8 @@ def _assemble(
     )
 
     # Календарь уезжает в `plan_runs.params`: прогон без границ PI невозможно
-    # сопоставить с кварталом, а фонд 525.71 ЧЧ выглядит «взятым с потолка»,
-    # если рядом нет 92 дней и множителя 6.5714 (ADR-017).
+    # сопоставить с кварталом, а фонд ставки выглядит «взятым с потолка»,
+    # если рядом нет числа дней и множителя (ADR-017).
     pi_start = min((pair[0] for pair in inputs.sprints.values()), default=None)
     pi_end = max((pair[1] for pair in inputs.sprints.values()), default=None)
     short_sprints = {

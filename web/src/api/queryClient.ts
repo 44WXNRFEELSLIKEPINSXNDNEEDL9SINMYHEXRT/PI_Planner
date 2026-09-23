@@ -21,6 +21,3 @@ export const queryClient = new QueryClient({
     },
   },
 })
-
-/** Один ключ на всё, что зависит от прогонов планировщика — для инвалидации после загрузки. */
-export const RUN_SCOPED_KEY = 'run-scoped'

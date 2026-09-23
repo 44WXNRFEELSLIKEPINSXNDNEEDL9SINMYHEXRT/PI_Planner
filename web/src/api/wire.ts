@@ -29,11 +29,6 @@ export function fmtSp(value: NumericString | number | null | undefined): string 
   return trimZeros(Math.round(n * 100) / 100)
 }
 
-/** Проценты KPI: всегда два знака, это привычная форма показателя. */
-export function fmtPercent(value: NumericString | null | undefined): string {
-  return `${num(value).toFixed(2)}%`
-}
-
 function trimZeros(n: number): string {
   const s = n.toFixed(2)
   return s.replace(/\.?0+$/, '') || '0'
@@ -51,10 +46,4 @@ export function fmtDate(value: string | null | undefined): string {
   if (!value) return '—'
   const [y, m, d] = value.split('-')
   return y && m && d ? `${d}.${m}.${y}` : value
-}
-
-/** Значение или тире — по правилу «null рисуется как «—», а не как 0». */
-export function orDash(value: string | number | null | undefined): string {
-  if (value === null || value === undefined || value === '') return '—'
-  return String(value)
 }

@@ -85,7 +85,7 @@ FROM last l
 """
 
 # Календарь отдаём метрикой, а не только в логах: если фонд квартала поедет,
-# это должно быть видно на дашборде (fund_factor 6.5714 против 7.0000).
+# это должно быть видно на дашборде (fund_factor против sprint_count).
 CALENDAR_SQL = """
 SELECT p.pi_id, p.start_date, p.end_date, p.sprint_count,
        f.factor                                    AS fund_factor,

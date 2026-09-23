@@ -6,7 +6,7 @@
 --  Файл держим в UTF-8 (без BOM): в проверках есть кириллица.
 --
 --  Числа в комментариях — эталон для ETL 1.1.0 и календаря Q3-2026
---  (01.07..30.09, 7 спринтов, 7-й короткий). Смена календаря меняет 0а/0б,
+--  (01.07..22.09, 6 спринтов по 14 дней, ADR-025). Смена календаря меняет 0а/0б,
 --  3/4/5 не меняет: спрос считается из датасета, а не из спринтов.
 -- =====================================================================
 
@@ -14,9 +14,8 @@
 SELECT pg_encoding_to_char(encoding) AS encoding
 FROM pg_database WHERE datname = current_database();
 
-\echo '=== 0а. Календарь PI: ожидаем 01.07..30.09.2026, 92 дня, 7 спринтов ==='
--- Фонд ставки за квартал = fte_hours_per_sprint × factor: 80 × 6.5714 = 525.71 ЧЧ.
--- Было 480 (6 × 14 дней) — календарь стал точнее, фонд вырос на 9.5% (ADR-017).
+\echo '=== 0а. Календарь PI: ожидаем 01.07..22.09.2026, 84 дня, 6 спринтов ==='
+-- Фонд ставки за квартал = fte_hours_per_sprint × factor: 80 × 6.0000 = 480 ЧЧ (ADR-025).
 SELECT p.pi_id, p.start_date, p.end_date, p.sprint_count,
        (SELECT SUM(length_days) FROM sprints s WHERE s.pi_id = p.pi_id) AS pi_days,
        f.factor                                                        AS fund_factor,
@@ -24,7 +23,7 @@ SELECT p.pi_id, p.start_date, p.end_date, p.sprint_count,
 FROM pi_periods p
 JOIN v_pi_fund_factor f ON f.pi_id = p.pi_id;
 
-\echo '--- 0б. Фонд по спринтам: шесть полных (1.0000) и короткий 7-й (0.5714) ---'
+\echo '--- 0б. Фонд по спринтам: все шесть полные (1.0000) ---'
 SELECT sprint_no, start_date, end_date, length_days, factor
 FROM v_sprint_fund_factor ORDER BY sprint_no;
 
@@ -119,14 +118,14 @@ SELECT team_id,
 FROM v_team_capacity_sp
 ORDER BY sp_per_sprint DESC;
 
-\echo '--- 7а. Ёмкость ядра за квартал: × 6.5714 (92/14), а не × 7 спринтов ---'
+\echo '--- 7а. Ёмкость ядра за квартал: × 6.0000 (84/14) ---'
 SELECT team_id,
        ROUND(available_sp_per_sprint, 2) AS sp_per_sprint,
        ROUND(available_sp_per_pi, 2)     AS sp_per_pi
 FROM v_team_capacity_sp
 ORDER BY sp_per_sprint DESC;
 
-\echo '--- 7б. Фонд часов по спринтам: 7-й короче, значит фонд меньше на 42.9% ---'
+\echo '--- 7б. Фонд часов по спринтам: у полных спринтов фонд одинаковый ---'
 -- Ровно то, что видит планировщик: 80 ЧЧ × ставка × factor спринта.
 SELECT s.sprint_no, s.length_days,
        ROUND(SUM(s.hours_own), 2) AS fund_hh

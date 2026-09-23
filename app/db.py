@@ -5,9 +5,9 @@
   2. dsn.json в корне репозитория (в .gitignore, см. dsn.example.json)
   3. значение по умолчанию (локальная dev-база из docs/RUNBOOK.md)
 
-По умолчанию соединение READ ONLY. Писать в базу умеют только явные вызовы
-`execute(..., read_only=False)` и `transaction()` — это защита от того, чтобы
-экран случайно не переписал контракт планировщика.
+По умолчанию соединение READ ONLY. Писать в базу умеет только явный
+`transaction()` — это защита от того, чтобы экран случайно не переписал
+контракт планировщика.
 """
 from __future__ import annotations
 
@@ -272,50 +272,6 @@ def scalar(
     if not row:
         return None
     return next(iter(row.values()))
-
-
-def execute(
-    sql: str,
-    params: Sequence[Any] | None = None,
-    *,
-    operation: str = "execute",
-) -> int:
-    """Запись, уважающая конфигурацию: при `read_only=true` упадёт.
-
-    Так защита работает по умолчанию: чтобы писать, нужно либо явно вызвать
-    `execute_write()`, либо поставить `"read_only": false` в dsn.json.
-    """
-    started = time.perf_counter()
-    _TELEMETRY.operation_enter()
-    try:
-        with connection(read_only=None) as conn, conn.cursor() as cur:
-            cur.execute(sql, tuple(params or ()))
-            rows = cur.rowcount
-    except Exception:
-        _finish_operation(operation, started, "error")
-        raise
-    _finish_operation(operation, started, "success", rows)
-    return rows
-
-
-def execute_write(
-    sql: str,
-    params: Sequence[Any] | None = None,
-    *,
-    operation: str = "execute_write",
-) -> int:
-    """Запись в обход конфигурации. Вызывать осознанно."""
-    started = time.perf_counter()
-    _TELEMETRY.operation_enter()
-    try:
-        with connection(read_only=False) as conn, conn.cursor() as cur:
-            cur.execute(sql, tuple(params or ()))
-            rows = cur.rowcount
-    except Exception:
-        _finish_operation(operation, started, "error")
-        raise
-    _finish_operation(operation, started, "success", rows)
-    return rows
 
 
 @contextmanager

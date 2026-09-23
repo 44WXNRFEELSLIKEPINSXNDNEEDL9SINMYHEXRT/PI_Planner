@@ -412,9 +412,9 @@ RPO текущей схемы backup — до 24 часов, RTO заранее 
 | № | Проверка | Эталон ДС | Факт | Итог |
 |---|---|---|---|---|
 | 0 | кодировка базы | UTF8 | UTF8 | ✅ |
-| 0а | `pi_periods` + `v_pi_fund_factor` | Q3: 01.07–22.09.2026, 84 дня, 6 спринтов, фонд ставки 480 ЧЧ (ADR-025) | ровно эти значения, `fund_factor = 6.5714`, `fund_hh_per_fte = 525.71` | ✅ |
+| 0а | `pi_periods` + `v_pi_fund_factor` | Q3: 01.07–22.09.2026, 84 дня, 6 спринтов, фонд ставки 480 ЧЧ (ADR-025) | ровно эти значения, `fund_factor = 6.0000`, `fund_hh_per_fte = 480.00` | ✅ |
 | 0б | `v_sprint_fund_factor` | шесть полных спринтов (×1.0000) | 1..6 по 14 дней / 1.0000 | ✅ |
-| 1 | `load_batches.row_counts` | 21 роль, 45 задач, 258 строк сметы, 19 зависимостей, 30 инженеров, 12 снимков истории, 38 находок DQ | ровно эти значения (плюс 6 команд, 117 навыков, 183 связи, 34 орбиты, 15 инициатив, **7 спринтов**, 24 факта) | ✅ |
+| 1 | `load_batches.row_counts` | 21 роль, 45 задач, 258 строк сметы, 19 зависимостей, 30 инженеров, 12 снимков истории, 38 находок DQ | ровно эти значения (плюс 6 команд, 117 навыков, 183 связи, 34 орбиты, 15 инициатив, **6 спринтов**, 24 факта) | ✅ |
 | 1а | живые `COUNT(*)` по 8 таблицам | совпадают с `row_counts` | 38 / 34 / 30 / 21 / 19 / 258 / 45 / 12 | ✅ |
 | 1б | объекты в `public` | 29 таблиц + 17 вьюх | 29 + 17 (две новые — `v_pi_fund_factor`, `v_sprint_fund_factor`) | ✅ |
 | 2 | `v_dq_summary` | 38 находок, 0 блокирующих | 38 = 0 error + 35 warning + 3 info | ✅ |
@@ -594,7 +594,7 @@ HTTP-метрики не заводят отдельную серию маршр
 | `pi_planner_plan_violations` | gauge | `run_id`, `severity` | нарушения контракта: `error` обязан быть 0 |
 | `pi_planner_plan_tasks_in_quarter` | gauge | `run_id` | задач с решением `in_quarter` |
 | `pi_planner_plan_assigned_hours` | gauge | `run_id` | часы исполнителей в прогоне |
-| `pi_planner_calendar_info` | gauge | `pi_id`, `pi_start`, `pi_end`, `sprint_count`, `fund_factor` | границы PI; значение — фонд ставки за квартал (525.71) |
+| `pi_planner_calendar_info` | gauge | `pi_id`, `pi_start`, `pi_end`, `sprint_count`, `fund_factor` | границы PI; значение — фонд ставки за квартал (480) |
 
 Лейбл `route` — фиксированный набор (`/api/health`, `/api/livez`, `/api/version`,
 `/api/views`, `/api/views/{view}`, `/metrics`, `/api/*`, `/static`), а не URL:
@@ -699,7 +699,7 @@ SELECT * FROM v_plan_violations WHERE run_id = 2 AND severity = 'error';   -- п
 | 6 | `task_state` | слепок всех задач | 45 строк на каждый прогон |
 | 7 | `alerts` | red по инициативам, orange по ролям | 14 `red/deadline_miss` + 6 `orange/role_deficit`; в прогоне 2 ещё 3 `yellow/cascade_shift` (в первом сравнивать не с чем) |
 | 8 | `kpi_snapshots` | 1 + `sprint_count` + 1 | `pi_predictability` 6.67 (норма 80–100), `bus_factor` 0.00 (норма > 1), `say_do_ratio` 7 строк: 100.00 в прогоне 1, 0.00–100.00 в прогоне 2 |
-| 9 | `plan_runs.params` | правила **и календарь** прогона записаны | `estimate_source = matrix_column_sum`, `estimate_validated = true`, `estimate_conflicts = 25`, `substitution_mode = rejected`, `objective`, `dependency_mode = start_start`, `initiative_mode = greedy`, `replan_floor = 1`, `initiatives_planned = 15`, `initiatives_complete = 1`, `initiatives_partial = [5 инициатив]`, `calendar = {2026-07-01..2026-09-30, 92 дня, 7 спринтов, fund_factor 6.5714, fund_hh_per_fte 525.71, short_sprints {"7": "0.5714"}}` |
+| 9 | `plan_runs.params` | правила **и календарь** прогона записаны | `estimate_source = matrix_column_sum`, `estimate_validated = true`, `estimate_conflicts = 25`, `substitution_mode = rejected`, `objective`, `dependency_mode = start_start`, `initiative_mode = greedy`, `replan_floor = 1`, `initiatives_planned = 15`, `initiatives_complete = 1`, `initiatives_partial = [5 инициатив]`, `calendar = {2026-07-01..2026-09-22, 84 дня, 6 спринтов, fund_factor 6.0000, fund_hh_per_fte 480.00, short_sprints {}}` |
 | 10 | `is_loan` | считает СУБД, не мы | 6 строк с `home_team_id <> serving_team_id`, в `INSERT` колонки нет |
 | 11 | Проверок в `db/05_invariants.sql` | 29 (A…AC) | см. таблицу кодов в `docs/PLANNER_SPEC.md`, раздел 7 |
 

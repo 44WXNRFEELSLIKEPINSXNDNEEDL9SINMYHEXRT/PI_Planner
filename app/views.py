@@ -165,7 +165,7 @@ SOURCES: tuple[Source, ...] = (
             "hours_own",
         ),
         note="Ёмкость инженера по спринтам: `hours_own` уже умножен на множитель своего "
-        "спринта (у 7-го 0.5714), вручную фонд не пересчитывать (ADR-017).",
+        "спринта (у короткого — меньше 1.0), вручную фонд не пересчитывать (ADR-017).",
     ),
 
 
@@ -240,22 +240,22 @@ SOURCES: tuple[Source, ...] = (
         screen="Календарь и фонд",
         order="sprint_no",
         orderable=("pi_id", "sprint_no", "start_date", "end_date", "length_days", "factor"),
-        note="Множитель фонда спринта: спринты 1–6 — 1.0000, 7-й (23–30.09, 8 дней) — 0.5714.",
+        note="Множитель фонда спринта: length_days / 14. Все шесть спринтов полные — 1.0000 (ADR-025).",
     ),
     _source(
         "v_pi_fund_factor",
         screen="Календарь и фонд",
         order="pi_id",
         orderable=("pi_id", "sprint_length_days", "days_total", "factor"),
-        note="Фонд всего PI: 6.5714 при 92 днях. Единственный источник правды для фонда — "
-        "эта витрина и v_sprint_fund_factor, «92 / 14» не считать (ADR-017).",
+        note="Фонд всего PI: 6.0000 при 84 днях. Единственный источник правды для фонда — "
+        "эта витрина и v_sprint_fund_factor, «дни / 14» не считать (ADR-017).",
     ),
     _source(
         "sprints",
         screen="Календарь и фонд",
         order="sprint_no",
         orderable=("pi_id", "sprint_no", "start_date", "end_date", "length_days"),
-        note="Сетка квартала: 7 спринтов, `length_days` — генерируемая колонка (у 7-го 8 дней).",
+        note="Сетка квартала: 6 спринтов по 14 дней, `length_days` — генерируемая колонка.",
     ),
     _source(
         "initiatives",
