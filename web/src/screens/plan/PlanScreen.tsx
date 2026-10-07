@@ -44,6 +44,11 @@ export function PlanScreen() {
   const inQuarter = [...data.scheduleByTask.values()].filter((s) => s.decision === 'in_quarter').length
   const achievedGoals = data.initiativeGoals.filter((row) => row.quarter_goal_status === 'confirmed_achieved').length
   const selectedRun = runs.find((row) => row.run_id === runId)
+  const algorithmName = selectedRun?.algorithm === 'lns-cpsat@1'
+    ? 'LNS + CP-SAT'
+    : selectedRun?.algorithm === 'greedy-priority-topo@2'
+      ? 'Жадный'
+      : selectedRun?.algorithm
   const stability = (selectedRun?.params as Record<string, unknown> | undefined)?.stability as {
     continued_role_pairs: number; kept_role_pairs: number; switched_role_pairs: number;
     people_changed: number; switches: Array<{ task_id: string; role_id: number; before: string[]; after: string[]; cause: string }>
@@ -54,6 +59,7 @@ export function PlanScreen() {
       <Group justify="space-between" align="flex-end" wrap="wrap">
         <div>
           <Title order={2}><L>План квартала</L></Title>
+          {algorithmName && <Text c="dimmed" size="sm">Алгоритм: {algorithmName}</Text>}
           <Text c="dimmed" size="sm" mt={2}>
             {data.scheduleByTask.size > 0
               ? `В квартал взято ${inQuarter} задач из ${data.scheduleByTask.size} — остальные перенесены на следующий PI. Это решение планировщика, а не сокращение бэклога.`

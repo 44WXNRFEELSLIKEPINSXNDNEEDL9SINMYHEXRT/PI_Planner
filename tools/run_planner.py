@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -41,6 +42,24 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=0,
         help="0 — базовый план Недели 0 (пишет plan_baseline), 1..12 — пересчёт (по умолчанию 0)",
+    )
+    parser.add_argument(
+        "--algorithm",
+        choices=(planner.ALGORITHM, planner.ALGORITHM_LOCAL_SEARCH),
+        default=os.environ.get("PLANNER_ALGORITHM", planner.ALGORITHM),
+        help="алгоритм планирования; lns-cpsat экспериментальный",
+    )
+    parser.add_argument(
+        "--search-time-seconds",
+        type=float,
+        default=os.environ.get("PLANNER_SEARCH_TIME_SECONDS", "10"),
+        help="общий лимит CP-SAT поиска в секундах (для lns-cpsat)",
+    )
+    parser.add_argument(
+        "--random-seed",
+        type=int,
+        default=os.environ.get("PLANNER_RANDOM_SEED", "0"),
+        help="seed решателя CP-SAT (для lns-cpsat)",
     )
     parser.add_argument(
         "--dry-run",
@@ -139,7 +158,10 @@ def _run_locked(args: argparse.Namespace) -> int:
         "dependency_mode": args.dependency_mode,
         "priority_strategy": args.priority_strategy,
         "initiative_mode": args.initiative_mode,
-        "simulate_next_pi": True,
+        "simulate_next_pi": args.algorithm != planner.ALGORITHM_LOCAL_SEARCH,
+        "algorithm": args.algorithm,
+        "max_time_seconds": args.search_time_seconds,
+        "random_seed": args.random_seed,
     }
     plan = planner.build_plan(inputs, baseline_starts=baseline_starts, **options)
     build_plan_seconds = time.perf_counter() - phase_started
@@ -152,6 +174,14 @@ def _run_locked(args: argparse.Namespace) -> int:
 
     print(f"статус: {plan.status}")
     print(f"итог: {plan.note}")
+    print(f"алгоритм: {plan.params['algorithm']}")
+    optimization = plan.params.get("optimization")
+    if optimization:
+        print(
+            f"поиск: {optimization.get('search_method', 'not_run')}, "
+            f"статус решателя {optimization.get('solver_status', 'unknown')}, "
+            f"улучшений LNS {optimization.get('neighborhoods_improved', 0)}"
+        )
     print(
         f"режимы: зависимости {plan.params['dependency_mode']}, инициативы "
         f"{plan.params['initiative_mode']}, нижняя граница старта {plan.params['replan_floor']}"
@@ -187,7 +217,7 @@ def _run_locked(args: argparse.Namespace) -> int:
         return 1
     print(
         f"записано: run_id = {run_id} "
-        f"(as_of_sprint = {plan.as_of_sprint}, алгоритм {planner.ALGORITHM})"
+        f"(as_of_sprint = {plan.as_of_sprint}, алгоритм {plan.params['algorithm']})"
     )
     print(
         f"приёмка: SELECT * FROM v_plan_violations WHERE run_id = {run_id} "

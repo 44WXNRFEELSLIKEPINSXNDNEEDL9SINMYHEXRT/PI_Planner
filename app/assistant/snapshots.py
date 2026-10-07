@@ -100,7 +100,10 @@ def save(cur: Any, run_id: int, inputs: Inputs, plan: Plan, *,
         "priority_strategy": plan.params.get("priority_strategy"),
         "simulate_next_pi": plan.params.get("simulate_next_pi"),
     }
-    if inputs.pi_id != plan.pi_id or options != expected_options:
+    # Search-specific CLI options are recorded on the plan, but the current
+    # snapshot replay contract only stores the five stable planner modes above.
+    snapshot_options = {key: options.get(key) for key in expected_options}
+    if inputs.pi_id != plan.pi_id or snapshot_options != expected_options:
         raise ValueError("snapshot input or options do not match the published plan")
     row = cur.execute(
         "SELECT generation_id FROM public.assistant_dataset_generations "
@@ -121,7 +124,7 @@ def save(cur: Any, run_id: int, inputs: Inputs, plan: Plan, *,
     else:
         generation_id = row["generation_id"]
     input_text = _dump({
-        "inputs": inputs, "baseline_starts": baseline_starts, "options": options,
+        "inputs": inputs, "baseline_starts": baseline_starts, "options": snapshot_options,
     })
     plan_text = _dump(plan)
     snapshot_id = uuid4()

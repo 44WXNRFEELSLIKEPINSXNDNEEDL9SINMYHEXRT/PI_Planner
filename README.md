@@ -78,6 +78,20 @@ docker compose up -d --build
    дашборд **PI-Planner / Overview** создаётся автоматически.
 
 Prometheus и PostgreSQL наружу не публикуются.
+
+Для ручного запуска планировщика алгоритм и лимит поиска задаются в `.env`
+параметрами `PLANNER_ALGORITHM`, `PLANNER_SEARCH_TIME_SECONDS` и
+`PLANNER_RANDOM_SEED`. По умолчанию остаётся текущий алгоритм. Чтобы проверить
+экспериментальный вариант `lns-cpsat@1`, задайте его в `.env`, затем выполните:
+
+```bash
+docker compose run --build --rm bootstrap-plan python tools/run_planner.py --dry-run
+```
+
+Команда только считает и показывает план. Уберите `--dry-run`, чтобы записать
+новый прогон в базу. Настройки из `.env` также применяются к начальному
+`bootstrap-plan` при первом `docker compose up`; существующая базовая запись
+останавливает его из-за `--if-empty`. Аргументы CLI имеют приоритет над `.env`.
 База знаний помощника не индексируется автоматически: до установки локальной
 модели эмбеддингов и [индексации](docs/ASSISTANT_RUNBOOK.md) в чате возможно
 ограничение `kb_not_indexed`. Подключение Gemini или Groq этот шаг не заменяет.
@@ -708,6 +722,8 @@ SELECT task_id, decision, reason_text FROM plan_task_schedule WHERE run_id = :ru
 | `ASSISTANT_DB_PASSWORD` | пароль отдельной ограниченной роли PostgreSQL для worker |
 | `GEMINI_API_KEY`, `GROQ_API_KEY`, `QWEN_API_KEY` | ключи моделей; в профиле хранится ссылка `env:ИМЯ`, а не значение |
 | `PI_PLANNER_KB_EMBED_BASE_URL`, `PI_PLANNER_KB_EMBED_MODEL` | адрес и модель локальных эмбеддингов базы знаний |
+| `PLANNER_ALGORITHM` | алгоритм одноразового запуска планировщика в Compose (`greedy-priority-topo@2` или экспериментальный `lns-cpsat@1`) |
+| `PLANNER_SEARCH_TIME_SECONDS`, `PLANNER_RANDOM_SEED` | общий лимит времени и seed CP-SAT для `lns-cpsat@1` |
 | `etl/config.py` | все параметры модели: focus factor, часы в спринте, алиасы ролей, имя файла датасета |
 | `.env` | настройки Docker-стека: пароли, домены, порты, лимиты ресурсов, бэкапы (см. `.env.example`) |
 

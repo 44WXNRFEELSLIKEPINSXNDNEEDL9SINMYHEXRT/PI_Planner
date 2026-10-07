@@ -66,6 +66,44 @@ def test_snapshot_detects_changed_input_payload(monkeypatch) -> None:
         snapshots.load(uuid4())
 
 
+def test_snapshot_save_accepts_search_options_beyond_replay_modes() -> None:
+    source = inputs([task("A")], [engineer("E-1")])
+    options = {
+        "as_of_sprint": 0,
+        "dependency_mode": planner.DEFAULT_DEPENDENCY_MODE,
+        "initiative_mode": planner.INITIATIVE_MODE_GREEDY,
+        "priority_strategy": planner.DEFAULT_PRIORITY_STRATEGY,
+        "simulate_next_pi": False,
+        "algorithm": planner.ALGORITHM_LOCAL_SEARCH,
+        "max_time_seconds": 2.5,
+        "random_seed": 17,
+    }
+    plan = planner.build_plan(source, **options)
+
+    class Cursor:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, query, params=None):
+            self.calls.append((query, params))
+            return self
+
+        def fetchone(self):
+            return {"generation_id": uuid4()}
+
+    cursor = Cursor()
+    snapshots.save(cursor, 12, source, plan, baseline_starts={}, options=options)
+
+    input_text = cursor.calls[-1][1][4]
+    saved = snapshots._decode(json.loads(input_text))
+    assert saved["options"] == {
+        key: options[key]
+        for key in (
+            "as_of_sprint", "dependency_mode", "initiative_mode", "priority_strategy", "simulate_next_pi"
+        )
+    }
+
+
 def test_sensitivity_uses_the_saved_priority_and_input(monkeypatch) -> None:
     source = inputs([task("A")], [engineer("E-1")])
     options = {

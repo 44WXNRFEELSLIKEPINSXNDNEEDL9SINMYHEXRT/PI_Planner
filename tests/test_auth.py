@@ -195,6 +195,19 @@ def test_planner_cannot_load_the_dataset_but_passes_the_gate_for_actuals(secured
     assert status == 400
 
 
+def test_double_run_is_planner_only(secured, monkeypatch) -> None:
+    port, _ = secured
+    payload = json.dumps({"as_of_sprint": 0, "search_time_seconds": 5}).encode()
+    monkeypatch.setattr(ingest, "compare_algorithms", lambda *_args: {"runs": []})
+    assert call(port, "POST", "/api/planner/compare", token="viewer-token-0123456789",
+                body=payload)[0] == 403
+    status, _headers, body = call(
+        port, "POST", "/api/planner/compare", token="planner-token-012345678",
+        body=payload, headers={"Content-Length": str(len(payload))},
+    )
+    assert status == 200 and json.loads(body) == {"runs": []}
+
+
 def test_admin_passes_the_gate_for_the_dataset(secured) -> None:
     port, _ = secured
     status, _h, _b = call(port, "POST", "/api/dataset", token="admin-token-0123456789ab")

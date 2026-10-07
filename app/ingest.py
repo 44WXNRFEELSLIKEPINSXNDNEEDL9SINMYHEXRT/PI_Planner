@@ -136,6 +136,119 @@ def run_plan(as_of_sprint: int) -> dict[str, Any]:
     }
 
 
+def compare_algorithms(as_of_sprint: int = 0, search_time_seconds: float = 10.0) -> dict[str, Any]:
+    """Build and publish greedy and LNS plans from one identical input snapshot."""
+    if not 0 <= as_of_sprint <= 12:
+        raise UploadError("номер среза должен быть от 0 до 12")
+    if not 1 <= search_time_seconds <= 60:
+        raise UploadError("лимит поиска должен быть от 1 до 60 секунд")
+
+    with WRITE_LOCK:
+        inputs = planner.load_inputs()
+        if as_of_sprint > inputs.sprint_count:
+            raise UploadError(f"в этом PI только {inputs.sprint_count} спринтов")
+        baseline_starts = planner.load_baseline_starts() if as_of_sprint > 0 else {}
+        modes = baseline_modes() if as_of_sprint > 0 else {}
+        dependency_mode = modes.get("dependency_mode", planner.DEFAULT_DEPENDENCY_MODE)
+        initiative_mode = modes.get("initiative_mode", planner.INITIATIVE_MODE_GREEDY)
+        priority_strategy = modes.get("priority_strategy", planner.DEFAULT_PRIORITY_STRATEGY)
+        if priority_strategy == "task":
+            raise UploadError(
+                "двойной прогон пока недоступен при priority_strategy='task': "
+                "lns-cpsat сравнивает приоритеты инициатив"
+            )
+
+        algorithms = (planner.ALGORITHM, planner.ALGORITHM_LOCAL_SEARCH)
+        plans = []
+        for algorithm in algorithms:
+            options = {
+                "as_of_sprint": as_of_sprint,
+                "dependency_mode": dependency_mode,
+                "initiative_mode": initiative_mode,
+                "priority_strategy": priority_strategy,
+                "simulate_next_pi": algorithm != planner.ALGORITHM_LOCAL_SEARCH,
+                "algorithm": algorithm,
+                "max_time_seconds": search_time_seconds,
+                "random_seed": 0,
+            }
+            plan = planner.build_plan(inputs, baseline_starts=baseline_starts, **options)
+            plans.append((plan, options))
+
+        published: list[dict[str, Any]] = []
+        for plan, options in plans:
+            run_id = planner.write_plan(
+                plan, inputs=inputs, baseline_starts=baseline_starts, options=options
+            )
+            optimization = plan.params.get("optimization") or {}
+            published.append({
+                "run_id": run_id,
+                "algorithm": plan.params["algorithm"],
+                "status": plan.status,
+                "note": plan.note,
+                "in_quarter": len(plan.in_quarter),
+                "deferred": len(plan.deferred),
+                "initiatives_complete": plan.params.get("initiatives_complete", 0),
+                "loan_hh": plan.params.get("loan_hh", "0"),
+                "solver_status": optimization.get("solver_status"),
+                "schedule": [
+                    {"task_id": row.task_id, "decision": row.decision,
+                     "start_sprint": row.start_sprint, "end_sprint": row.end_sprint}
+                    for row in plan.schedule
+                ],
+                "assignments": [
+                    {"task_id": row.task_id, "sprint_no": row.sprint_no,
+                     "engineer_id": row.engineer_id, "role_id": row.role_id,
+                     "home_team_id": row.home_team_id, "hours": str(row.hours)}
+                    for row in plan.assignments
+                ],
+                "story_points": [
+                    {"task_id": task_id, "sprint_no": sprint_no, "sp": str(sp)}
+                    for task_id, sprint_no, sp in plan.sp_shares
+                ],
+            })
+
+    left, right = published
+    left_schedule = {row["task_id"]: row for row in left["schedule"]}
+    right_schedule = {row["task_id"]: row for row in right["schedule"]}
+    left_assignments: dict[str, list[tuple[Any, ...]]] = {}
+    right_assignments: dict[str, list[tuple[Any, ...]]] = {}
+    for target, rows in ((left_assignments, left["assignments"]), (right_assignments, right["assignments"])):
+        for row in rows:
+            target.setdefault(row["task_id"], []).append(tuple(row[key] for key in (
+                "sprint_no", "engineer_id", "role_id", "home_team_id", "hours"
+            )))
+    left_sp: dict[str, list[tuple[Any, ...]]] = {}
+    right_sp: dict[str, list[tuple[Any, ...]]] = {}
+    for target, rows in ((left_sp, left["story_points"]), (right_sp, right["story_points"])):
+        for row in rows:
+            target.setdefault(row["task_id"], []).append((row["sprint_no"], row["sp"]))
+
+    differences = []
+    for task_id in sorted(left_schedule.keys() | right_schedule.keys()):
+        old = left_schedule.get(task_id, {})
+        new = right_schedule.get(task_id, {})
+        assignment_changed = sorted(left_assignments.get(task_id, ())) != sorted(right_assignments.get(task_id, ()))
+        sp_changed = sorted(left_sp.get(task_id, ())) != sorted(right_sp.get(task_id, ()))
+        schedule_changed = any(old.get(key) != new.get(key) for key in (
+            "decision", "start_sprint", "end_sprint"
+        ))
+        if schedule_changed or assignment_changed or sp_changed:
+            differences.append({
+                "task_id": task_id,
+                "greedy": old,
+                "lns": new,
+                "assignments_changed": assignment_changed,
+                "story_points_changed": sp_changed,
+            })
+    return {
+        "as_of_sprint": as_of_sprint,
+        "input_sha256": inputs.source_sha256,
+        "runs": published,
+        "different_tasks": len(differences),
+        "differences": differences,
+    }
+
+
 def _has_baseline() -> bool:
     return bool(
         db.scalar("SELECT COUNT(*) FROM plan_runs WHERE as_of_sprint = 0 AND status IN ('ok', 'infeasible')")

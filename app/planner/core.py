@@ -1,11 +1,14 @@
 """Ядро: чистая функция `build_plan` (вход -> `Plan`, без обращений к базе)."""
 from __future__ import annotations
 
+import os
+
 from collections import Counter, defaultdict
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import date, timedelta
 from decimal import Decimal
+from time import monotonic
 from typing import Any
 
 from app.planner.constants import (
@@ -45,6 +48,10 @@ from app.planner.graph import _refresh_live_graph
 from app.planner.alerts import _build_alerts
 from app.planner.capacity import effective_capacity
 from app.planner.kpi import _build_kpis, _build_states
+from app.planner.local_search.solver import (
+    ALGORITHM_LOCAL_SEARCH, allocation_from_plan, plan_vector_units, solve_allocation,
+)
+from app.planner.local_search.search import improve_with_lns
 
 
 def build_plan(
@@ -55,6 +62,9 @@ def build_plan(
     initiative_mode: str = INITIATIVE_MODE_GREEDY,
     simulate_next_pi: bool = True,
     priority_strategy: str = DEFAULT_PRIORITY_STRATEGY,
+    algorithm: str = ALGORITHM,
+    max_time_seconds: float = 10.0,
+    random_seed: int = 0,
 ) -> Plan:
     """Строит план. Ни одного обращения к базе: всё, что нужно, уже во `Inputs`.
 
@@ -68,6 +78,7 @@ def build_plan(
     в `plan_runs.params`, поэтому любой прогон сам объясняет, по каким правилам
     он построен. Значения по умолчанию — те, на которых прошла приёмка M2.
     """
+    source_inputs = inputs
     if not 0 <= as_of_sprint <= 12:
         raise ValueError(f"as_of_sprint={as_of_sprint} вне диапазона 0..12 (CHECK в plan_runs)")
     if dependency_mode not in DEPENDENCY_MODES:
@@ -75,6 +86,13 @@ def build_plan(
     if initiative_mode not in INITIATIVE_MODES:
         raise ValueError(f"initiative_mode={initiative_mode!r} не из {INITIATIVE_MODES}")
     check_strategy(priority_strategy)
+    if algorithm not in (ALGORITHM, ALGORITHM_LOCAL_SEARCH):
+        raise ValueError(f"unsupported algorithm={algorithm!r}")
+    if algorithm == ALGORITHM_LOCAL_SEARCH and priority_strategy == "task":
+        raise ValueError("priority_strategy='task' is unsupported by lns-cpsat")
+    if algorithm == ALGORITHM_LOCAL_SEARCH:
+        # Next-PI forecasting still uses diagnostics from the greedy allocator.
+        simulate_next_pi = False
 
     # В закрытые спринты план не пишется (ADR-014): при `as_of_sprint = k` спринт
     # k начинается «сегодня», всё до него — история. Инвариант
@@ -126,6 +144,7 @@ def build_plan(
     sp_shares: dict[str, dict[int, Decimal]] = {}
     deferred: dict[str, str] = {}
     atomic_deferred: set[str] = set()
+    allocation_solution = None
     # Итог квартала: факт загружен за последний спринт — планировать некуда (ADR-021).
     pi_closed = replan_floor > inputs.sprint_count
 
@@ -279,10 +298,88 @@ def build_plan(
                     if initiative_mode == INITIATIVE_MODE_ATOMIC:
                         defer_initiative(task.prodf_id)
 
-    # ---- проход 1: обход в порядке приоритетов ----------------------------
+    # ---- размещение: текущая эвристика или новый решатель -----------------
     if pi_closed:
         for task in ordered:
             deferred[task.task_id] = DEFERRED_REASON
+    elif algorithm == ALGORITHM_LOCAL_SEARCH:
+        from app.planner.local_search.validation import validate_plan
+
+        search_started = monotonic()
+        seed_plan = build_plan(
+            source_inputs, as_of_sprint=as_of_sprint,
+            baseline_starts=baseline_starts, dependency_mode=dependency_mode,
+            initiative_mode=initiative_mode, simulate_next_pi=False,
+            priority_strategy=priority_strategy, algorithm=ALGORITHM,
+        )
+        seed_errors = validate_plan(seed_plan, inputs, dependency_mode=dependency_mode)
+        seed_allocation = allocation_from_plan(seed_plan, inputs, priority_strategy=priority_strategy)
+        seed = seed_allocation if not seed_errors else None
+        # The greedy vector is a hard lexicographic floor even when its plan cannot
+        # be loaded into the model as an incumbent (sub-cent chunks, rounding).
+        floor_vector = plan_vector_units(seed_plan, inputs, priority_strategy=priority_strategy)
+        initial_budget = max(0.000001, max_time_seconds * 0.5 - (monotonic() - search_started))
+        try:
+            allocation_solution = solve_allocation(
+                inputs,
+                qualified_by_task,
+                replan_floor=replan_floor,
+                dependency_mode=dependency_mode,
+                initiative_mode=initiative_mode,
+                priority_strategy=priority_strategy,
+                max_time_seconds=initial_budget,
+                random_seed=random_seed,
+                incumbent=seed,
+                free_task_ids=frozenset(by_id),
+                floor_vector=floor_vector,
+                hint_solution=seed_allocation,
+                num_workers=int(os.environ.get('PLANNER_SEARCH_WORKERS', '1')),
+            )
+        except RuntimeError as exc:
+            # Keep planning available when CP-SAT cannot produce its first
+            # feasible point inside the initial budget. Mark the fallback in
+            # plan metadata so it is never presented as an LNS result.
+            fallback = seed_plan
+            fallback.params["requested_algorithm"] = ALGORITHM_LOCAL_SEARCH
+            fallback.params["fallback_reason"] = str(exc)
+            return replace(fallback, note=(fallback.note + " LNS не нашёл начальный план; показан жадный результат.").strip())
+        remaining_search_budget = max(
+            0.0, max_time_seconds - (monotonic() - search_started)
+        )
+        if allocation_solution.solver_status != "OPTIMAL" and remaining_search_budget > 0.05:
+            allocation_solution = improve_with_lns(
+                inputs,
+                qualified_by_task,
+                allocation_solution,
+                replan_floor=replan_floor,
+                dependency_mode=dependency_mode,
+                initiative_mode=initiative_mode,
+                priority_strategy=priority_strategy,
+                max_time_seconds=remaining_search_budget,
+                random_seed=random_seed,
+            )
+        if tuple(int(v) for v in allocation_solution.objective_vector) < floor_vector:
+            # Never publish a plan the greedy algorithm beats on the shared objective.
+            fallback = seed_plan
+            fallback.params["requested_algorithm"] = ALGORITHM_LOCAL_SEARCH
+            fallback.params["fallback_reason"] = "lns result is lexicographically worse than greedy"
+            return replace(fallback, note=(fallback.note + " LNS не улучшил жадный план; показан жадный результат.").strip())
+        for task_id in allocation_solution.selected:
+            starts[task_id] = allocation_solution.starts[task_id]
+            ends[task_id] = allocation_solution.ends[task_id]
+            sp_shares[task_id] = {}
+        for assignment in allocation_solution.assignments:
+            placed.setdefault(assignment.task_id, []).append(assignment)
+            funds.spend(
+                assignment.engineer_id, assignment.home_team_id,
+                assignment.sprint_no, assignment.hours,
+            )
+        for task_id, sprint_no, sp in allocation_solution.sp_shares:
+            sp_shares.setdefault(task_id, {})[sprint_no] = sp
+            funds.take_sp(by_id[task_id].team_id, sprint_no, sp)
+        for task in ordered:
+            if task.task_id not in allocation_solution.selected:
+                deferred[task.task_id] = DEFERRED_REASON
     elif initiative_mode == INITIATIVE_MODE_ATOMIC:
         # Пробная упаковка инициативы целиком (ADR-013): не влезла хоть одна
         # задача — откат всех. Иначе дефицитный исполнитель занят инициативой,
@@ -305,7 +402,7 @@ def build_plan(
             if not place(task, lower_bound(task)):
                 deferred[task.task_id] = DEFERRED_REASON
 
-    if not pi_closed:
+    if not pi_closed and algorithm == ALGORITHM:
         # ---- проходы 2–3: перенос тянет зависимые, догон зазоров -----------
         propagate_deferrals()
         fix_gaps()
@@ -470,6 +567,19 @@ def build_plan(
                  "blocking": [{"task_id": blocking, "ready_from": sprint} for blocking, sprint in pushing]},
             )
 
+        if algorithm == ALGORITHM_LOCAL_SEARCH:
+            assert allocation_solution is not None
+            return (
+                REASON_ROLE_HOURS,
+                "Не выбрана в лучшем найденном варианте целевой функции при текущем лимите поиска. "
+                "Это не доказывает, что задача невыполнима; проверьте цель и оставшиеся ресурсы.",
+                {
+                    "search_status": allocation_solution.solver_status,
+                    "objective_vector": list(allocation_solution.objective_vector),
+                    "solver_reason": "not_selected_by_best_found_plan",
+                },
+            )
+
         # Одна и та же проверка совместной выполнимости (часы и SP, ADR-029), что и при размещении:
         # причина и числа берутся из её журнала, а не пересчитываются упрощённо (DA-16).
         sp_free = sp_free_for(task)
@@ -600,7 +710,7 @@ def build_plan(
         "assumptions": "тот же штат и календарь, без новых задач и найма",
     }
     next_pi_forecast: dict[str, date] = {}
-    if simulate_next_pi and not pi_closed and initiative_mode == INITIATIVE_MODE_GREEDY:
+    if simulate_next_pi and not pi_closed and initiative_mode == INITIATIVE_MODE_GREEDY and algorithm == ALGORITHM:
         pool = {
             task_id for task_id, (code, _text, _details) in reasons.items()
             if code in (REASON_ROLE_HOURS, REASON_TEAM_SP)
@@ -705,9 +815,14 @@ def build_plan(
             if starts[task_id] == ends[task_id]
             else f"спринты {starts[task_id]}–{ends[task_id]}"
         )
+        selection_explanation = (
+            f"Выбрана решателем {ALGORITHM_LOCAL_SEARCH}; объективный вектор "
+            f"{list(allocation_solution.objective_vector) if allocation_solution else []}"
+            if algorithm == ALGORITHM_LOCAL_SEARCH
+            else f"Включена: приоритет {_priority_label(task)} — {rank[task_id]}-я в очереди из {len(ordered)}"
+        )
         parts = [
-                f"Включена: приоритет {_priority_label(task)} — {rank[task_id]}-я в очереди "
-                f"из {len(ordered)}, {window}",
+                f"{selection_explanation}, {window}",
                 "Роли закрыты: "
                 + "; ".join(f"{name} — {', '.join(sorted(people))}" for name, people in sorted(roles.items())),
         ]
@@ -738,8 +853,8 @@ def build_plan(
             "priority_value": str(priority_of[task_id]) if priority_of[task_id] is not None else None,
             "priority_strategy": priority_strategy,
             "priority_source": "business" if task.business_priority is not None else "dataset",
-            "queue_rank": rank[task_id],
-            "queue_size": len(ordered),
+            "queue_rank": rank[task_id] if algorithm == ALGORITHM else None,
+            "queue_size": len(ordered) if algorithm == ALGORITHM else None,
             "roles": {name: sorted(people) for name, people in sorted(roles.items())},
             "loan_hh": str(loan_hh),
             "sp_by_sprint": {str(n): str(sp) for n, sp in sorted(shares.items())},
@@ -775,7 +890,7 @@ def build_plan(
             )
 
     assignments = [_round_hours(row) for task in ordered for row in placed.get(task.task_id, [])]
-    return _assemble(
+    plan = _assemble(
         inputs,
         as_of_sprint,
         schedule,
@@ -785,6 +900,7 @@ def build_plan(
             "dependency_mode": dependency_mode,
             "initiative_mode": initiative_mode,
             "priority_strategy": priority_strategy,
+            "algorithm": algorithm,
             "simulate_next_pi": simulate_next_pi,
             "business_priorities": sorted({item.prodf_id for item in inputs.tasks if item.business_priority is not None}),
             "replan_floor": replan_floor,
@@ -792,6 +908,36 @@ def build_plan(
             "repack": True,
             "next_pi_check": next_pi_check,
             "pi_closed": pi_closed,
+            "optimization": ({
+                "solver_status": allocation_solution.solver_status,
+                "lexicographic_status": [
+                    {"objective": name, "status": status}
+                    for name, status in allocation_solution.lexicographic_status
+                ],
+                "objective_levels": list(allocation_solution.objective_levels),
+                "objective_vector": list(allocation_solution.objective_vector),
+                "objective_bounds": list(allocation_solution.objective_bounds),
+                "objective_bound_semantics": (
+                    "CP-SAT upper bounds for the maximized objective level; these are not Little-method bounds"
+                ),
+                "neighborhood_statuses": [
+                    {"tasks": tasks, "solver_status": status, "accepted": accepted}
+                    for tasks, status, accepted in allocation_solution.neighborhood_statuses
+                ],
+                "neighborhood_log": list(allocation_solution.neighborhood_log),
+                "wall_time_seconds": allocation_solution.wall_time_seconds,
+                "neighborhoods_attempted": allocation_solution.neighborhoods_attempted,
+                "neighborhoods_improved": allocation_solution.neighborhoods_improved,
+                "scales": {
+                    "work": allocation_solution.work_scale,
+                    "hours": allocation_solution.hours_scale,
+                    "story_points": allocation_solution.sp_scale,
+                },
+                "search_method": allocation_solution.search_method,
+            } if allocation_solution is not None else (
+                {"solver_status": "PI_CLOSED", "search_method": "not_run"}
+                if algorithm == ALGORITHM_LOCAL_SEARCH else None
+            )),
             "dependency_fact_issues": dependency_fact_issues,
         },
         sp_shares=tuple(
@@ -804,6 +950,22 @@ def build_plan(
         },
         capacity_rows=capacity_rows,
     )
+    if algorithm == ALGORITHM_LOCAL_SEARCH:
+        from app.planner.local_search import evaluate_objective, validate_plan
+
+        plan.params["objective"] = "business_completion_v1: lexicographic CP-SAT"
+        plan.params["objective_note"] = (
+            "Найденный лексикографический план при заданном лимите; статус и границы "
+            "каждого уровня сохранены в optimization."
+        )
+        plan.params["optimization"]["objective"] = evaluate_objective(
+            plan, inputs, priority_strategy=priority_strategy
+        ).as_dict()
+        violations = validate_plan(plan, inputs, dependency_mode=dependency_mode)
+        if violations:
+            raise RuntimeError("lns-cpsat returned an invalid plan: " + "; ".join(violations))
+        plan.params["optimization"]["independent_validation"] = "passed"
+    return plan
 
 
 def _round_hours(row: Assignment) -> Assignment:

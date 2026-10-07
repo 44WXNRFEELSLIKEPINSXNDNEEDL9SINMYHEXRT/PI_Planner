@@ -173,6 +173,107 @@ def test_task_fits_in_first_sprint_with_own_engineer() -> None:
     assert plan.status == "ok"
 
 
+def test_local_search_finds_one_to_two_task_exchange() -> None:
+    source = inputs(
+        [
+            task("A-80", sp=1, prodf="P-80", roles={1: 80}),
+            task("B-40", sp=1, prodf="P-40-A", roles={1: 40}),
+            task("C-40", sp=1, prodf="P-40-B", roles={1: 40}),
+        ],
+        [engineer("ENG-1")],
+        sprint_count=1,
+        team_sp={T1: 10},
+    )
+
+    plan = planner.build_plan(
+        source,
+        algorithm=planner.ALGORITHM_LOCAL_SEARCH,
+        simulate_next_pi=False,
+        max_time_seconds=10,
+    )
+
+    assert {row.task_id for row in plan.in_quarter} == {"B-40", "C-40"}
+    assert plan.params["algorithm"] == planner.ALGORITHM_LOCAL_SEARCH
+    assert plan.params["optimization"]["independent_validation"] == "passed"
+    assert plan.params["optimization"]["solver_status"] == "OPTIMAL"
+
+
+def test_local_search_rejects_unconfirmed_unknown_role_coverage() -> None:
+    source = replace(
+        inputs(
+            [task("T-1", roles={1: 10})],
+            [engineer("ENG-1")],
+            sprint_count=1,
+            team_sp={T1: 10},
+        ),
+        skill_requirements={("T-1", 1): frozenset({99})},
+        engineer_skills={"ENG-1": frozenset()},
+    )
+
+    plan = planner.build_plan(
+        source,
+        algorithm=planner.ALGORITHM_LOCAL_SEARCH,
+        simulate_next_pi=False,
+        max_time_seconds=10,
+    )
+
+    assert not plan.in_quarter
+    assert plan.schedule[0].reason_code == planner.REASON_SKILL_UNAVAILABLE
+
+
+def test_lns_repairs_greedy_one_to_two_exchange_neighborhood() -> None:
+    from app.planner.local_search.search import improve_with_lns
+    from app.planner.local_search.solver import AllocationSolution
+
+    source = inputs(
+        [
+            task("A-80", sp=1, prodf="P-80", roles={1: 80}),
+            task("B-40", sp=1, prodf="P-40-A", roles={1: 40}),
+            task("C-40", sp=1, prodf="P-40-B", roles={1: 40}),
+        ],
+        [engineer("ENG-1")],
+        sprint_count=1,
+        team_sp={T1: 10},
+    )
+    greedy = planner.build_plan(source, simulate_next_pi=False)
+    assert {row.task_id for row in greedy.in_quarter} == {"A-80"}
+    incumbent = AllocationSolution(
+        selected=frozenset({"A-80"}),
+        starts={"A-80": 1},
+        ends={"A-80": 1},
+        assignments=tuple(greedy.assignments),
+        sp_shares=tuple(greedy.sp_shares),
+        solver_status="FEASIBLE",
+        lexicographic_status=(),
+        objective_vector=("1", "0", "1", "0", "0", "0", "-1"),
+        objective_levels=(),
+        objective_bounds=(),
+        wall_time_seconds=0,
+        work_scale=10000,
+        hours_scale=100,
+        sp_scale=100,
+    )
+
+    result = improve_with_lns(
+        source,
+        {task_id: {1: ["ENG-1"]} for task_id in ("A-80", "B-40", "C-40")},
+        incumbent,
+        replan_floor=1,
+        dependency_mode=planner.DEFAULT_DEPENDENCY_MODE,
+        initiative_mode=planner.INITIATIVE_MODE_GREEDY,
+        priority_strategy=planner.DEFAULT_PRIORITY_STRATEGY,
+        max_time_seconds=5,
+        random_seed=0,
+    )
+
+    assert result.selected == frozenset({"B-40", "C-40"})
+    assert result.search_method == "full_cp_sat_seed_plus_lns"
+    assert result.neighborhoods_attempted >= 1
+    assert result.neighborhoods_improved >= 1
+    assert result.neighborhood_statuses
+    assert any(accepted for _tasks, _status, accepted in result.neighborhood_statuses)
+
+
 def test_confirmed_task_skill_filters_same_role_candidates() -> None:
     source = replace(
         inputs([task("T-1")], [engineer("E-1"), engineer("E-2")]),

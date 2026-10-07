@@ -20,7 +20,7 @@ function parse(hash: string): ScreenId {
   return SCREENS.includes(id) ? id : DEFAULT_SCREEN
 }
 
-/** Простая маршрутизация по хешу (`#/profiles?team=X`): десять экранов, без внешнего роутера. */
+/** Простая маршрутизация по хешу (`#/profiles?team=X`): без внешнего роутера. */
 export function useHashRoute(): [ScreenId, (id: ScreenId, query?: Record<string, string>) => void] {
   const [screen, setScreen] = useState<ScreenId>(() => parse(window.location.hash))
 

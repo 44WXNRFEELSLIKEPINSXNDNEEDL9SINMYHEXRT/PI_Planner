@@ -33,6 +33,15 @@ def write_plan(plan: Plan, *, inputs: Inputs | None = None,
     started = time.perf_counter()
     plan.params.setdefault("observability", {})
     with db.transaction(operation="planner_write") as cur:
+        canonical_baseline_id: int | None = None
+        if plan.as_of_sprint == 0:
+            cur.execute(
+                "SELECT MIN(run_id) AS run_id FROM plan_runs "
+                "WHERE as_of_sprint = 0 AND status IN ('ok', 'infeasible')"
+            )
+            baseline_row = cur.fetchone()
+            if baseline_row and baseline_row.get("run_id") is not None:
+                canonical_baseline_id = int(baseline_row["run_id"])
         cur.execute(
             """
             INSERT INTO plan_runs (pi_id, as_of_sprint, algorithm, params, status, note,
@@ -43,7 +52,7 @@ def write_plan(plan: Plan, *, inputs: Inputs | None = None,
             (
                 plan.pi_id,
                 plan.as_of_sprint,
-                ALGORITHM,
+                plan.params.get("algorithm", ALGORITHM),
                 json.dumps(plan.params, ensure_ascii=False),
                 "failed",  # до проверки результат не виден как успешный
                 plan.note,
@@ -55,11 +64,24 @@ def write_plan(plan: Plan, *, inputs: Inputs | None = None,
             raise RuntimeError("plan_runs не вернул run_id")
         run_id = int(row["run_id"])
         if plan.as_of_sprint == 0:
-            plan.params["baseline_run_id"] = run_id
+            canonical_baseline_id = canonical_baseline_id or run_id
+            plan.params["baseline_run_id"] = canonical_baseline_id
             cur.execute("UPDATE plan_runs SET params = %s::jsonb WHERE run_id = %s",
                         (json.dumps(plan.params, ensure_ascii=False), run_id))
 
-        if plan.baseline:
+        if plan.as_of_sprint == 0 and canonical_baseline_id != run_id:
+            # Alternative baseline plans may select different tasks, but the
+            # committed snapshot is immutable and belongs to the first
+            # published baseline. Reusing it keeps BASELINE_MUTATED invariant.
+            cur.execute(
+                """
+                INSERT INTO plan_baseline (run_id, task_id, planned_sp, committed)
+                SELECT %s, task_id, planned_sp, committed
+                FROM plan_baseline WHERE run_id = %s
+                """,
+                (run_id, canonical_baseline_id),
+            )
+        elif plan.baseline:
             cur.executemany(
                 """
                 INSERT INTO plan_baseline (run_id, task_id, planned_sp, committed)

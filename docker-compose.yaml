@@ -176,6 +176,10 @@ services:
     mem_limit: ${APP_MEMORY_LIMIT:-256m}
     pids_limit: ${APP_PIDS_LIMIT:-100}
     environment:
+      PLANNER_ALGORITHM: ${PLANNER_ALGORITHM:-greedy-priority-topo@2}
+      PLANNER_SEARCH_TIME_SECONDS: ${PLANNER_SEARCH_TIME_SECONDS:-10}
+      PLANNER_RANDOM_SEED: ${PLANNER_RANDOM_SEED:-0}
+      PLANNER_SEARCH_WORKERS: ${PLANNER_SEARCH_WORKERS:-1}
       PI_PLANNER_DSN: >-
         host=db port=5432 dbname=${POSTGRES_DB:-pi_planner}
         user=${POSTGRES_USER:-postgres} password=${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}

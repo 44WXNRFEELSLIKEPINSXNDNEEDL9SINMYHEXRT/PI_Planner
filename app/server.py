@@ -5,7 +5,8 @@
 
 * `POST /api/dataset` — xlsx датасета: ETL, заливка, базовый план;
 * `GET  /api/actuals/template?sprint=N` — CSV-шаблон факта спринта;
-* `POST /api/actuals?sprint=N` — факт спринта, пересборка состояния и пересчёт.
+* `POST /api/actuals?sprint=N` — факт спринта, пересборка состояния и пересчёт;
+* `POST /api/planner/compare` — двойной прогон greedy/LNS на одном входе.
 
 Тело загрузки — сам файл (`Content-Type` неважен, имя — в `?filename=`):
 multipart в stdlib Python 3.13 разбирать нечем, а сырое тело отправляется
@@ -36,10 +37,8 @@ devops, описан в docs/OBSERVABILITY.md. Переименование
 * `/metrics` — всегда 200, даже при мёртвой базе (`pi_planner_db_up 0`): иначе
   мониторинг теряет вместе с метриками и причину их отсутствия.
 
-Отношение к базе — **read-only**: единственные запросы к PostgreSQL это
-`app.db.health()`, `app.db.query_one()` для бизнес-метрик и `app.views.fetch()`
-для витрин, все три идут в read-only сессии. Ни один маршрут этого сервера не
-пишет в контракт планировщика.
+Чтение витрин и метрик идёт в read-only сессиях. Явные операции записи
+планировщика и загрузок проходят через транзакционные функции приложения.
 """
 
 from __future__ import annotations
@@ -103,6 +102,7 @@ MIME_OVERRIDES = {
 # `route` становится `/api/views/{view}` (см. app/metrics.py).
 KNOWN_API = (
     "/api/health", "/api/livez", "/api/version", "/api/views",
+    "/api/planner/compare",
     "/api/me", "/api/dataset", "/api/actuals", "/api/actuals/template", "/api/actuals/role-review",
     "/api/scenarios/absence", "/api/scenarios/sensitivity", "/api/scenarios/workforce",
     "/api/tasks/goal-confirmation", "/api/tasks/skill-review", "/api/initiatives/priority",
@@ -453,7 +453,16 @@ class Handler(BaseHTTPRequestHandler):
             return
         query = parse_qs(urlparse(self.path).query)
         try:
-            if path == "/api/dataset":
+            if path == "/api/planner/compare":
+                try:
+                    payload = json.loads(self._read_body())
+                    result = ingest.compare_algorithms(
+                        int(payload.get("as_of_sprint", 0)),
+                        float(payload.get("search_time_seconds", 10)),
+                    )
+                except (TypeError, ValueError, OverflowError, json.JSONDecodeError) as exc:
+                    raise ingest.UploadError("некорректные параметры двойного прогона", [str(exc)]) from None
+            elif path == "/api/dataset":
                 body = self._read_body()
                 result = ingest.load_dataset(
                     body, self._query_param(query, "filename"), actor=self._principal.name,
@@ -593,9 +602,13 @@ class Handler(BaseHTTPRequestHandler):
             self._audited(f"POST {path}", "failed", error=type(exc).__name__)
             self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, unavailable_payload(exc))
             return
-        log_event("upload_ok", path=path, run_id=(result.get("plan") or {}).get("run_id"),
+        run_id = (result.get("plan") or {}).get("run_id")
+        if run_id is None and result.get("runs"):
+            run_id = result["runs"][-1].get("run_id")
+        log_event("upload_ok", path=path, run_id=run_id,
                   user=self._principal.name)
-        self._audited(f"POST {path}", "ok", run_id=(result.get("plan") or {}).get("run_id"))
+        self._audited(f"POST {path}", "ok", run_id=run_id,
+                      run_ids=[item.get("run_id") for item in result.get("runs", [])])
         self._send_json(HTTPStatus.OK, result)
 
     def _assistant_profile_write(self, path: str) -> None:

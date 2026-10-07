@@ -44,3 +44,32 @@ def test_validation_failure_exits_nonzero_and_reports_run(monkeypatch, capsys) -
     stderr = capsys.readouterr().err
     assert "прогон 42 не опубликован" in stderr
     assert "UNDER_ALLOCATED" in stderr
+
+
+def test_planner_options_can_be_selected_from_environment(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("PLANNER_ALGORITHM", "lns-cpsat@1")
+    monkeypatch.setenv("PLANNER_SEARCH_TIME_SECONDS", "2.5")
+    monkeypatch.setenv("PLANNER_RANDOM_SEED", "17")
+    monkeypatch.setattr(run_planner.db, "dsn", lambda: "dbname=test")
+    monkeypatch.setattr(run_planner.db, "atomic_transaction", nullcontext)
+    monkeypatch.setattr(
+        run_planner.planner,
+        "load_inputs",
+        lambda: inputs([task("A")], [engineer("ENG-1")]),
+    )
+    original_build_plan = run_planner.planner.build_plan
+    captured: dict[str, object] = {}
+
+    def capture_options(source, **options):
+        captured.update(options)
+        return original_build_plan(source, **options)
+
+    monkeypatch.setattr(run_planner.planner, "build_plan", capture_options)
+
+    assert run_planner.main(["--dry-run"]) == 0
+    output = capsys.readouterr().out
+    assert "алгоритм: lns-cpsat@1" in output
+    assert captured["algorithm"] == "lns-cpsat@1"
+    assert captured["max_time_seconds"] == 2.5
+    assert captured["random_seed"] == 17
+    assert captured["simulate_next_pi"] is False

@@ -114,6 +114,7 @@ from app.planner.constants import (  # noqa: F401
     REASON_TEAM_SP,
     SUBSTITUTION_MODE,
 )
+from app.planner.local_search.solver import ALGORITHM_LOCAL_SEARCH  # noqa: F401
 from app.planner.queries import (  # noqa: F401
     ALL_DEPS_SQL,
     ALL_TASKS_SQL,

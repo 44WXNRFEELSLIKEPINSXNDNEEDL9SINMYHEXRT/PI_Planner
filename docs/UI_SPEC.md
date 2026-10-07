@@ -371,7 +371,7 @@ H, факт текущего квартала F), разброс истории 
 | Роль | Маршруты |
 |---|---|
 | `admin` | `POST /api/dataset`, `POST /api/pi-contexts` |
-| `planner` | `POST /api/actuals`, `/api/actuals/role-review`, `/api/tasks/goal-confirmation`, `/api/tasks/skill-review`, `/api/engineers/availability`, `/api/engineers/qualifications`, `/api/initiatives/priority`, `/api/dq-issues/review` |
+| `planner` | `POST /api/actuals`, `/api/actuals/role-review`, `/api/tasks/goal-confirmation`, `/api/tasks/skill-review`, `/api/engineers/availability`, `/api/engineers/qualifications`, `/api/initiatives/priority`, `/api/dq-issues/review`, `/api/planner/compare` |
 | `viewer` | все `GET` (кроме публичных `livez`, `health`, `version`) |
 
 Роль ограничивает действия, а не экраны: `viewer` на экране «Загрузка» видит
