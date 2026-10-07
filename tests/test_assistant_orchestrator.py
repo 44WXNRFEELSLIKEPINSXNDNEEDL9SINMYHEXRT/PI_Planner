@@ -79,3 +79,33 @@ def test_general_question_in_run_chat_still_gets_help():
     intent = orchestrator.classify("Что такое Bus Factor?", has_snapshot=True, focus=None,
                                    metric_codes=set(), has_scenario=False)
     assert intent == orchestrator.Intent("system_help")
+
+
+def test_loan_count_uses_server_facts_and_requires_context():
+    for snapshot in (False, True):
+        intent = orchestrator.classify('напиши количество заемных часов', has_snapshot=snapshot,
+                                       focus=None, metric_codes=set(), has_scenario=False)
+        assert intent.name == 'loan_hours'
+        assert bool(intent.clarification) == (not snapshot)
+
+
+def test_kpi_human_name_is_understood():
+    intent = orchestrator.classify('Почему Bus Factor низкий?', has_snapshot=True,
+                                   focus=None, metric_codes={'bus_factor'}, has_scenario=False)
+    assert intent.name == 'metric_explanation'
+
+
+def test_direct_task_reason_does_not_replace_a_scenario_question():
+    assert orchestrator.direct_task_reason('почему ANL 3042 не попала в план')
+    assert not orchestrator.direct_task_reason('Можно ли нанять аналитика для ANL 3042?')
+
+
+@pytest.mark.parametrize('question', [
+    'обьясни с чего приступить увеличение количества задач',
+    'объясни с чего приступить увеличение количества задач',
+    'проанализируй что мне делать',
+    'какие есть предложения',
+])
+def test_planning_actions_get_a_server_action_plan(question):
+    intent = orchestrator.classify(question, has_snapshot=True, focus=None, metric_codes=set(), has_scenario=False)
+    assert intent.name == 'planning_actions' and intent.clarification is None

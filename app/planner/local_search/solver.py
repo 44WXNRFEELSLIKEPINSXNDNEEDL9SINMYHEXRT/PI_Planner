@@ -8,7 +8,7 @@ from time import monotonic
 from typing import Any
 
 from app.planner.constants import INITIATIVE_MODE_ATOMIC
-from app.planner.model import Assignment, Inputs, Plan
+from app.planner.model import Assignment, Inputs, Plan, TaskInput
 from app.planner.priority import DEFAULT_PRIORITY_STRATEGY, effective_priority
 
 
@@ -32,6 +32,7 @@ class AllocationSolution:
     work_scale: int
     hours_scale: int
     sp_scale: int
+    objective_bounds_scope: str = "full_model"
     search_method: str = "full_cp_sat"
     neighborhoods_attempted: int = 0
     neighborhoods_improved: int = 0
@@ -118,7 +119,7 @@ def solve_allocation(
     следующего уровня. Неподтверждённый префикс отмечается как условный.
     """
     try:
-        from ortools.sat.python import cp_model
+        from ortools.sat.python import cp_model, cp_model_helper
     except ImportError as exc:  # pragma: no cover - depends on installed extras
         raise RuntimeError("algorithm=lns-cpsat requires the ortools dependency") from exc
 
@@ -241,7 +242,7 @@ def solve_allocation(
                     efficiency, efficiency_scale, name=f"coverage[{engineer_id},{role_id}]"
                 )
                 for home_team_id, _rate in sorted(engineer.orbits.items()):
-                    for sprint_no in range(max(1, replan_floor), inputs.sprint_count + 1):
+                    for sprint_no in range(max(1, replan_floor, task.earliest_start_sprint), inputs.sprint_count + 1):
                         factor = inputs.sprint_factors.get(sprint_no, Decimal(1))
                         orbit_rate = inputs.sprint_orbit_rates.get(
                             (engineer_id, home_team_id, sprint_no), engineer.orbits[home_team_id]
@@ -535,6 +536,9 @@ def solve_allocation(
     for task in tasks:
         initiative_members[task.prodf_id].append(task.task_id)
     for index, (prodf_id, members) in enumerate(sorted(initiative_members.items())):
+        if set(members) <= fixed_ids:
+            complete_vars[prodf_id] = model.NewConstant(int(set(members) <= incumbent.selected))
+            continue
         complete = model.NewBoolVar(f"initiative_complete_{index}")
         model.Add(sum(selected_var[task_id] for task_id in members) == len(members)).OnlyEnforceIf(complete)
         model.Add(sum(selected_var[task_id] for task_id in members) <= len(members) - 1).OnlyEnforceIf(complete.Not())
@@ -581,6 +585,12 @@ def solve_allocation(
         if role_demand <= 0:
             continue
         role_units = _units(role_demand, work_scale, name=f"stability[{task_id},{role_id}]")
+        if task_id in fixed_ids:
+            retained = sum(units for (candidate_task, candidate_role, engineer_id, _orbit, _sprint), units
+                           in fixed_work.items() if candidate_task == task_id and candidate_role == role_id
+                           and engineer_id in preferred)
+            change_vars.append(int(task_id in incumbent.selected and 2 * retained < role_units))
+            continue
         retained_work = sum(
             variable for (candidate_task, candidate_role, engineer_id, _orbit, _sprint), variable
             in [*work_vars.items(), *fixed_work.items()]
@@ -601,6 +611,10 @@ def solve_allocation(
     for index, (task_id, baseline) in enumerate(sorted(inputs.baseline_schedule.items())):
         old_end = baseline[2]
         if old_end is None or task_id not in selected_var:
+            continue
+        if task_id in fixed_ids:
+            current_end = incumbent.ends[task_id] if task_id in incumbent.selected else inputs.sprint_count + 1
+            delay_vars.append(max(0, current_end - old_end))
             continue
         delay = model.NewIntVar(0, inputs.sprint_count + 1, f"baseline_delay_{index}")
         model.AddMaxEquality(delay, [
@@ -651,6 +665,21 @@ def solve_allocation(
         model.Add(variable >= used)
         used_rows.append(used)
     objective_exprs.append(("-assignment_rows", -sum(used_rows)))
+
+    # Fold fixed objective components before dividing the solve budget.
+    def fold_constant(expression):
+        if isinstance(expression, int):
+            return expression
+        flat = cp_model_helper.FlatIntExpr(expression)
+        value = flat.offset
+        for variable, coefficient in zip(flat.vars, flat.coeffs):
+            domain = model.Proto().variables[variable.Index()].domain
+            if len(domain) != 2 or domain[0] != domain[1]:
+                return expression
+            value += coefficient * domain[0]
+        return int(value)
+
+    objective_exprs = [(name, fold_constant(expression)) for name, expression in objective_exprs]
 
     last_snapshot: AllocationSolution | None = incumbent
     statuses: list[tuple[str, str]] = []
@@ -747,6 +776,10 @@ def solve_allocation(
             hint(hint_solution)
         if reference is not None and prefix_equal and index < len(reference):
             model.Add(expression >= reference[index])
+        # The retained snapshot has the fixed prefix. Preserve its current
+        # value even after improving an earlier level over the original floor.
+        if last_snapshot is not None and index < len(last_snapshot.objective_vector):
+            model.Add(expression >= int(last_snapshot.objective_vector[index]))
         remaining = max_time_seconds - (monotonic() - started)
         if remaining <= 0:
             statuses.append((name, "BUDGET_EXHAUSTED"))
@@ -815,6 +848,7 @@ def solve_allocation(
             "solver_status": last_solver_status,
             "lexicographic_status": tuple(statuses),
             "objective_bounds": tuple(objective_bounds),
+            "objective_bounds_scope": "full_model" if unlocked == set(task_by_id) else "neighborhood",
             "wall_time_seconds": monotonic() - started,
         }
     )

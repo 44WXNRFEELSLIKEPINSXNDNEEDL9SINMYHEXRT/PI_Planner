@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 from psycopg.types.json import Jsonb
 
 from app import auth, db
-from app.assistant import facts, retrieval, snapshots
+from app.assistant import facts, orchestrator, retrieval, snapshots
 
 MAX_MODEL_FACT_CHARS = 18000
 
@@ -20,17 +20,19 @@ def prepare(snapshot_id: UUID | None, question: str,
             found: retrieval.SearchResult,
             document_context: str,
             scenario: dict[str, Any] | None = None,
-            comparison: dict[str, Any] | None = None) -> tuple[list[dict[str, Any]], str]:
+            comparison: dict[str, Any] | None = None,
+            operation: str | None = None) -> tuple[list[dict[str, Any]], str]:
     records: list[dict[str, Any]] = []
     context = ""
     if snapshot_id is not None:
-        if comparison is not None:
+        if operation == "planning_actions":
+            payload = facts.get_improvement_plan(snapshot_id)
+        elif comparison is not None:
             payload = comparison
         else:
             _inputs, plan, _baseline, _options = snapshots.load(snapshot_id)
             codes = {row.kpi_code for row in plan.kpis}
-            mentioned = [code for code in sorted(codes, key=len, reverse=True)
-                         if re.search(r"(?<![\w])" + re.escape(code) + r"(?![\w])", question, re.I)]
+            mentioned = orchestrator.metric_mentions(question, codes)
             if focus and focus[0] == "task":
                 payload = facts.get_task_trace(snapshot_id, focus[1])
             elif focus and focus[0] == "team":
@@ -167,3 +169,100 @@ def get(principal: auth.Principal, evidence_id: str) -> dict[str, Any]:
     return {"evidence_id": str(row["evidence_id"]), "source_type": row["source_type"],
             "source_ref": row["source_ref"], "payload": row["payload"],
             "created_at": row["created_at"].isoformat()}
+
+
+def _server_answer(summary: str, explanation: str, records: list[dict[str, Any]],
+                   revision: int, newer: bool | None, focus: tuple[str, str] | None) -> dict[str, Any]:
+    return {"status": "answered", "summary": summary, "explanation": explanation,
+            "clarification": "", "fact_refs": [], "recommendations": [],
+            "evidence_ids": [str(record["evidence_id"]) for record in records],
+            "entity_refs": [{"type": focus[0], "id": focus[1], "context_revision": revision}] if focus else [],
+            "context_revision": revision, "newer_run_available": newer,
+            "limitations": [], "sources": []}
+
+
+def loan_answer(records: list[dict[str, Any]], revision: int, newer: bool | None,
+                focus: tuple[str, str] | None = None) -> dict[str, Any] | None:
+    """Answer a direct loan-hours question from assignments without an LLM call."""
+    record = next((item for item in records if item["source_type"] == "snapshot"
+                   and "loan_hours" in item["payload"]), None)
+    if record is None:
+        return None
+    payload = record["payload"]
+    scope = "выбранной задачи" if focus and focus[0] == "task" else (
+        "выбранной команды" if focus else "выбранного плана")
+    reference = f"[evidence:{record['evidence_id']}]"
+    summary = f"Заёмные часы {scope}: {payload['loan_hours']} ч."
+    explanation = "Это часы назначений, списанные с орбит других команд, а не дополнительные часы сверх фонда."
+    rows = payload.get("loan_hours_by_sprint", [])
+    if rows:
+        explanation += "\n\nПо спринтам:\n" + "\n".join(
+            f"- Спринт {row['sprint_no']}: {row['hours']} ч." for row in rows)
+    explanation += f"\n\nИсточник: назначения закреплённого прогона {reference}."
+    answer = _server_answer(summary, explanation, records, revision, newer, focus)
+    answer["intent"] = "loan_hours"
+    return answer
+
+
+def task_answer(records: list[dict[str, Any]], revision: int, newer: bool | None,
+                focus: tuple[str, str] | None) -> dict[str, Any] | None:
+    """Keep the saved task explanation when model output cannot be verified."""
+    record = next((item for item in records if item["source_type"] == "snapshot"
+                   and item["payload"].get("operation") == "get_task_trace"), None)
+    if record is None or not record["payload"].get("schedule"):
+        return None
+    row = record["payload"]["schedule"][0]
+    reason = row.get("reason_text")
+    if not reason:
+        return None
+    summary = (f"Задача [entity:{row['task_id']}] включена в план." if row["decision"] == "in_quarter"
+               else f"Задача [entity:{row['task_id']}] перенесена.")
+    explanation = reason + f"\n\nИсточник: решение планировщика [evidence:{record['evidence_id']}]."
+    return _server_answer(summary, explanation, records, revision, newer, focus)
+
+
+def action_answer(records: list[dict[str, Any]], revision: int, newer: bool | None) -> dict[str, Any] | None:
+    record = next((item for item in records if item["source_type"] == "snapshot"
+                   and item["payload"].get("operation") == "get_improvement_plan"), None)
+    if record is None:
+        return None
+    payload = record["payload"]
+    roles = payload["missing_roles"]
+    reasons = payload["reason_counts"]
+    steps = []
+    if not payload["deferred_tasks"]:
+        summary = "Все задачи выбранного снимка уже включены в план."
+        steps.append("Проверьте сроки и устойчивость назначений; увеличение объёма требует новых задач и отдельного расчёта.")
+    elif roles:
+        top = roles[0]
+        summary = f"Начните с роли «{top['role_name']}»: её нет у доступных специалистов в сохранённом снимке."
+        steps.append("Подтвердите потребности и роли в исходных данных. Отсутствующие роли:")
+        steps.extend(f"- «{role['role_name']}»: требуется для {len(role['task_ids'])} отложенных задач; "
+                     f"сметная работа {role['required_work_hours']} ч." for role in roles)
+        steps.append("Выберите способ закрыть дефицит: исправить ошибку в данных или рассчитать сценарий найма/обучения. "
+                     "Для сценария нужны команда, роль, ставка и спринт начала; для обучения также навыки и затраты наставника.")
+    else:
+        summary = "Начните с причин переноса задач в закреплённом прогоне."
+    if payload["skill_gap_tasks"]:
+        steps.append(f"Проверьте подтверждённые навыки: подходящие исполнители не найдены для "
+                     f"{len(payload['skill_gap_tasks'])} отложенных задач.")
+    if reasons.get("ETC_REQUIRED"):
+        steps.append("Запросите оставшуюся оценку работ для задач с неизвестным ETC; затем пересчитайте план.")
+    if reasons.get("BLOCKED_BY_DEFERRED"):
+        steps.append("Разберите блокирующие задачи перед зависимыми: добавление ресурса зависимой задаче не устраняет её предшественника.")
+    if reasons.get("ROLE_HOURS_EXHAUSTED"):
+        steps.append("Для дефицита часов проверьте ставки, календарь и занятость подходящих людей; "
+                     "сравните перераспределение и наём сценарием.")
+    if reasons.get("TEAM_SP_EXHAUSTED"):
+        steps.append("Для дефицита SP проверьте историю скорости и focus_factor команды; "
+                     "дополнительные часы сами по себе не снимают лимит SP.")
+    if payload["deferred_tasks"]:
+        steps.append("После подтверждения меры пересчитайте сценарий и сравните состав задач, завершённые инициативы и сроки. "
+                     "Число затронутых задач не равно гарантированному приросту: зависимости, другие роли "
+                     "и ёмкость могут остаться ограничением.")
+    explanation = (f"В плане {payload['selected_tasks']} из {payload['task_count']} задач; "
+                   f"отложено {payload['deferred_tasks']}.\n\n" + "\n\n".join(steps)
+                   + f"\n\nОснование: сохранённый снимок [evidence:{record['evidence_id']}].")
+    result = _server_answer(summary, explanation, records, revision, newer, None)
+    result["limitations"] = ["Эффект мер не рассчитан; опубликованный план не изменён."]
+    return result

@@ -41,7 +41,7 @@ cache:
 
 .postgres:
   services:
-    - name: postgres:17-bookworm
+    - name: pgvector/pgvector:0.8.6-pg17-bookworm
       alias: postgres
   variables:
     PI_PLANNER_DSN: "host=postgres port=5432 dbname=pi_planner user=postgres password=postgres"
@@ -120,6 +120,8 @@ schema-equivalence:
               c.execute(f"CREATE DATABASE {name}")
       PY
     - export BASE="host=postgres port=5432 user=postgres password=postgres"
+    # python:3.14-slim не содержит git; он нужен для git archive ниже.
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends git >/dev/null
     # 1. Чистая установка из текущего дерева, затем migrate — обязан быть no-op.
     - export PI_PLANNER_DSN="$BASE dbname=fresh"
     - >
@@ -157,7 +159,11 @@ web:
   script:
     - npm run build
     - cd ..
-    - git diff --exit-code -- web/dist || { echo "web/dist устарел: выполните npm run build и закоммитьте" >&2; exit 1; }
+    - |
+      if ! git diff --exit-code -- web/dist; then
+        echo "web/dist устарел: выполните npm run build и закоммитьте" >&2
+        exit 1
+      fi
   cache:
     key: "npm-$CI_COMMIT_REF_SLUG"
     paths: [web/node_modules/.cache]
@@ -170,7 +176,7 @@ e2e-ui:
   stage: test
   allow_failure: true
   services:
-    - name: postgres:17-bookworm
+    - name: pgvector/pgvector:0.8.6-pg17-bookworm
       alias: postgres
   variables:
     PI_PLANNER_DSN: "host=postgres port=5432 dbname=pi_planner user=postgres password=postgres"

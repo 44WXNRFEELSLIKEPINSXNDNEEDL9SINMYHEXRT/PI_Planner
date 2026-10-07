@@ -32,3 +32,20 @@ def public_payload(value: Any, principal: auth.Principal) -> Any:
                                  if isinstance(item, str) and item.startswith("Векторный поиск:") else item
                                  for item in result["limitations"]]
     return result
+
+
+def job_error(value: Any, principal: auth.Principal, job_id: str) -> dict[str, Any] | None:
+    """Return the documented error envelope, including for older stored flat errors."""
+    safe = public_payload(value, principal)
+    if safe is None:
+        return None
+    error = dict(safe.get("error", safe))
+    messages = {
+        "rate_limited": "Сервис модели достиг лимита запросов. Повторите позже или выберите другую модель.",
+        "message_deadline_exceeded": "Модель не успела ответить. Повторите вопрос или выберите другую модель.",
+        "provider_timeout": "Модель не ответила вовремя. Повторите вопрос позже.",
+        "provider_unavailable": "Сервис модели временно недоступен. Повторите вопрос позже.",
+    }
+    if error.get("code") in messages:
+        error["message"] = messages[error["code"]]
+    return {"request_id": safe.get("request_id", job_id), "error": error}

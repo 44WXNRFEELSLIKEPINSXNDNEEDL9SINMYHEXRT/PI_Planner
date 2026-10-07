@@ -17,6 +17,14 @@ SYSTEM_HELP = """PI Planner хранит загруженный датасет, 
 Плановый чат закреплён за конкретным прогоном; после нового прогона пользователь явно меняет его контекст.
 План показывает расписание задач, назначения, KPI и предупреждения. Сценарии ресурсов и чувствительности
 не публикуют штатный план. Для точных чисел, причин решений и источников нужен закреплённый снимок прогона.
+Роли сотрудников и потребности задач по ролям приходят из загруженного Excel; доступность исполнителей
+определяется покрытием ролей и подтверждёнными навыками. Замещение отсутствующей роли не предполагается.
+Ёмкость команды в SP рассчитывается из истории фактической скорости и focus_factor; при пересчёте
+учитывается подтверждённый факт закрытых спринтов. Фонд часов людей считается отдельно по ставкам,
+орбитам команд, календарю и доступности. Достаточно часов не означает достаточно ёмкости SP.
+Bus Factor относится к навыкам, требуемым живым бэклогом, и подтверждённым носителям критичных навыков.
+Если релевантные навыки не размечены, показатель не определён; оценка через роль — лишь приближение.
+Эти общие правила доступны без снимка. Не спрашивай у пользователя, где сервер хранит поля или данные.
 Если данных для ответа нет, объясни, какие именно данные нужны. Не обещай действия, которых сервер не выполнил."""
 
 ANSWER_SCHEMA: dict[str, Any] = {
@@ -57,19 +65,32 @@ def history(conversation_id: UUID, revision: int, latest_message_id: UUID) -> li
     return result
 
 
+def entity_mentions(question: str, identifiers) -> list[str]:
+    """Match canonical IDs with omitted/alternate separators, preserving ambiguity."""
+    result = []
+    for identifier in identifiers:
+        parts = re.split(r"[-_\s–—‑]+", identifier.casefold())
+        pattern = r"(?<![\w])" + r"[-_\s–—‑]*".join(re.escape(part) for part in parts) + r"(?![\w])"
+        if re.search(pattern, question.casefold()):
+            result.append(identifier)
+    return result
+
+
 def focus(conversation_id: UUID, revision: int, snapshot_id: UUID | None,
           question: str) -> tuple[str, str] | None:
     if snapshot_id is None:
         return None
     inputs, _plan, _baseline, _options = snapshots.load(snapshot_id)
-    words = set(re.findall(r"[\w.-]+", question.lower()))
-    teams = [team for team in inputs.team_sp_per_sprint if team.lower() in words]
-    tasks = [task.task_id for task in inputs.tasks if task.task_id.lower() in words]
+    teams = entity_mentions(question, inputs.team_sp_per_sprint)
+    tasks = entity_mentions(question, (task.task_id for task in inputs.tasks))
     if len(tasks) == 1 and not teams:
         return "task", tasks[0]
     if len(teams) == 1 and not tasks:
         return "team", teams[0]
     if teams or tasks:
+        return None
+    # Carry focus only for references to the previous object, not a new general question.
+    if not re.search(r"\b(?:эт\w*|он[аи]?|не[её]|них|его|е[её])\b|^\s*(?:почему|а дальше|подробнее)\s*[?!]*$", question.casefold()):
         return None
     row = db.query_one(
         "SELECT payload FROM public.assistant_messages WHERE conversation_id = %s "

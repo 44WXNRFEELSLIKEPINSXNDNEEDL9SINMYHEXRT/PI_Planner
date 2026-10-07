@@ -2,20 +2,17 @@
 from __future__ import annotations
 
 import random
-from itertools import combinations
+from collections.abc import Iterator
+from itertools import combinations, islice, zip_longest
 from time import monotonic
 
 from app.planner.local_search.solver import AllocationSolution, solve_allocation
 from app.planner.model import Inputs, TaskInput
+from app.planner.priority import DEFAULT_PRIORITY_STRATEGY, order_tasks
 
 
-def _task_order(tasks: tuple[TaskInput, ...]) -> list[TaskInput]:
-    return sorted(tasks, key=lambda task: (
-        task.priority_rung is None,
-        -(task.business_priority if task.business_priority is not None else task.priority_rung or 0),
-        task.topo_order,
-        task.task_id,
-    ))
+def _task_order(tasks: tuple[TaskInput, ...], priority_strategy: str = DEFAULT_PRIORITY_STRATEGY) -> list[TaskInput]:
+    return order_tasks(tasks, priority_strategy)
 
 
 def _neighborhoods(
@@ -23,80 +20,61 @@ def _neighborhoods(
     incumbent: AllocationSolution,
     *,
     limit: int,
+    priority_strategy: str = DEFAULT_PRIORITY_STRATEGY,
 ) -> list[frozenset[str]]:
-    """Deterministic small neighborhoods plus the 1-to-2 exchange operator."""
+    """Interleave bounded operator streams so repacking cannot starve exchanges."""
+    if limit <= 0:
+        return []
     tasks = {task.task_id: task for task in inputs.tasks}
     selected = incumbent.selected
-    deferred = set(tasks) - selected
-    ordered_deferred = [task.task_id for task in _task_order(tuple(tasks[key] for key in deferred))]
-    ordered_selected = [task.task_id for task in _task_order(tuple(tasks[key] for key in selected))]
+    ordered = _task_order(inputs.tasks, priority_strategy)
+    deferred = [task.task_id for task in ordered if task.task_id not in selected]
+    chosen = [task.task_id for task in ordered if task.task_id in selected]
+
+    def competitors(task_id: str) -> list[str]:
+        task = tasks[task_id]
+        return [other for other in deferred
+                if tasks[other].team_id == task.team_id or set(tasks[other].needed) & set(task.needed)]
+
+    def exchanges(count: int) -> Iterator[set[str]]:
+        for task_id in chosen:
+            for candidates in combinations(competitors(task_id), count):
+                yield {task_id, *candidates}
+
+    predecessors: dict[str, set[str]] = {}
+    for blocking, blocked, _gap in inputs.deps:
+        if blocking in tasks and blocked in tasks:
+            predecessors.setdefault(blocked, set()).add(blocking)
+
+    def chains() -> Iterator[set[str]]:
+        for task_id in chosen + deferred:
+            ids = {task_id}
+            frontier = [task_id]
+            while frontier:
+                current = frontier.pop()
+                for blocking in sorted(predecessors.get(current, set()) - ids):
+                    ids.add(blocking)
+                    frontier.append(blocking)
+            yield ids
+
+    streams = [
+        (set(members) for members in _initiative_groups(inputs).values()
+         if any(member not in selected for member in members)),
+        ({task_id} for task_id in chosen),
+        exchanges(2), exchanges(1), exchanges(3),
+        ({task_id} for task_id in deferred), chains(),
+    ]
     result: list[frozenset[str]] = []
     seen: set[frozenset[str]] = set()
-
-    def add(ids: set[str]) -> None:
-        neighborhood = _close(inputs, ids, selected)
-        if neighborhood and neighborhood not in seen and len(result) < limit:
-            seen.add(neighborhood)
-            result.append(neighborhood)
-
-    # Atomic initiatives must be released as one unit, regardless of size.
-    if incumbent is not None:
-        for members in _initiative_groups(inputs).values():
-            if any(task_id in deferred for task_id in members):
-                add(set(members))
-
-    # Repack each selected task on its own: this can move work to earlier
-    # sprints, reduce borrowed capacity, or change engineers without changing selection.
-    for task_id in ordered_selected:
-        add({task_id})
-
-    # One-for-two exchanges are necessary for the 80 -> 40 + 40 trap.
-    for selected_id in ordered_selected:
-        selected_task = tasks[selected_id]
-        candidates = [
-            task_id for task_id in ordered_deferred
-            if tasks[task_id].team_id == selected_task.team_id
-            or set(tasks[task_id].needed) & set(selected_task.needed)
-        ]
-        for first, second in combinations(candidates, 2):
-            if tasks[first].team_id != tasks[second].team_id:
+    # Bound duplicate-heavy streams (large initiatives can collapse many exchanges).
+    for batch in zip_longest(*(islice(stream, limit * 4) for stream in streams)):
+        for ids in batch:
+            if ids is None:
                 continue
-            add({selected_id, first, second})
-            if len(result) >= limit:
-                return result
-
-    # Release a selected task and one competing deferred task together.
-    for deferred_id in ordered_deferred:
-        deferred_task = tasks[deferred_id]
-        candidates = [
-            selected_id for selected_id in ordered_selected
-            if tasks[selected_id].team_id == deferred_task.team_id
-            or set(tasks[selected_id].needed) & set(deferred_task.needed)
-        ]
-        for selected_id in candidates:
-            add({selected_id, deferred_id})
-            if len(result) >= limit:
-                return result
-
-    # A single moved task can fill a small unused gap.
-    for task_id in ordered_deferred:
-        add({task_id})
-        if len(result) >= limit:
-            return result
-
-    # Repack two deferred tasks against an already selected task, even where
-    # the shared bottleneck is an engineer rather than the task's home team.
-    role_candidates: dict[int, list[str]] = {}
-    for role_id in sorted({role for task in tasks.values() for role in task.needed}):
-        role_candidates[role_id] = [
-            task_id for task_id in ordered_deferred if role_id in tasks[task_id].needed
-        ]
-    for selected_id in ordered_selected:
-        for role_id, deferred_ids in role_candidates.items():
-            if role_id not in tasks[selected_id].needed:
-                continue
-            for first, second in combinations(deferred_ids, 2):
-                add({selected_id, first, second})
+            neighborhood = _close(inputs, ids, selected)
+            if neighborhood and neighborhood not in seen:
+                seen.add(neighborhood)
+                result.append(neighborhood)
                 if len(result) >= limit:
                     return result
     return result
@@ -110,19 +88,22 @@ def _initiative_groups(inputs: Inputs) -> dict[str, list[str]]:
 
 
 def _close(inputs: Inputs, ids: set[str], selected: frozenset[str]) -> frozenset[str]:
-    """Release what a selection change needs: whole initiatives and, for each
-    deferred task, its deferred predecessors (transitively)."""
+    """Release initiatives, selected successors and deferred predecessors."""
     groups = _initiative_groups(inputs)
     by_task = {task.task_id: task.prodf_id for task in inputs.tasks}
     blockers: dict[str, set[str]] = {}
+    successors: dict[str, set[str]] = {}
     for blocking, blocked, _gap in inputs.deps:
         if blocking in by_task and blocked in by_task:
             blockers.setdefault(blocked, set()).add(blocking)
+            successors.setdefault(blocking, set()).add(blocked)
     result = set(ids)
     frontier = list(ids)
     while frontier:
         task_id = frontier.pop()
         related = set(groups[by_task[task_id]])
+        # A fixed selected successor would force this task to remain selected.
+        related |= successors.get(task_id, set()) & selected
         if task_id not in selected:
             related |= {item for item in blockers.get(task_id, ()) if item not in selected}
         for item in related - result:
@@ -147,6 +128,7 @@ def _conflict_neighborhood(
     eligible_by_task: dict[str, dict[int, list[str]]],
     rng: random.Random,
     size: int,
+    priority_strategy: str = DEFAULT_PRIORITY_STRATEGY,
 ) -> frozenset[str]:
     """A deferred task plus the selected tasks holding the resources it needs.
 
@@ -156,9 +138,8 @@ def _conflict_neighborhood(
     """
     tasks = {task.task_id: task for task in inputs.tasks}
     selected = incumbent.selected
-    deferred = [task.task_id for task in _task_order(tuple(
-        task for task in inputs.tasks if task.task_id not in selected and task.needed
-    ))]
+    deferred = [task.task_id for task in _task_order(inputs.tasks, priority_strategy)
+                if task.task_id not in selected and task.needed]
     if not deferred:
         return frozenset()
     pick = deferred[min(len(deferred) - 1, int(rng.expovariate(0.35)))]
@@ -191,6 +172,8 @@ def _random_neighborhood(
     rng: random.Random,
     size: int,
     eligible_by_task: dict[str, dict[int, list[str]]] | None = None,
+    priority_strategy: str = DEFAULT_PRIORITY_STRATEGY,
+    operator_weights: dict[str, float] | None = None,
 ) -> tuple[str, frozenset[str]]:
     """Structured random neighborhood of about `size` tasks, with its kind.
 
@@ -204,9 +187,10 @@ def _random_neighborhood(
     kinds = ["team", "engineer", "window", "mixed"]
     if deferred and eligible_by_task is not None:
         kinds += ["conflict", "conflict"]
-    kind = rng.choice(kinds)
+    kind = (rng.choices(kinds, weights=[operator_weights.get(item, 1.0) for item in kinds], k=1)[0]
+            if operator_weights is not None else rng.choice(kinds))
     if kind == "conflict":
-        free = _conflict_neighborhood(inputs, incumbent, eligible_by_task or {}, rng, size)
+        free = _conflict_neighborhood(inputs, incumbent, eligible_by_task or {}, rng, size, priority_strategy)
         if free:
             return kind, free
         kind = "mixed"
@@ -273,7 +257,7 @@ def improve_with_lns(
     random neighborhoods whose size adapts: an exactly solved neighborhood
     without gain grows, one that times out shrinks. After `max_stale_random`
     fruitless random attempts the search releases every task at once; if that
-    is solved exactly, the incumbent is a proven lexicographic optimum and the
+    is solved exactly, the best result is a proven lexicographic optimum and the
     search stops, otherwise the size resets and the search goes on.
     `max_neighborhoods <= 0` disables the search.
     """
@@ -283,6 +267,9 @@ def improve_with_lns(
     started = monotonic()
     rng = random.Random(random_seed)
     best = initial
+    pool = [initial]
+    operator_weights: dict[str, float] = {}
+    visited = {_signature(initial)}
     attempted = improved = stale = 0
     proven = False
     neighborhood_statuses: list[tuple[str, str, bool]] = []
@@ -298,10 +285,11 @@ def improve_with_lns(
         remaining = max_time_seconds - (monotonic() - started)
         if remaining <= 0.05:
             break
-        signature = _signature(best)
+        base = rng.choice(pool) if attempted % 3 else best
+        signature = _signature(base)
         if deterministic_cache is None or deterministic_cache[0] != signature:
             deterministic_cache = (
-                signature, _neighborhoods(inputs, best, limit=max_neighborhoods * 4)
+                signature, _neighborhoods(inputs, base, limit=max_neighborhoods * 4, priority_strategy=priority_strategy)
             )
         free = next((group for group in deterministic_cache[1]
                      if (group, signature) not in tried), None)
@@ -312,7 +300,7 @@ def improve_with_lns(
             if stale >= max_stale_random:
                 kind, free = "full", all_tasks
             else:
-                kind, free = _random_neighborhood(inputs, best, rng, size, eligible_by_task)
+                kind, free = _random_neighborhood(inputs, base, rng, size, eligible_by_task, priority_strategy, operator_weights)
         if kind != "full" and (free, signature) in tried:
             stale += 1
             continue
@@ -326,10 +314,13 @@ def improve_with_lns(
             initiative_mode=initiative_mode, priority_strategy=priority_strategy,
             max_time_seconds=budget,
             random_seed=random_seed + attempted,
-            incumbent=best, free_task_ids=free,
+            incumbent=base, free_task_ids=free,
         )
         before, after = _vector(best), _vector(candidate)
         accepted = after > before
+        if kind not in ("deterministic", "full"):
+            reward = 5.0 if accepted else (2.0 if after == before and _signature(candidate) != signature else 0.5)
+            operator_weights[kind] = 0.8 * operator_weights.get(kind, 1.0) + 0.2 * reward
         changed = next((i for i, (a, b) in enumerate(zip(before, after)) if a != b), None)
         if len(neighborhood_statuses) < 500:
             neighborhood_statuses.append((",".join(sorted(free)), candidate.solver_status, accepted))
@@ -350,11 +341,21 @@ def improve_with_lns(
             improved += 1
             stale = 0
             best = candidate  # a neighborhood proof is not a global optimality proof
+            pool = [candidate]
+            visited = {_signature(candidate)}
         elif kind != "deterministic":
             stale += 1
+        if after == _vector(best) and _signature(candidate) not in visited:
+            visited.add(_signature(candidate))
+            pool.append(candidate)
+            if len(pool) > 4:
+                pool.pop(0)
+            # Keep publication incumbent available even during neutral exploration.
+            if best not in pool:
+                pool[0] = best
         if kind == "full":
-            # Every task was free: an exact solve without gain proves optimality.
-            proven = candidate.solver_status == "OPTIMAL" and not accepted
+            # Every task was free: an exact solve proves global optimality, including an improvement.
+            proven = candidate.solver_status == "OPTIMAL"
             stale = 0
             size = min(total_tasks, 6)
         elif kind != "deterministic":

@@ -316,7 +316,7 @@ def get_job(principal: auth.Principal, job_id: Any) -> dict[str, Any]:
         raise ChatError("job_not_found", 404)
     return {"job_id": str(row["job_id"]), "status": row["status"],
             "result": diagnostics.public_payload(row["result_payload"], principal),
-            "error": diagnostics.public_payload(row["error_payload"], principal)}
+            "error": diagnostics.job_error(row["error_payload"], principal, str(row["job_id"]))}
 
 
 def cancel_job(principal: auth.Principal, job_id: Any) -> dict[str, Any]:
@@ -335,4 +335,4 @@ def cancel_job(principal: auth.Principal, job_id: Any) -> dict[str, Any]:
             raise ChatError("job_not_found", 404)
         return {"job_id": str(row["job_id"]), "status": row["status"],
                 "result": diagnostics.public_payload(row["result_payload"], principal),
-            "error": diagnostics.public_payload(row["error_payload"], principal)}
+            "error": diagnostics.job_error(row["error_payload"], principal, str(row["job_id"]))}

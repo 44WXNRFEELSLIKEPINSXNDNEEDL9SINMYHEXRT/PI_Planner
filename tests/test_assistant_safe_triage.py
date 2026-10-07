@@ -53,3 +53,13 @@ def test_complete_ranked_report_and_followup(monkeypatch):
     assert triage.requested('можешь загрузить все критичные проблемы себе в контекст и сказать порядок', None)
     monkeypatch.setattr(triage.db, 'query_one', lambda *a: {'payload': result})
     assert triage.previous(uuid4(), 1, uuid4()) is None
+
+
+def test_job_error_matches_ui_envelope_and_preserves_retry():
+    principal = auth.Principal('user', 'viewer', 'db', 1)
+    result = diagnostics.job_error({'code': 'rate_limited', 'message': 'rate_limited', 'retryable': True}, principal, 'job')
+    assert result['request_id'] == 'job'
+    assert result['error']['code'] == 'rate_limited'
+    assert result['error']['retryable'] is True
+    assert 'лимита запросов' in result['error']['message']
+    assert diagnostics.job_error(None, principal, 'job') is None

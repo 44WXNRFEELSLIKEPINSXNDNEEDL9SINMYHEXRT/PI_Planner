@@ -107,3 +107,50 @@ def test_markdown_list_numbers_are_not_numeric_claims():
     answer["explanation"] += "\n4. В плане 37 задач."
     with pytest.raises(ValueError, match="untyped_numeric_claim"):
         evidence.render_fact_refs(answer, [])
+
+
+def test_loan_totals_include_zero_sprints_and_only_foreign_orbits():
+    from decimal import Decimal
+    from types import SimpleNamespace
+    rows = [SimpleNamespace(sprint_no=1, hours=Decimal('7.50'), home_team_id='A', serving_team_id='B'),
+            SimpleNamespace(sprint_no=1, hours=Decimal('20'), home_team_id='B', serving_team_id='B')]
+    totals = facts._loan_totals(rows, 2)
+    assert totals['loan_hours'] == Decimal('7.50')
+    assert totals['loan_hours_by_sprint'] == [{'sprint_no': 1, 'hours': Decimal('7.50')},
+                                             {'sprint_no': 2, 'hours': Decimal(0)}]
+
+
+def test_direct_loan_answer_uses_stored_amounts():
+    eid = uuid4()
+    records = [{'evidence_id': eid, 'source_type': 'snapshot',
+                'payload': {'loan_hours': '267.00', 'loan_hours_by_sprint': [{'sprint_no': 1, 'hours': '100.00'}]}}]
+    result = evidence.loan_answer(records, 1, False)
+    assert result['status'] == 'answered' and '267.00' in result['summary']
+    assert 'Спринт 1: 100.00' in result['explanation']
+    assert str(eid) in result['evidence_ids']
+
+
+def test_task_fallback_preserves_the_actual_question():
+    records = [{'evidence_id': uuid4(), 'source_type': 'snapshot', 'payload': {
+        'operation': 'get_task_trace', 'schedule': [{'task_id': 'ANL-3042', 'decision': 'deferred_next_pi',
+                                                   'reason_text': 'Не хватает часов аналитика.'}]}}]
+    result = evidence.task_answer(records, 1, False, ('task', 'ANL-3042'))
+    assert 'ANL-3042' in result['summary'] and 'Не хватает часов аналитика' in result['explanation']
+    assert 'Найдено проблем' not in result['summary']
+
+
+def test_action_plan_counts_missing_roles_without_promising_a_gain(monkeypatch):
+    from tests.test_planner import task, engineer, inputs
+    from app import planner
+    source = inputs([task('A', roles={1: 20}), task('B', roles={2: 20})], [engineer('E')], sprint_count=1)
+    plan = planner.build_plan(source, simulate_next_pi=False)
+    monkeypatch.setattr(facts.snapshots, 'load', lambda sid: (source, plan, {}, {}))
+    sid = uuid4()
+    payload = facts.get_improvement_plan(sid)
+    assert payload['selected_tasks'] == 1 and payload['deferred_tasks'] == 1
+    assert payload['missing_roles'][0]['task_ids'] == ['B']
+    assert payload['effect_calculated'] is False
+    records = [{'source_type': 'snapshot', 'evidence_id': uuid4(), 'payload': payload}]
+    answer = evidence.action_answer(records, 1, False)
+    assert 'Начните с роли' in answer['summary'] and 'сценарий' in answer['explanation']
+    assert 'не равно гарантированному приросту' in answer['explanation']

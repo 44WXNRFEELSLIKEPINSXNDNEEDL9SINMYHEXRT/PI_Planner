@@ -13,7 +13,7 @@ Freshness = Literal["current", "stale", "superseded"]
 
 INTENTS = frozenset({
     "system_help", "overview", "team_analysis", "task_explanation",
-    "metric_explanation", "compare_measures", "changes",
+    "metric_explanation", "compare_measures", "changes", "loan_hours", "planning_actions",
 })
 
 BASE_PATH = "/api/assistant"

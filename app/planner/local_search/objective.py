@@ -80,7 +80,6 @@ def evaluate_objective(
     требуют повторного назначения; обещание baseline считается потерянным,
     если хотя бы одна живая задача обещанной инициативы не вошла в текущий PI.
     """
-    tasks_by_id = {task.task_id: task for task in inputs.tasks}
     tasks_by_initiative: dict[str, list] = defaultdict(list)
     for task in inputs.tasks:
         tasks_by_initiative[task.prodf_id].append(task)

@@ -934,6 +934,7 @@ def build_plan(
                     "story_points": allocation_solution.sp_scale,
                 },
                 "search_method": allocation_solution.search_method,
+                "objective_bounds_scope": allocation_solution.objective_bounds_scope,
             } if allocation_solution is not None else (
                 {"solver_status": "PI_CLOSED", "search_method": "not_run"}
                 if algorithm == ALGORITHM_LOCAL_SEARCH else None
