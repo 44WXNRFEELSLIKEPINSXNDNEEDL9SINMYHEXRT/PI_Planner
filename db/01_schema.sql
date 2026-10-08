@@ -806,9 +806,10 @@ CREATE TABLE IF NOT EXISTS public.assistant_kb_documents (
     version TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('active', 'retired')),
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (path, content_sha256, version)
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE UNIQUE INDEX IF NOT EXISTS assistant_kb_document_chunker_version
+    ON public.assistant_kb_documents (path, content_sha256, version);
 CREATE TABLE IF NOT EXISTS public.assistant_kb_chunks (
     chunk_id UUID PRIMARY KEY,
     document_id UUID NOT NULL REFERENCES public.assistant_kb_documents(document_id),

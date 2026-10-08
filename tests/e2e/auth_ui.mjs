@@ -28,9 +28,12 @@ log(true, 'неверный токен: понятное сообщение')
 
 await page.getByLabel('Токен доступа').fill(VIEWER)
 await page.getByRole('button', { name: 'Войти' }).click()
+await page.getByText('vera', { exact: true }).waitFor({ timeout: 10000 })
+// The role warning belongs to UploadScreen; the landing page is now SummaryScreen.
+await page.goto(`${BASE}/#/upload`)
 await page.getByText('Режим просмотра').waitFor({ timeout: 10000 })
 log(true, 'viewer вошёл, видит «Режим просмотра»')
-log(await page.getByText('Загрузка факта').count() === 0 || await page.getByText('Скачать шаблон').count() === 0, 'viewer не видит загрузку факта')
+log(await page.getByText('Загрузка факта').count() === 0 && await page.getByText('Скачать шаблон').count() === 0, 'viewer не видит загрузку факта')
 log(await page.getByText('vera', { exact: true }).count() > 0, 'в шапке имя пользователя')
 await page.screenshot({ path: `${OUT}/02-viewer.png` })
 await page.goto(`${BASE}/#/plan`)
